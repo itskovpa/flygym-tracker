@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+# large / machine-specific artifacts
+data/
+output/
+*.avi
+*.mp4
+*.bmp
+# keep calibration bundle + committed sample docs
+!docs/*.png

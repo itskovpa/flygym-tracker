@@ -1,0 +1,7 @@
+numpy>=1.24
+opencv-python>=4.8
+pandas>=2.0
+pyyaml>=6.0
+openpyxl>=3.1
+# HikRobot MvImport is NOT on PyPI — it is vendored from the local MVS install at runtime
+# (see src/flygym_tracker/frame_source.py; path configurable via MVS_PYTHON_SDK env var).

@@ -1,0 +1,142 @@
+"""Shared data contracts for flygym_tracker.
+
+AUTHORITATIVE. Every module imports these types; do not fork or redefine them. Changing a field
+here is a spec change — update DESIGN.md too.
+"""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Optional
+
+
+class TrackState(str, Enum):
+    UNKNOWN = "unknown"
+    ROTATING = "rotating"
+    SETTLING = "settling"      # just became stationary; used for re-registration, excluded from activity
+    STATIONARY = "stationary"  # measurable
+
+
+@dataclass
+class Frame:
+    """One acquired frame. `image` is HxW uint8 grayscale."""
+    image: "object"            # np.ndarray uint8, HxW  (typed as object to avoid importing numpy here)
+    index: int
+    t_monotonic: float         # seconds from a monotonic clock (for intervals)
+    t_wall_iso: str            # wall-clock ISO 8601 (for logging)
+
+
+@dataclass
+class VialROI:
+    """A single vial slot on a face. bbox in pixel coords of the full frame."""
+    id: int                    # local id within the face, 1..16 (row-major, top row 1..8, bottom 9..16)
+    row: int                   # 0 = upper, 1 = lower
+    col: int                   # 0..7, left to right
+    x: int
+    y: int
+    w: int
+    h: int
+    present: bool = True       # False = empty/missing tube slot, skip in activity
+
+
+@dataclass
+class FaceCalibration:
+    name: str                          # "A" or "B"
+    vials: list                        # list[VialROI]
+    illum_mask_path: str               # PNG, full-frame, 255 = trackable lit pixel, 0 = excluded
+    marker: Optional[dict] = None      # marker template/id/bbox; None until markers exist
+
+
+@dataclass
+class Calibration:
+    image_width: int
+    image_height: int
+    faces: dict                        # dict[str, FaceCalibration]
+    created: str = ""
+    notes: str = ""
+
+    def to_json(self, path: str) -> None:
+        def enc(o):
+            if isinstance(o, (Calibration, FaceCalibration, VialROI)):
+                return asdict(o)
+            raise TypeError(type(o))
+        payload = {
+            "image_width": self.image_width,
+            "image_height": self.image_height,
+            "created": self.created,
+            "notes": self.notes,
+            "faces": {k: asdict(v) for k, v in self.faces.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    @staticmethod
+    def from_json(path: str) -> "Calibration":
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        faces = {}
+        for name, fc in d["faces"].items():
+            vials = [VialROI(**v) for v in fc["vials"]]
+            faces[name] = FaceCalibration(
+                name=fc["name"], vials=vials,
+                illum_mask_path=fc["illum_mask_path"], marker=fc.get("marker"),
+            )
+        return Calibration(
+            image_width=d["image_width"], image_height=d["image_height"],
+            faces=faces, created=d.get("created", ""), notes=d.get("notes", ""),
+        )
+
+    # convenience
+    def resolve_mask_paths(self, base_dir: str) -> None:
+        """Make illum_mask_path absolute relative to the calibration bundle dir."""
+        for fc in self.faces.values():
+            if not os.path.isabs(fc.illum_mask_path):
+                fc.illum_mask_path = os.path.join(base_dir, fc.illum_mask_path)
+
+
+# ---- Output records ---------------------------------------------------------
+
+#: CSV/XLSX column order for the activity table (one row per vial per bin).
+ACTIVITY_COLUMNS = [
+    "run_id", "bin_start_iso", "bin_end_iso", "elapsed_s", "face", "vial_id", "row", "col",
+    "present", "n_stationary_frames", "n_rotating_frames", "motion_px_sum",
+    "active_fraction_mean", "lit_area_px",
+]
+
+
+@dataclass
+class ActivityRecord:
+    run_id: str
+    bin_start_iso: str
+    bin_end_iso: str
+    elapsed_s: float
+    face: str
+    vial_id: int               # global id = face_index*16 + local_id
+    row: int
+    col: int
+    present: bool
+    n_stationary_frames: int
+    n_rotating_frames: int
+    motion_px_sum: int
+    active_fraction_mean: float
+    lit_area_px: int
+
+    def as_row(self) -> dict:
+        return {k: getattr(self, k) for k in ACTIVITY_COLUMNS}
+
+
+EVENT_COLUMNS = ["run_id", "iso_time", "elapsed_s", "event", "detail"]
+
+
+@dataclass
+class EventRecord:
+    run_id: str
+    iso_time: str
+    elapsed_s: float
+    event: str                 # rotation_start | rotation_end | face_change | calibration | marker_absent | mis_registration
+    detail: str = ""
+
+    def as_row(self) -> dict:
+        return {k: getattr(self, k) for k in EVENT_COLUMNS}

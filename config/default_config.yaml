@@ -1,0 +1,46 @@
+# FlyGym v2 tracker — default configuration. Copy and override per experiment.
+
+source:
+  type: camera            # camera | video
+  video_path: null        # used when type == video
+  # camera settings (HikRobot MvImport)
+  camera:
+    serial: "DA4282883"
+    width: 1280
+    height: 1024
+    exposure_us: null     # null = auto; pin (e.g. 20000) for a hard frame-rate cap
+    gain_db: null         # null = auto
+    frame_rate: 20        # target fps for acquisition
+    pixel_format: "Mono8"
+
+calibration:
+  path: "calib"           # dir holding calibration.json + illum_mask_*.png
+
+rotation:
+  metric: mean_abs_diff
+  enter_threshold: null   # null = seed from measured noise floor (cli noise); large separation expected
+  exit_threshold: null
+  debounce_frames: 8      # consecutive quiet frames to declare stationary
+  min_stationary_frames: 10   # settling frames after stationary onset (skip for activity)
+
+activity:
+  reference: prev_stationary   # diff baseline; reset after rotation / face change
+  pixel_threshold: null   # null = noise_mean + k*noise_std
+  k: 5.0
+  normalize_by_lit_area: true
+
+binning:
+  bin_seconds: 60
+
+markers:
+  enabled: false          # flip to true once physical IR-opaque markers are added
+  # decode params filled in when markers exist
+
+output:
+  dir: "output"
+  format: both            # csv | xlsx | both
+  rolling: daily          # new file per day
+  snapshot_every_s: 0     # 0 = never; else periodic full-frame PNG for spot checks
+
+logging:
+  level: INFO
