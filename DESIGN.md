@@ -25,9 +25,11 @@ pySolo-Video / ethoscope — is **per-vial ROI frame-differencing during station
   falls into darkness** and is often untrackable. Track only the lit portion of each tube.
 - **Tubes can be missing** (currently 2 slots empty on the visible side). Calibration must detect
   tube **presence** per slot and skip empties.
-- The drum **rotates back and forth** to agitate flies (forces climbing). Whether it flips ~180° to
-  present the far face to the camera, or only rocks a few degrees, is TBD — build **face-agnostic**
-  (see §5).
+- The drum **rotates back and forth, flipping ~180°** to alternately present **Face A** and
+  **Face B** to the single camera (CONFIRMED) — each flip also agitates the flies (forces climbing).
+  Face B appears geometrically transformed (mirror/flip) vs Face A, so **each face is calibrated
+  independently**; Face B's calibration is captured the first time a flip is observed (deferred until
+  the rig can run). **~15–25 flies per vial** → strong frame-diff signal, population metric is correct.
 
 ### Vial numbering (canonical)
 Per face: row-major, left→right, top row then bottom row. Upper row = 1..8, lower row = 9..16.
@@ -104,7 +106,14 @@ For each **stationary, non-settling** frame, for each **present** vial on the cu
   differs per vial. `motion_px_sum` is the raw total.
 
 ### 5.4 Calibration (`calibration.py`)
-Input: one representative still of a face (empty rig OK). Steps:
+Two ways to produce a calibration bundle, both emitting the IDENTICAL `Calibration` bundle:
+- **(A) Manual ROI wizard — PRIMARY / reliable path (user-endorsed).** The user iterates over the 16
+  slots on a captured face frame, drawing/adjusting each vial ROI and marking present/absent. Robust
+  against non-uniform light and missing tubes. See §5.5.
+- **(B) Auto-detect — optional accelerator.** Best-effort lattice detection that **pre-seeds** the
+  wizard's initial boxes; the user then confirms/nudges. Never the sole path.
+
+**Auto-detect** — input: one representative still of a face (empty rig OK). Steps:
 1. Illuminated mask: threshold the bright back-lit region; morphological cleanup → `illum_mask_<face>.png`.
 2. Central hardware band: detect the ultra-bright horizontal slots + frame → exclude from illum mask.
 3. Vial lattice: from column/row intensity profiles, find the two tube bands (rows) and 8 column
@@ -112,7 +121,17 @@ Input: one representative still of a face (empty rig OK). Steps:
 4. Tube presence: per slot, test for a glowing column (mean brightness / structure in the lit band).
    Empty slot (dark, or no tube walls) → `present=false`.
 5. Emit `Calibration` JSON + mask PNG(s). Also write `calib/overlay_<face>.png` for human check.
-Manual override: the JSON is hand-editable (bboxes, present flags) as the escape hatch.
+
+### 5.5 Manual calibration wizard (PRIMARY)
+- Interactive per-face: show the captured frame; for slot 1..16 the user draws a rectangle (e.g.
+  `cv2.selectROI`), or accepts the auto-seeded box; a keypress marks the slot **absent** (skip).
+  Optionally pre-seed all 16 boxes from auto-detect (B) so the user only nudges.
+- Within each accepted box the **illuminated sub-mask** is auto-derived (threshold the bright pixels
+  inside the box) so the user draws boxes, not pixel masks; the central-hardware band stays excluded.
+- Emit the SAME `Calibration` bundle (JSON + `illum_mask_<face>.png` + `overlay_<face>.png`).
+- Keep the interactive driver THIN; put bundle-building (boxes + present flags + frame → Calibration
+  + masks) in a pure, unit-testable function `build_calibration_from_boxes(...)`.
+- The JSON also stays hand-editable as a final escape hatch.
 
 ## 6. Shared data contracts — see `src/flygym_tracker/types.py` (provided, authoritative)
 
@@ -153,9 +172,12 @@ Manual override: the JSON is hand-editable (bboxes, present flags) as the escape
    against real fly motion; confirm shadow SNR; validate per-vial activity vs. eyeball/known stimulus.
    Also finalize marker decode once physical markers are added.
 
-## 10. Assumptions (flagged for user confirmation; coded as configurable defaults)
+## 10. Confirmed parameters (from the rig owner)
 
-- Experiment length up to days; activity bin default **60 s** (configurable).
-- **Several flies per vial** → population frame-diff metric (not single-fly). If single fly, same
-  metric still works.
-- Rotation may or may not reveal the far face — built face-agnostic; markers give face id.
+- Experiment length **hours to 1–3 days**. Activity bin is **user-defined** (default 60 s), settable
+  via config AND a CLI flag — must be easy to change per experiment.
+- **15–25 flies per vial** → population frame-diff metric (not single-fly tracking).
+- Rotation **flips ~180°** presenting Face A/B alternately (see §2). Built for 2 faces; markers give
+  face id; each face calibrated independently.
+- Fly shadows are clearly visible when flies are loaded (owner confirmed) — so SNR is not a concern;
+  only the numeric activity threshold needs tuning on real flies (the deferred "last bit", §9).
