@@ -1,0 +1,43 @@
+# Tuned config for the FlyGym v2 rig, validated on real flies (2026-07-18).
+# Key finding: measure fly motion WITHIN the static dwells (drum fully stopped, same pose) on
+# UNCOMPRESSED live frames. On a 90s clip with flies in vial 7, this gave a 42:1 activity
+# separation of the fly vial from all others (idealized), ~5:1 through the full pipeline (the gap
+# is the two-tilt-pose rocking — see docs/validation_realfly.md).
+
+source:
+  type: camera
+  camera:
+    serial: "DA4282883"
+    width: 1280
+    height: 1024
+    frame_rate: 20            # the AcquisitionFrameRate limiter held at 20 fps in testing
+    pixel_format: "Mono8"
+
+calibration:
+  path: "calib"              # build with the MANUAL wizard (auto-detect mis-flags vial 7 as empty)
+
+rotation:
+  # Measured on the rig: rotation frames ~9 mean|diff|, static dwells ~1.6 (true floor).
+  enter_threshold: 6.0        # > dwell (1.6), < rotation (9)
+  exit_threshold: 3.0
+  debounce_frames: 4          # dwells are short (~2 s) - keep settling small
+  min_stationary_frames: 3
+
+activity:
+  pixel_threshold: 12.0       # above the uncompressed sensor-noise floor; catches fly shadows
+  k: 5.0
+  normalize_by_lit_area: true
+
+binning:
+  bin_seconds: 10             # user-defined; 10 s shown here, set per experiment
+
+markers:
+  enabled: false              # NOT needed: the rig rocks (one face), it does not flip to a back side
+
+output:
+  dir: "output"
+  format: both
+  rolling: daily
+
+logging:
+  level: INFO
