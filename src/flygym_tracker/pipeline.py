@@ -60,6 +60,12 @@ from flygym_tracker.types import ActivityRecord, EventRecord, TrackState
 
 #: Default registration residual (0=perfect, ~1=uncorrelated) above which a shift is rejected.
 DEFAULT_MAX_RESIDUAL = 0.5
+#: A registration shift larger than this fraction of the tightest vial-center pitch is rejected as
+#: lattice aliasing. The vial lattice is periodic (8 near-identical vials per row), so phase
+#: correlation can lock onto a whole vial-pitch offset with HIGH confidence (low residual) and shift
+#: every ROI onto its neighbour. Real drift after the drum returns to pose is far smaller than a
+#: pitch, so a magnitude cap is the right guard where the residual check is blind.
+DEFAULT_MAX_SHIFT_FRAC = 0.4
 #: Retry budget + backoff for a transient `source.read()` exception (multi-day robustness).
 DEFAULT_READ_RETRIES = 3
 DEFAULT_READ_RETRY_SLEEP = 0.5
@@ -129,6 +135,7 @@ class TrackerPipeline:
         enter_threshold: Optional[float] = None,
         exit_threshold: Optional[float] = None,
         max_residual: float = DEFAULT_MAX_RESIDUAL,
+        max_shift: Optional[float] = None,
         read_retries: int = DEFAULT_READ_RETRIES,
         read_retry_sleep: float = DEFAULT_READ_RETRY_SLEEP,
     ) -> None:
@@ -138,6 +145,7 @@ class TrackerPipeline:
         self.logger = logger
         self.marker_detector = marker_detector
         self.max_residual = float(max_residual)
+        self._max_shift_arg = max_shift  # resolved after _precompute_faces (needs vial geometry)
         self.read_retries = max(1, int(read_retries))
         self.read_retry_sleep = float(read_retry_sleep)
         self.run_id = getattr(logger, "run_id", "run")
@@ -178,6 +186,10 @@ class TrackerPipeline:
         self._face_calib_bbox: Dict[str, Dict[int, Bbox]] = {}                  # face -> gvid -> anchor bbox
         self._vial_meta: Dict[int, Tuple[str, object]] = {}                     # gvid -> (face, VialROI)
         self._precompute_faces()
+        self.max_shift = (
+            float(self._max_shift_arg) if self._max_shift_arg is not None
+            else self._default_max_shift()
+        )
 
         # -- reference frames + working state -------------------------------------------------
         self._face_refs: Dict[str, np.ndarray] = {}
@@ -253,6 +265,29 @@ class TrackerPipeline:
         if w <= 0 or h <= 0:
             return cb, np.zeros((0, 0), dtype=bool)
         return cb, (illum_mask[y:y + h, x:x + w] == 255)
+
+    def _default_max_shift(self) -> float:
+        """`DEFAULT_MAX_SHIFT_FRAC` x the tightest vial-center pitch across all present vials.
+
+        The tightest pitch is the smallest center-to-center distance between any two vials, i.e. the
+        offset at which a registration shift would alias one vial onto its nearest neighbour. Capping
+        below it rejects lattice-pitch lock-ons while still allowing realistic sub-pitch drift. Falls
+        back to a quarter of the smaller image dimension when there are fewer than two vials.
+        """
+        centers = []
+        for active in self._face_active.values():
+            for _gvid, (bbox, _sub) in active.items():
+                x, y, w, h = bbox
+                centers.append((x + w / 2.0, y + h / 2.0))
+        best: Optional[float] = None
+        for i in range(len(centers)):
+            for j in range(i + 1, len(centers)):
+                d = float(np.hypot(centers[i][0] - centers[j][0], centers[i][1] - centers[j][1]))
+                if best is None or d < best:
+                    best = d
+        if best is None:
+            return 0.25 * float(min(self._W, self._H))
+        return DEFAULT_MAX_SHIFT_FRAC * best
 
     # ---- public run loop --------------------------------------------------------------------
 
@@ -393,8 +428,17 @@ class TrackerPipeline:
             self._face_refs[face] = np.asarray(gray).copy()
             return
         dx, dy, residual = estimate_shift(gray, ref, mask=self._face_lit_mask[face])
-        if residual <= self.max_residual:
+        too_large = abs(dx) > self.max_shift or abs(dy) > self.max_shift
+        if residual <= self.max_residual and not too_large:
             self._apply_registration(face, dx, dy)
+        elif too_large:
+            # Phase correlation locked onto (near) a vial pitch -> would alias every ROI onto a
+            # neighbour. Reject and keep ROIs at their calibration anchors (DESIGN.md §5.2).
+            self._log_event(
+                elapsed_s, frame, "mis_registration",
+                detail=f"shift=({dx:.1f},{dy:.1f}) exceeds max_shift={self.max_shift:.1f}px "
+                       "(likely vial-lattice aliasing); ROIs left unshifted",
+            )
         else:
             self._log_event(
                 elapsed_s, frame, "mis_registration",

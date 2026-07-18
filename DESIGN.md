@@ -86,9 +86,14 @@ Each module is one file under `src/flygym_tracker/`. Interfaces reference datacl
 ### 5.2 Face id + registration (stationary onset)
 - On each stationary onset (after settling): run `MarkerDetector` → face name. If markers absent
   (current state), default to face "A" and log `marker_absent`.
-- `registration.py`: estimate small (dx,dy,dθ) aligning the current frame's rigid structure to the
-  calibration frame (phase correlation on the masked frame, or ECC). Apply the offset to ROIs.
-  Reject/flag if the residual is too large (mis-registration guard).
+- `registration.py`: estimate small (dx,dy) aligning the current frame's rigid structure to the
+  calibration/reference frame (phase correlation on the masked frame). Apply the offset to ROIs.
+  Two mis-registration guards, both log `mis_registration` and keep ROIs at their calibration anchors:
+  (a) reject if the correlation **residual** is too large; (b) reject if the **shift magnitude**
+  exceeds `max_shift` (default 0.4x the tightest vial-center pitch). Guard (b) is essential because
+  the vial lattice is periodic — phase correlation can lock onto a whole vial-pitch offset with HIGH
+  confidence (low residual, so guard (a) is blind to it), which would alias every ROI onto its
+  neighbour. Real drift after the drum returns to pose is far smaller than a pitch.
 
 ### 5.3 Per-vial activity (`activity.py`)
 For each **stationary, non-settling** frame, for each **present** vial on the current face:
