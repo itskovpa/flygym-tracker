@@ -17,11 +17,13 @@ calibration:
   path: "calib"              # build with the MANUAL wizard (auto-detect mis-flags vial 7 as empty)
 
 rotation:
-  # Measured on the rig: rotation frames ~9 mean|diff|, static dwells ~1.6 (true floor).
-  enter_threshold: 6.0        # > dwell (1.6), < rotation (9)
-  exit_threshold: 3.0
+  detector: adaptive          # rotation speed/characteristics vary between runs -> auto-detect motion,
+  sensitivity: 1.0            # do not preset a magnitude. (enter/exit below are ignored in adaptive mode.)
   debounce_frames: 4          # dwells are short (~2 s) - keep settling small
   min_stationary_frames: 3
+  # threshold-mode fallback values (measured: rotation ~9 mean|diff|, static dwell ~1.6):
+  enter_threshold: 6.0
+  exit_threshold: 3.0
 
 activity:
   pixel_threshold: 12.0       # above the uncompressed sensor-noise floor; catches fly shadows

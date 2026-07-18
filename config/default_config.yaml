@@ -17,8 +17,10 @@ calibration:
   path: "calib"           # dir holding calibration.json + illum_mask_*.png
 
 rotation:
+  detector: threshold     # threshold = fixed enter/exit magnitude | adaptive = speed-independent (auto)
+  sensitivity: 1.0        # adaptive mode only: higher = more sensitive
   metric: mean_abs_diff
-  enter_threshold: null   # null = seed from measured noise floor (cli noise); large separation expected
+  enter_threshold: null   # threshold mode: null = seed from measured noise floor (cli noise)
   exit_threshold: null
   debounce_frames: 8      # consecutive quiet frames to declare stationary
   min_stationary_frames: 10   # settling frames after stationary onset (skip for activity)

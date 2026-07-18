@@ -55,6 +55,7 @@ import numpy as np
 from flygym_tracker.activity import ActivityAccumulator, per_frame_activity
 from flygym_tracker.frame_source import FrameSource, VideoFileSource
 from flygym_tracker.registration import apply_shift, estimate_shift
+from flygym_tracker.adaptive_rotation import AdaptiveRotationDetector
 from flygym_tracker.rotation import RotationDetector
 from flygym_tracker.types import ActivityRecord, EventRecord, TrackState
 
@@ -150,27 +151,38 @@ class TrackerPipeline:
         self.read_retry_sleep = float(read_retry_sleep)
         self.run_id = getattr(logger, "run_id", "run")
 
+        # -- rotation detector mode: 'adaptive' (speed-independent, no preset thresholds) or
+        #    'threshold' (fixed enter/exit magnitude). Default 'threshold' for back-compat.
+        try:
+            self.detector_mode = str(config.rotation.detector).lower()
+        except Exception:
+            self.detector_mode = "threshold"
+
         # -- resolve thresholds (config, overridable; never hard-coded) -----------------------
         px = pixel_threshold if pixel_threshold is not None else config.activity.pixel_threshold
-        enter = enter_threshold if enter_threshold is not None else config.rotation.enter_threshold
-        exit_ = exit_threshold if exit_threshold is not None else config.rotation.exit_threshold
         if px is None:
             raise ValueError(
                 "activity.pixel_threshold is null: run measure_noise() and pass the result via a "
                 "config override or the pixel_threshold= argument (DESIGN.md §5.3)."
             )
-        if enter is None or exit_ is None:
-            raise ValueError(
-                "rotation.enter_threshold/exit_threshold is null: run measure_noise() and pass "
-                "them via a config override or the enter_threshold=/exit_threshold= arguments "
-                "(DESIGN.md §5.1)."
-            )
         self.pixel_threshold = float(px)
-        self.enter_threshold = float(enter)
-        self.exit_threshold = float(exit_)
         self.bin_seconds = float(config.binning.bin_seconds)
         debounce = int(config.rotation.debounce_frames)
         min_stationary = int(config.rotation.min_stationary_frames)
+
+        # enter/exit are only needed in 'threshold' mode; 'adaptive' derives them online.
+        self.enter_threshold = self.exit_threshold = None
+        if self.detector_mode != "adaptive":
+            enter = enter_threshold if enter_threshold is not None else config.rotation.enter_threshold
+            exit_ = exit_threshold if exit_threshold is not None else config.rotation.exit_threshold
+            if enter is None or exit_ is None:
+                raise ValueError(
+                    "rotation.enter_threshold/exit_threshold is null: run measure_noise() and pass "
+                    "them via a config override or the enter_threshold=/exit_threshold= arguments, "
+                    "or set rotation.detector: adaptive to auto-detect (DESIGN.md §5.1)."
+                )
+            self.enter_threshold = float(enter)
+            self.exit_threshold = float(exit_)
 
         # -- geometry + per-face masks/bboxes -------------------------------------------------
         self._W = int(calibration.image_width)
@@ -202,13 +214,27 @@ class TrackerPipeline:
         self._prev_stationary: Optional[np.ndarray] = None
         self._prev_state: Optional[TrackState] = None
 
-        self.rotation = RotationDetector(
-            enter_threshold=self.enter_threshold,
-            exit_threshold=self.exit_threshold,
-            debounce_frames=debounce,
-            min_stationary_frames=min_stationary,
-            roi_mask=self._face_lit_mask.get(self._default_face),
-        )
+        if self.detector_mode == "adaptive":
+            try:
+                sensitivity = float(config.rotation.sensitivity)
+            except Exception:
+                sensitivity = 1.0
+            # whole-frame displacement (roi_mask=None) is the validated configuration; the rigid
+            # structure dominates the phase correlation regardless of which face is presented.
+            self.rotation = AdaptiveRotationDetector(
+                roi_mask=None,
+                debounce_frames=debounce,
+                min_stationary_frames=min_stationary,
+                sensitivity=sensitivity,
+            )
+        else:
+            self.rotation = RotationDetector(
+                enter_threshold=self.enter_threshold,
+                exit_threshold=self.exit_threshold,
+                debounce_frames=debounce,
+                min_stationary_frames=min_stationary,
+                roi_mask=self._face_lit_mask.get(self._default_face),
+            )
         self.accumulator = ActivityAccumulator(bin_seconds=self.bin_seconds)
 
         # -- clock selection ------------------------------------------------------------------
@@ -415,7 +441,8 @@ class TrackerPipeline:
         if face != self._current_face:
             self._log_event(elapsed_s, frame, "face_change", detail=f"{self._current_face} -> {face}")
             self._current_face = face
-            self.rotation.roi_mask = self._face_lit_mask[face]
+            if self.detector_mode != "adaptive":
+                self.rotation.roi_mask = self._face_lit_mask[face]
         if face not in self._faces_seen:
             self._faces_seen.append(face)
 
