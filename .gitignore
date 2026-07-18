@@ -10,5 +10,7 @@ output/
 *.avi
 *.mp4
 *.bmp
+# large, regenerable QA overlay (the json + mask ARE committed)
+calib/overlay_*.png
 # keep calibration bundle + committed sample docs
 !docs/*.png

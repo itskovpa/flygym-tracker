@@ -1,0 +1,175 @@
+{
+  "image_width": 1280,
+  "image_height": 1024,
+  "created": "2026-07-18T00:20:26+00:00",
+  "notes": "auto-detected lattice (seed for manual wizard)",
+  "faces": {
+    "A": {
+      "name": "A",
+      "vials": [
+        {
+          "id": 1,
+          "row": 0,
+          "col": 0,
+          "x": 100,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 2,
+          "row": 0,
+          "col": 1,
+          "x": 228,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 3,
+          "row": 0,
+          "col": 2,
+          "x": 356,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 4,
+          "row": 0,
+          "col": 3,
+          "x": 484,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 5,
+          "row": 0,
+          "col": 4,
+          "x": 642,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 6,
+          "row": 0,
+          "col": 5,
+          "x": 770,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 7,
+          "row": 0,
+          "col": 6,
+          "x": 898,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": false
+        },
+        {
+          "id": 8,
+          "row": 0,
+          "col": 7,
+          "x": 1026,
+          "y": 196,
+          "w": 110,
+          "h": 264,
+          "present": true
+        },
+        {
+          "id": 9,
+          "row": 1,
+          "col": 0,
+          "x": 100,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 10,
+          "row": 1,
+          "col": 1,
+          "x": 227,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": false
+        },
+        {
+          "id": 11,
+          "row": 1,
+          "col": 2,
+          "x": 353,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 12,
+          "row": 1,
+          "col": 3,
+          "x": 480,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 13,
+          "row": 1,
+          "col": 4,
+          "x": 635,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 14,
+          "row": 1,
+          "col": 5,
+          "x": 762,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 15,
+          "row": 1,
+          "col": 6,
+          "x": 888,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        },
+        {
+          "id": 16,
+          "row": 1,
+          "col": 7,
+          "x": 1015,
+          "y": 676,
+          "w": 109,
+          "h": 255,
+          "present": true
+        }
+      ],
+      "illum_mask_path": "illum_mask_A.png",
+      "marker": null
+    }
+  }
+}
