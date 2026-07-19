@@ -19,6 +19,8 @@ calibration:
 rotation:
   detector: threshold     # threshold = fixed enter/exit magnitude | adaptive = speed-independent (auto)
   sensitivity: 1.0        # adaptive mode only: higher = more sensitive
+  min_consistency: 0.6    # adaptive mode only: how straight motion must be to count as the drum
+                          # turning rather than flies milling about (0..1)
   metric: mean_abs_diff
   enter_threshold: null   # threshold mode: null = seed from measured noise floor (cli noise)
   exit_threshold: null

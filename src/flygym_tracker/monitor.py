@@ -56,9 +56,15 @@ Keyboard (polled once per `maybe_render()` call via `cv2.waitKey`, dispatched by
 itself a plain function of a keycode + current state, independently testable without a window):
 ``q`` quit the monitor (the pipeline run itself is untouched -- only the window/rendering stops),
 ``p`` pause/resume rendering (acquisition-side hooks keep running), ``+``/``-`` nudge
-`pixel_threshold` by `threshold_step` and fire `on_threshold_change` (the CLI wires this straight
-to the live `pipeline.pixel_threshold`), ``o`` toggle the ROI overlay, ``s`` save a PNG snapshot of
-the last-rendered composite to `snapshot_dir`.
+`pixel_threshold` by `threshold_step`, ``t`` open/close the settings panel, ``o`` toggle the ROI
+overlay, ``s`` save a PNG snapshot of the last-rendered composite to `snapshot_dir`.
+
+Setting changes (``+``/``-`` and the ``t`` panel) leave here through ONE funnel,
+`_notify_setting_change(key, value)`, which the CLI wires to `pipeline.apply_setting` -- so every
+change made from this window is routed and LOGGED as a `setting_change` event by the same code
+path, whichever key produced it. `on_threshold_change` (the original threshold-only callback) is
+still honoured for callers that wired it before `on_setting_change` existed; see
+`_notify_setting_change` for why only one of the two ever fires.
 """
 from __future__ import annotations
 
@@ -75,6 +81,12 @@ import numpy as np
 from flygym_tracker.types import TrackState
 
 logger = logging.getLogger(__name__)
+
+#: The routing key for `pixel_threshold`, as `pipeline.TrackerPipeline._build_setting_routes`
+#: spells it. Named here (rather than inlined at the two call sites) because the +/- keys and the
+#: settings panel must send the SAME key for the same knob, or one of them would silently stop
+#: being routed the day the other was renamed.
+PIXEL_THRESHOLD_KEY = "activity.pixel_threshold"
 
 #: BGR (OpenCV convention) colours for the state banner + bar chart accents.
 _STATE_COLORS = {
@@ -134,6 +146,10 @@ class LiveMonitor:
         threshold_step: float = 1.0,
         snapshot_dir: str = "snapshots",
         on_threshold_change: Optional[Callable[[float], None]] = None,
+        on_setting_change: Optional[Callable[[str, object], object]] = None,
+        settings_model=None,
+        settings_on_save: Optional[Callable[[object], object]] = None,
+        settings_window: str = "Tracking settings",
     ) -> None:
         self.calibration = calibration
         self.config = config
@@ -154,6 +170,13 @@ class LiveMonitor:
         self.threshold_step = float(threshold_step)
         self.snapshot_dir = snapshot_dir
         self._on_threshold_change = on_threshold_change
+        self._on_setting_change = on_setting_change
+        #: A `settings_panel.SettingsModel`, or None. Without one the ``t`` key has nothing to
+        #: show and says so, rather than opening an empty window.
+        self.settings_model = settings_model
+        self._settings_on_save = settings_on_save
+        self._settings_window_name = settings_window
+        self._settings_window = None
 
         #: face -> {global_vial_id: {"bbox": (x,y,w,h), "local_id", "row", "col", "present"}}.
         self.vial_geom: Dict[str, Dict[int, dict]] = self._precompute_geometry(calibration)
@@ -314,7 +337,7 @@ class LiveMonitor:
             cv2.putText(img, "PAUSED", (w - 110, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 220, 255), 2, cv2.LINE_AA)
 
-        hint = "q quit  p pause  +/- threshold  o roi  s snapshot"
+        hint = "q quit  p pause  +/- threshold  t settings  o roi  s snapshot"
         cv2.putText(img, hint, (12, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1, cv2.LINE_AA)
         return img
 
@@ -459,6 +482,9 @@ class LiveMonitor:
         """
         if not self.render_enabled:
             return False
+        # Pumped BEFORE the throttle gate, and self-throttled at its own (higher) rate, so a slider
+        # drag stays responsive even when the composite is only redrawn at `max_fps`.
+        self._pump_settings()
         now = time.monotonic()
         if now - self._last_render_time < self._min_render_interval:
             return False
@@ -496,6 +522,8 @@ class LiveMonitor:
             self._adjust_threshold(self.threshold_step)
         elif ch == "-":
             self._adjust_threshold(-self.threshold_step)
+        elif ch == "t":
+            self.toggle_settings()
         elif ch == "o":
             self.show_roi = not self.show_roi
         elif ch == "s":
@@ -504,11 +532,82 @@ class LiveMonitor:
     def _adjust_threshold(self, delta: float) -> None:
         new_value = max(0.0, self.pixel_threshold + delta)
         self.pixel_threshold = new_value
-        if self._on_threshold_change is not None:
+        # Keep an open settings panel showing the same number this window's banner now shows --
+        # two widgets disagreeing about the live threshold is worse than having only one of them.
+        if self.settings_model is not None and PIXEL_THRESHOLD_KEY in self.settings_model:
             try:
-                self._on_threshold_change(new_value)
+                self.settings_model.set(PIXEL_THRESHOLD_KEY, new_value)
+            except Exception:
+                logger.warning("LiveMonitor: could not resync the settings panel", exc_info=True)
+        self._notify_setting_change(PIXEL_THRESHOLD_KEY, new_value)
+
+    def _notify_setting_change(self, key: str, value) -> object:
+        """The ONE exit for a setting changed from this window (+/- keys, or the ``t`` panel).
+
+        `on_setting_change(key, value)` is the general callback and is preferred whenever it is
+        wired. `on_threshold_change(value)` is the original threshold-only one, kept working for
+        callers that predate the panel -- but only ONE of the two ever fires for a given change:
+        if both were wired and both fired, the CLI's `apply_setting` route would run twice for one
+        keypress and write TWO `setting_change` rows for a single move, which is precisely the
+        double-bookkeeping that event exists to prevent.
+
+        A raising callback is logged and swallowed: a display-side keypress must never be able to
+        abort an experiment that is otherwise acquiring correctly.
+        """
+        if self._on_setting_change is not None:
+            try:
+                return self._on_setting_change(key, value)
+            except Exception:
+                logger.warning("LiveMonitor: on_setting_change callback raised", exc_info=True)
+                return None
+        if key == PIXEL_THRESHOLD_KEY and self._on_threshold_change is not None:
+            try:
+                return self._on_threshold_change(value)
             except Exception:
                 logger.warning("LiveMonitor: on_threshold_change callback raised", exc_info=True)
+        return None
+
+    def toggle_settings(self) -> bool:
+        """``t``: open the settings panel, or close it if it is already up. True if it is now open.
+
+        `settings_panel` is imported HERE rather than at module scope so a headless run that never
+        presses ``t`` does not pay for (or depend on) the panel's import chain at all.
+        """
+        if self._settings_window is not None:
+            self._settings_window.close()
+            self._settings_window = None
+            return False
+        if self.settings_model is None:
+            logger.info("LiveMonitor: no settings model wired, so 't' has nothing to show")
+            return False
+        try:
+            from flygym_tracker.settings_panel import SettingsWindow
+
+            window = SettingsWindow(
+                self.settings_model,
+                on_change=self._notify_setting_change,
+                on_save=self._settings_on_save,
+                window=self._settings_window_name,
+                subtitle="live - changes take effect on the next frame",
+            )
+            window.open()
+        except Exception as exc:
+            logger.warning("LiveMonitor: could not open the settings panel (%s)", exc)
+            return False
+        self._settings_window = window
+        return True
+
+    def _pump_settings(self) -> None:
+        """Give an open settings panel one iteration. Cheap, self-throttled, never raises."""
+        window = self._settings_window
+        if window is None:
+            return
+        try:
+            if not window.pump():
+                self._settings_window = None
+        except Exception:
+            logger.warning("LiveMonitor: settings panel failed; closing it", exc_info=True)
+            self._settings_window = None
 
     def save_snapshot(self, path: Optional[str] = None) -> Optional[str]:
         """Write the last-rendered composite to a PNG (rendering fresh first if nothing has been
@@ -538,6 +637,12 @@ class LiveMonitor:
 
     def close(self) -> None:
         """Best-effort window teardown. Idempotent; safe even if a window was never shown."""
+        if self._settings_window is not None:
+            try:
+                self._settings_window.close()
+            except Exception:
+                pass
+            self._settings_window = None
         try:
             cv2.destroyWindow(self.window_name)
         except Exception:

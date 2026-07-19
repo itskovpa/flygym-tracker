@@ -62,6 +62,7 @@ from flygym_tracker.marker_band import MarkerBandDetector
 from flygym_tracker.markers import MarkerDetector
 from flygym_tracker.monitor import LiveMonitor
 from flygym_tracker.pipeline import TrackerPipeline, measure_noise
+from flygym_tracker.settings_panel import SettingsWindow, build_settings, save_settings_to_yaml
 
 #: Shared "thresholds are missing" remediation, appended to the pipeline's own ValueError text.
 _THRESHOLD_HINT = (
@@ -140,8 +141,42 @@ def _load_run_config(args):
     return load_config(path=args.config, overrides=overrides)
 
 
+def _settings_saver(config_path: Optional[str]):
+    """A save hook for the settings panel, or None when there is no file to write to.
+
+    Prints what it wrote and where, ALWAYS. The panel's ``s`` key changes a file the operator is
+    not looking at; a save that produced no visible output would leave them unable to tell a
+    successful write from a silently skipped one, and the next run would then be a mystery.
+    """
+    if not config_path:
+        return None
+
+    def save(model):
+        notes = save_settings_to_yaml(config_path, model)
+        if notes:
+            print("\nsettings: wrote %d change(s) to %s" % (len(notes), config_path))
+        else:
+            print("\nsettings: nothing changed, %s left alone" % config_path)
+        return notes
+
+    return save
+
+
+def _settings_gui_available(flag_name: str) -> bool:
+    """True if a settings window can be opened; warns (without failing the run) if it cannot."""
+    if has_gui_support():
+        return True
+    # Not fatal: the run itself is headless-safe, so warn and keep acquiring.
+    print("\nWARNING: %s requested but this OpenCV build cannot open a window.\n" % flag_name
+          + gui_diagnosis("The settings panel")
+          + "\nContinuing WITHOUT it; measurement and logging are unaffected.\n",
+          file=sys.stderr)
+    return False
+
+
 def _run_pipeline_or_report(
     config, calib, source, logger, marker_detector, *, clock, max_frames, stop_flag, monitor=False,
+    settings=False, config_path=None,
 ) -> int:
     """Construct + run a `TrackerPipeline`, turning its two documented construction-time failure
     modes into a short message instead of a traceback: null thresholds (ValueError -- DESIGN.md
@@ -151,7 +186,16 @@ def _run_pipeline_or_report(
     `monitor=True` (the `--monitor` flag) wires a `LiveMonitor` (monitor.py) as a pipeline
     observer -- a live tracking/activity window the scientist can watch (and nudge
     `pixel_threshold` from) while the run is in progress, without changing anything about the run
-    itself (DESIGN.md's `noise`/output-file wiring is unaffected either way)."""
+    itself (DESIGN.md's `noise`/output-file wiring is unaffected either way).
+
+    `settings=True` (the `--settings` flag) opens the settings panel (settings_panel.py) BEFORE
+    the first frame is measured, and holds the run until the operator closes it. That ordering is
+    the point: values chosen in the panel are in force for frame 1, so a `replay --settings`
+    against the same clip is a clean A/B -- adjust, close, watch, re-run -- with no leading
+    stretch of data measured at the old settings. The same panel is reachable mid-run with the
+    monitor's ``t`` key, and BOTH routes end at `TrackerPipeline.apply_setting`, so either way the
+    change is logged as a `setting_change` event.
+    """
     try:
         pipe = TrackerPipeline(config, calib, source, logger, marker_detector=marker_detector, clock=clock)
     except ValueError as e:
@@ -163,10 +207,20 @@ def _run_pipeline_or_report(
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    # One model shared by the modal panel and the monitor's `t` panel, so a value set before the
+    # run is still shown (and still marked as changed) by the panel opened during it.
+    settings_model = build_settings(config, pipeline=pipe)
+    save_hook = _settings_saver(config_path)
+
+    if settings and _settings_gui_available("--settings"):
+        SettingsWindow(
+            settings_model, on_change=pipe.apply_setting, on_save=save_hook,
+            subtitle="applies from the first frame - close this window to start",
+        ).run()
+
     live_monitor = None
     if monitor:
         if not has_gui_support():
-            # Not fatal: the run itself is headless-safe, so warn and keep acquiring.
             print("\nWARNING: --monitor requested but this OpenCV build cannot open a window.\n"
                   + gui_diagnosis("The live monitor")
                   + "\nContinuing WITHOUT the monitor; measurement and logging are unaffected.\n",
@@ -174,7 +228,13 @@ def _run_pipeline_or_report(
             monitor = False
     if monitor:
         live_monitor = LiveMonitor(
-            calib, config, on_threshold_change=lambda v: setattr(pipe, "pixel_threshold", v),
+            calib, config,
+            # One route for every change made from the monitor -- the +/- keys and the `t` panel
+            # alike -- so each one is applied AND logged exactly once. (`on_threshold_change` is
+            # deliberately not wired: it would be the second of two callbacks for the same key.)
+            on_setting_change=pipe.apply_setting,
+            settings_model=settings_model,
+            settings_on_save=save_hook,
         )
         pipe.add_observer(live_monitor.on_frame)
         pipe.add_bin_observer(live_monitor.on_bin)
@@ -722,6 +782,7 @@ def _cmd_run(args) -> int:
     return _run_pipeline_or_report(
         config, calib, source, logger, marker_detector,
         clock="auto", max_frames=args.max_frames, stop_flag=stop_flag, monitor=args.monitor,
+        settings=getattr(args, "settings", False), config_path=args.config,
     )
 
 
@@ -749,6 +810,7 @@ def _cmd_replay(args) -> int:
     return _run_pipeline_or_report(
         config, calib, source, logger, marker_detector,
         clock="auto", max_frames=args.max_frames, stop_flag=None, monitor=args.monitor,
+        settings=getattr(args, "settings", False), config_path=args.config,
     )
 
 
@@ -945,6 +1007,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--monitor", action="store_true",
         help="Show a live tracking/activity monitor window while running (monitor.py).",
     )
+    p_run.add_argument(
+        "--settings", action="store_true",
+        help="Open the settings panel before the first frame; close it to start. "
+             "(With --monitor, 't' reopens it at any time during the run.)",
+    )
     p_run.set_defaults(handler=_cmd_run)
 
     # -- replay -------------------------------------------------------------------------------
@@ -963,6 +1030,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument(
         "--monitor", action="store_true",
         help="Show a live tracking/activity monitor window while replaying (monitor.py).",
+    )
+    p_replay.add_argument(
+        "--settings", action="store_true",
+        help="Open the settings panel before the clip starts; close it to replay. This is the "
+             "tuning loop: adjust, watch, 's' to save, re-run the SAME clip and compare.",
     )
     p_replay.set_defaults(handler=_cmd_replay)
 

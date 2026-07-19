@@ -101,6 +101,8 @@ goto done
 echo.
 echo   The round starts by offering the vial positions saved in "%CALIB%".
 echo   Press ENTER to reuse them, or answer n to draw them again on the live feed.
+echo   In the monitor window, press t for the tracking-settings sliders (drag them
+echo   while the run continues; s in that window saves them to "%CONFIG%").
 echo   Then: close the monitor window, or press Ctrl+C here, to stop the experiment.
 echo   IMPORTANT: make sure MVS is CLOSED - the camera allows only one program at a time.
 echo.
@@ -128,10 +130,19 @@ goto done
 
 :replay
 echo.
+echo   Replaying the SAME clip after changing a setting is how the tracking is tuned:
+echo   adjust, watch, press s in the settings window to keep it, then replay again.
+echo.
 set "VID="
 set /p VID="   Path to the video file: "
 if not defined VID goto menu
-%PY% -m flygym_tracker.cli replay --video "%VID%" --config "%CONFIG%" --calib "%CALIB%" --out "%OUTDIR%" --bin-seconds %BIN_SECONDS% --monitor
+set "TUNE="
+set /p TUNE="   Open the settings sliders first? [y/N]: "
+if /I "!TUNE!"=="y" (
+  %PY% -m flygym_tracker.cli replay --video "%VID%" --config "%CONFIG%" --calib "%CALIB%" --out "%OUTDIR%" --bin-seconds %BIN_SECONDS% --monitor --settings
+) else (
+  %PY% -m flygym_tracker.cli replay --video "%VID%" --config "%CONFIG%" --calib "%CALIB%" --out "%OUTDIR%" --bin-seconds %BIN_SECONDS% --monitor
+)
 goto done
 
 :noise

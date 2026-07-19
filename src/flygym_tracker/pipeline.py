@@ -86,6 +86,20 @@ def _to_bool_mask(mask: np.ndarray) -> np.ndarray:
     return m if m.dtype == bool else (m > 0)
 
 
+def _fmt_setting(value) -> str:
+    """A setting value for the `setting_change` event detail: readable, and never in exponent form.
+
+    An analyst reading events.csv must be able to compare the number against the config file
+    without decoding it, so a float keeps a visible decimal point (``12.0``, not ``12``) and never
+    turns into ``1.2e+01``.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return "%.1f" % value if float(value).is_integer() else ("%s" % round(value, 6))
+    return str(value)
+
+
 def _clip_bbox(bbox: Bbox, width: int, height: int) -> Bbox:
     """Clip an (x, y, w, h) bbox to the image; returns (x, y, w, h) with w/h >= 0."""
     x, y, w, h = bbox
@@ -223,6 +237,17 @@ class TrackerPipeline:
                 sensitivity = float(config.rotation.sensitivity)
             except Exception:
                 sensitivity = 1.0
+            # `rotation.min_consistency` is absent from both shipped YAMLs, so it is passed ONLY
+            # when the config actually carries one -- otherwise the detector's own default stands,
+            # unduplicated. It is read at all so a value SAVED from the settings panel is honoured
+            # on the next run; a knob the panel can write but the pipeline never reads would be a
+            # knob that silently forgets itself the moment the run ends.
+            extra = {}
+            try:
+                if config.rotation.min_consistency is not None:
+                    extra["min_consistency"] = float(config.rotation.min_consistency)
+            except Exception:
+                pass
             # whole-frame displacement (roi_mask=None) is the validated configuration; the rigid
             # structure dominates the phase correlation regardless of which face is presented.
             self.rotation = AdaptiveRotationDetector(
@@ -230,6 +255,7 @@ class TrackerPipeline:
                 debounce_frames=debounce,
                 min_stationary_frames=min_stationary,
                 sensitivity=sensitivity,
+                **extra,
             )
         else:
             self.rotation = RotationDetector(
@@ -267,6 +293,9 @@ class TrackerPipeline:
         self._bin_observers: List[Callable[[dict], None]] = []
         self.observer_failures = 0
         self._fps_times: List[float] = []
+
+        # -- live settings (see the "live settings" section below) ----------------------------
+        self._setting_routes = self._build_setting_routes()
 
     # ---- observers ----------------------------------------------------------------------------
     #
@@ -324,6 +353,117 @@ class TrackerPipeline:
             "pixel_threshold": self.pixel_threshold,
         }
         self._notify(self._observers, payload)
+
+    # ---- live settings ------------------------------------------------------------------------
+    #
+    # `apply_setting(key, value)` is how a running pipeline is re-tuned from the outside -- the
+    # settings panel (settings_panel.py) and the monitor's +/- keys both end here. Two rules:
+    #
+    #   1. THE ROUTING TABLE IS A LITERAL. A dotted key arriving from a GUI is only ever a dict
+    #      lookup; it never becomes an attribute name. `setattr(self, key.rsplit(".")[-1], value)`
+    #      would have been three lines shorter and would have let a typo'd or hostile key write
+    #      any attribute on this object, including `_prev_stationary` or `logger`.
+    #   2. EVERY APPLIED CHANGE IS LOGGED as a `setting_change` event. A 3-day run whose
+    #      `pixel_threshold` moved from 12 to 18 at hour 40 produces ONE activity.csv holding two
+    #      different measurement regimes. Without a row in events.csv saying when the switch
+    #      happened, the analysis would average across both and compare incomparable numbers, with
+    #      nothing anywhere in the output hinting that it should not. The event is the only record
+    #      that exists -- `run_meta.json` snapshots the config at START, which by then is wrong.
+
+    def _build_setting_routes(self):
+        """``key -> (getter, setter)`` for everything this run can actually change.
+
+        Built once, from the live objects: the rotation knobs are included only if THIS run's
+        detector really has them (`AdaptiveRotationDetector` does; the fixed-threshold
+        `RotationDetector` has no `sensitivity`/`min_consistency` at all). A key that is absent
+        here makes `apply_setting` return False, which is how the panel learns to say "not applied
+        to this run" instead of moving a slider that does nothing.
+        """
+        routes = {
+            "activity.pixel_threshold": (
+                lambda: self.pixel_threshold, self._set_pixel_threshold),
+        }
+        detector = self.rotation
+        if hasattr(detector, "sensitivity"):
+            routes["rotation.sensitivity"] = (
+                lambda: self.rotation.sensitivity, self._set_rotation_sensitivity)
+        if hasattr(detector, "debounce_frames"):
+            routes["rotation.debounce_frames"] = (
+                lambda: self.rotation.debounce_frames, self._set_rotation_debounce_frames)
+        if hasattr(detector, "min_stationary_frames"):
+            routes["rotation.min_stationary_frames"] = (
+                lambda: self.rotation.min_stationary_frames,
+                self._set_rotation_min_stationary_frames)
+        if hasattr(detector, "min_consistency"):
+            routes["rotation.min_consistency"] = (
+                lambda: self.rotation.min_consistency, self._set_rotation_min_consistency)
+        return routes
+
+    # Each setter is spelled out rather than generated, so the set of attributes reachable from a
+    # GUI is visible in one screenful. They also clamp: the detectors validate these in their
+    # CONSTRUCTORS but not on assignment, and a live write must not be able to put the state
+    # machine somewhere its own constructor would have rejected.
+
+    def _set_pixel_threshold(self, value) -> None:
+        self.pixel_threshold = max(0.0, float(value))
+
+    def _set_rotation_sensitivity(self, value) -> None:
+        # `_thresholds()` divides by this every frame; zero or negative would be a ZeroDivisionError
+        # (or an inverted threshold) inside the acquisition loop.
+        self.rotation.sensitivity = max(1e-3, float(value))
+
+    def _set_rotation_debounce_frames(self, value) -> None:
+        # Below 1, every frame satisfies the quiet streak -> instant, spurious stationary onsets.
+        self.rotation.debounce_frames = max(1, int(value))
+
+    def _set_rotation_min_stationary_frames(self, value) -> None:
+        self.rotation.min_stationary_frames = max(1, int(value))
+
+    def _set_rotation_min_consistency(self, value) -> None:
+        self.rotation.min_consistency = min(1.0, max(0.0, float(value)))
+
+    def settable_keys(self) -> List[str]:
+        """The setting keys `apply_setting` will accept for THIS run, in table order."""
+        return list(self._setting_routes.keys())
+
+    def apply_setting(self, key: str, value) -> bool:
+        """Route one setting change into the live objects. True if the key was routed at all.
+
+        The new value is in force from the NEXT frame processed -- `pixel_threshold` is read per
+        frame by `_compute_vial_results`, and the rotation knobs are read per frame by
+        `AdaptiveRotationDetector.update`, so nothing needs restarting.
+
+        Returns False for a key this run cannot route (unknown, or a rotation knob the configured
+        detector does not have), and for a value the setter rejects. Returns True when the value
+        is in place -- INCLUDING when it was already that value, in which case nothing moved and
+        nothing is logged. That distinction matters: a drag across a slider fires a mouse event per
+        pixel, and logging one event per pixel would bury the transitions the log exists to record.
+
+        A drag that PASSES THROUGH several values still logs each one, and that is deliberate: the
+        panel applies continuously (which is the point -- the operator watches the effect while
+        turning the knob), so frames really were measured at each intermediate value. The log
+        therefore reads as an unbroken chain, ``12.0 -> 0.5``, ``0.5 -> 6.0``, ``6.0 -> 15.0``,
+        and the analysis can reconstruct which threshold was in force for any frame. Collapsing
+        that to the final value would re-create, in miniature, the exact untracked-regime problem
+        this event exists to prevent.
+        """
+        route = self._setting_routes.get(str(key))
+        if route is None:
+            return False
+        getter, setter = route
+        try:
+            old = getter()
+            setter(value)
+            new = getter()
+        except Exception:
+            return False
+        if new == old:
+            return True
+        self._log_event(
+            self._last_elapsed, None, "setting_change",
+            detail="%s: %s -> %s" % (key, _fmt_setting(old), _fmt_setting(new)),
+        )
+        return True
 
     # ---- precompute -------------------------------------------------------------------------
 
