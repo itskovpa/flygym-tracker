@@ -6,7 +6,7 @@ Produces the `Calibration` bundle described in DESIGN.md §5.4/§5.5:
   * a 2x8 vial lattice (16 `VialROI`, ids 1..16 row-major), and
   * per-slot tube-presence flags.
 
-Two entry points, emitting an IDENTICAL bundle:
+Three entry points, all emitting an IDENTICAL bundle:
   * `detect_calibration(frame, face)` -- auto-detect accelerator (DESIGN §5.4 B). It finds
     the lattice geometry and hands the boxes to `build_calibration_from_boxes`, which does
     all the bundle building.  Its boxes also serve as *seed boxes* for the manual wizard.
@@ -14,6 +14,10 @@ Two entry points, emitting an IDENTICAL bundle:
     unit-testable core used by the manual ROI wizard (DESIGN §5.5): given vial boxes and
     optional present/absent flags it derives each box's illuminated sub-mask (bright pixels
     inside the box, minus the central band) and assembles the same bundle.
+  * `build_calibration_from_markers(frame, face, marker_detector)` -- MARKER-DRIVEN path
+    (see below), the preferred automatic path on a rig that carries the physical sticker
+    band, plus `build_two_face_calibration(video, detector, out_dir)` which drives it over a
+    whole flip video to calibrate BOTH drum faces at once.
 
 The interactive wizard driver lives in `calibrate_wizard.py` and only wraps
 `build_calibration_from_boxes`; no CV logic lives there.
@@ -21,13 +25,49 @@ The interactive wizard driver lives in `calibrate_wizard.py` and only wraps
 Nothing here is hard-coded to the pixel coordinates of any one frame: geometry comes from
 row/column intensity profiles and presence from illumination-relative thresholds, all of
 which are exposed as `CalibParams` fields.
+
+MARKER-DRIVEN CALIBRATION (`build_calibration_from_markers`, `build_two_face_calibration`)
+-------------------------------------------------------------------------------------------
+`detect_calibration` infers the 8 vial columns from a *brightness* profile. That works but it
+is guessing at a lattice from illumination alone, and it is fragile exactly where the rig is
+dimmest. `marker_band.MarkerBandDetector` reads the rig's physical IR-sticker band instead and
+returns the vial column spans as a *measurement* (validated 8/8 against a hand calibration),
+plus the face identity (validated 43/43 on real dwells). So when the rig carries the marker
+band, the marker spans -- not a brightness guess -- are the right source of vial x-positions.
+
+What this path takes from where:
+  * **x** (8 vial columns)  <- `marker_detector.vial_boundaries(frame)`.
+  * **y** (2 tube rows)     <- the two glowing tube row-bands found in the frame, selected as
+    the bright row-runs immediately ABOVE and BELOW the marker band (the band physically sits
+    between the two rows, so "nearest run on each side" identifies them unambiguously). This
+    is what keeps the blindingly-lit stage along the bottom edge of the frame out of the
+    lattice: it is a *further* run below the band, never the nearest one.
+  * **ids**                 <- row-major: upper band = ids 1..8, lower band = 9..16, both
+    left->right, matching the canonical numbering in DESIGN.md §2.
+
+PRESENCE IS ALWAYS `True` ON THIS PATH -- AND THAT IS DELIBERATE
+----------------------------------------------------------------
+`detect_calibration` judges tube presence from brightness/rim cues and gets it WRONG on the
+dim end columns: it flagged a vial that was in fact full of flies as empty. A false "absent"
+is silent and unrecoverable -- `pipeline.TrackerPipeline._precompute_faces` skips non-present
+vials outright, so that vial's flies are simply never measured and nothing in the output says
+so. A false "present" costs, at worst, one boring row of near-zero activity that a human can
+see and ignore.
+
+The two error costs are therefore wildly asymmetric, so this path does not make the call at
+all: **every slot is emitted with `present=True`**. Slots that *look* empty (very little of
+their box is lit relative to the rest of the face) are recorded as SUSPICIOUS instead -- drawn
+in orange with a "?" on the overlay, listed in the bundle's `notes`, and stored in
+`FaceCalibration.marker["suspicious"]` (read it back with `suspicious_vials`). A human then
+decides, and marks a slot absent by hand (edit `calibration.json`, or re-run the wizard).
 """
 from __future__ import annotations
 
+import collections.abc
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -36,6 +76,12 @@ from flygym_tracker.types import Calibration, FaceCalibration, VialROI
 
 # (x, y, w, h) pixel box in full-frame coords.
 Box = Tuple[int, int, int, int]
+#: (y0, y1) HALF-OPEN row range, as used for `gray[y0:y1]`.
+RowBand = Tuple[int, int]
+#: Vial columns per drum face (DESIGN.md §2: 16 slots = 2 rows x 8). `pipeline.TrackerPipeline`
+#: hard-codes the resulting 16 slots per face in its global-vial-id arithmetic, so this is a
+#: contract, not a tunable.
+N_VIAL_COLUMNS = 8
 
 
 # --------------------------------------------------------------------------------------
@@ -460,15 +506,31 @@ def _draw_overlay(gray: np.ndarray, vials: Sequence[VialROI], mask: np.ndarray,
     return vis
 
 
-def save_calibration(calib: Calibration, illum_mask: np.ndarray, out_dir: str,
-                     overlay: Optional[np.ndarray] = None) -> None:
-    """Write the bundle to `out_dir`: calibration.json + illum_mask_<face>.png (+ overlay)."""
+def _for_face(value, face: str):
+    """Resolve a per-face image argument: a plain array applies to every face, a mapping is
+    looked up by face name (missing -> None, i.e. "nothing to write for this face")."""
+    if isinstance(value, collections.abc.Mapping):
+        return value.get(face)
+    return value
+
+
+def save_calibration(calib: Calibration, illum_mask, out_dir: str, overlay=None) -> None:
+    """Write the bundle to `out_dir`: calibration.json + illum_mask_<face>.png (+ overlay).
+
+    `illum_mask` and `overlay` are each either ONE image (applied to every face in `calib` --
+    the single-face behaviour this has always had) or a ``{face_name: image}`` mapping, which
+    is what a multi-face bundle needs so face A and face B get their own mask/overlay PNGs
+    (`build_two_face_calibration`).
+    """
     os.makedirs(out_dir, exist_ok=True)
     for fc in calib.faces.values():
         mask_name = os.path.basename(fc.illum_mask_path) or ("illum_mask_%s.png" % fc.name)
-        cv2.imwrite(os.path.join(out_dir, mask_name), illum_mask)
-        if overlay is not None:
-            cv2.imwrite(os.path.join(out_dir, "overlay_%s.png" % fc.name), overlay)
+        mask_img = _for_face(illum_mask, fc.name)
+        if mask_img is not None:
+            cv2.imwrite(os.path.join(out_dir, mask_name), mask_img)
+        overlay_img = _for_face(overlay, fc.name)
+        if overlay_img is not None:
+            cv2.imwrite(os.path.join(out_dir, "overlay_%s.png" % fc.name), overlay_img)
     calib.to_json(os.path.join(out_dir, "calibration.json"))
 
 
@@ -477,3 +539,656 @@ def load_calibration(out_dir: str) -> Calibration:
     calib = Calibration.from_json(os.path.join(out_dir, "calibration.json"))
     calib.resolve_mask_paths(os.path.abspath(out_dir))
     return calib
+
+
+# ======================================================================================
+# MARKER-DRIVEN CALIBRATION  (see the module docstring for the rationale)
+# ======================================================================================
+@dataclass
+class MarkerCalibParams:
+    """Knobs for the marker-driven path. Everything intensity-related is RELATIVE to the
+    frame's own levels, so nothing here depends on this rig's absolute grey values."""
+
+    # --- tube row bands (the two glowing rows either side of the marker band) ---
+    band_body_frac: float = 0.45     # a row is "tube" if its mean > frac * (robust bright level)
+    band_smooth: int = 9             # smoothing window (px) on the row-mean profile
+    band_min_h_frac: float = 0.06    # reject row-runs shorter than frac * image height
+    band_inset_frac: float = 0.0     # shrink each band top+bottom by frac of its height
+
+    # --- illuminated mask (computed over IN-BAND pixels only; see `_band_threshold`) ---
+    illum_method: str = "otsu"       # "otsu" | "relative"
+    illum_dark_pct: float = 5.0      # "unlit" reference percentile (method == "relative")
+    illum_bright_pct: float = 95.0   # "fully lit" reference percentile (method == "relative")
+    illum_rel: float = 0.40          # threshold = dark + rel*(bright - dark)
+    morph_open: int = 3              # opening kernel (px); 0 disables
+    morph_close: int = 7             # closing kernel (px); 0 disables
+    min_component_frac: float = 0.0004   # drop mask blobs smaller than frac * image area
+
+    # --- vial boxes ---
+    box_w_frac: float = 1.0          # box width as a fraction of the marker span (1.0 = as measured)
+
+    # --- suspicion flags (ADVISORY ONLY -- these never set present=False) ---
+    # A slot is suspicious when its lit fraction is under BOTH of these (i.e. under their
+    # minimum) -- see `_flag_suspicious` for why it is an AND and not an OR.
+    suspect_lit_frac_abs: float = 0.60   # ceiling: never flag a slot this well lit
+    suspect_lit_frac_rel: float = 0.60   # ... and it must also be this far under the face median
+
+    # --- dwell finding (`find_dwells`, used by `build_two_face_calibration`) ---
+    dwell_quiet_ratio: float = 10.0  # frames quieter than ratio * median|diff| are "dwelling"
+    dwell_min_frames: int = 5        # ignore quiet runs shorter than this
+    face_match_score: float = 0.50   # marker score below which a dwell is a NEW face
+
+
+@dataclass
+class VialQC:
+    """Per-slot quality numbers behind a suspicion flag (advisory; see module docstring)."""
+
+    id: int
+    lit_frac: float        # fraction of the box's pixels that are in the illuminated mask
+    median_gray: float     # median grey level inside the box
+    suspicious: bool
+
+    def as_dict(self) -> dict:
+        return {"id": int(self.id), "lit_frac": round(float(self.lit_frac), 4),
+                "median_gray": round(float(self.median_gray), 2),
+                "suspicious": bool(self.suspicious)}
+
+
+# --------------------------------------------------------------------------------------
+# Tube row bands
+# --------------------------------------------------------------------------------------
+def _marker_band_rows(strips: Sequence[Sequence[int]]) -> Tuple[int, int]:
+    """(first_row, last_row) INCLUSIVE covering every marker strip."""
+    return min(int(s[0]) for s in strips), max(int(s[1]) for s in strips)
+
+
+def tube_row_bands(
+    gray: np.ndarray,
+    strips: Sequence[Sequence[int]],
+    x_extent: Tuple[int, int],
+    params: Optional[MarkerCalibParams] = None,
+) -> Tuple[RowBand, RowBand, RowBand]:
+    """Locate the two glowing tube rows around the marker band.
+
+    Returns ``(upper, lower, central)`` as HALF-OPEN ``(y0, y1)`` row ranges, where `central`
+    is everything between the two tube rows -- the marker band plus its surrounding mounting
+    hardware -- which is excluded from the illuminated mask.
+
+    Method. Take the row-mean profile of the frame **restricted to the vial columns' x extent**
+    (so the drum's side hardware cannot contribute), smooth it, and threshold it at
+    ``band_body_frac`` of a robust bright level (the median of the profile's own upper half, so
+    a saturated stage or LED slot cannot inflate it). That yields a handful of bright row-runs.
+    The tube rows are then simply **the run nearest the marker band on each side**: the band
+    physically sits between the two vial rows (DESIGN.md §2), so nearest-above is the upper row
+    and nearest-below is the lower row.
+
+    That last step is the whole trick, and it is what makes this robust to the brightest object
+    in the frame. On the real rig the illuminated stage along the bottom edge is *brighter and
+    taller* than either tube row (measured: rows ~893-1023 at mean ~228, versus the lower tube
+    row at ~127), so any "pick the brightest/biggest runs" rule picks the stage. Picking by
+    ADJACENCY TO THE BAND instead ignores brightness entirely and never can.
+
+    Raises:
+        ValueError: no qualifying bright run above and/or below the marker band.
+    """
+    p = params or MarkerCalibParams()
+    H, W = gray.shape[:2]
+    x0, x1 = int(x_extent[0]), int(x_extent[1])
+    x0 = max(0, min(x0, W - 1))
+    x1 = max(x0, min(x1, W - 1))
+
+    prof = _smooth1d(gray[:, x0:x1 + 1].mean(axis=1).astype(np.float64), p.band_smooth)
+    bright_level = float(np.median(prof[prof >= np.median(prof)]))
+    runs = _bright_runs(prof > p.band_body_frac * bright_level,
+                        max(1, int(p.band_min_h_frac * H)))
+    if not runs:
+        raise ValueError("no bright row-runs found; cannot locate the tube rows")
+
+    b0, b1 = _marker_band_rows(strips)
+    above = [r for r in runs if r[1] <= b0]      # entirely above the band (half-open end)
+    below = [r for r in runs if r[0] > b1]       # entirely below it
+    if not above or not below:
+        raise ValueError(
+            "expected a tube row on each side of the marker band (rows %d..%d); found %d above "
+            "and %d below among runs %r" % (b0, b1, len(above), len(below), runs)
+        )
+    upper = max(above, key=lambda r: r[1])       # nearest above
+    lower = min(below, key=lambda r: r[0])       # nearest below
+
+    if p.band_inset_frac > 0:
+        upper = _inset_band(upper, p.band_inset_frac)
+        lower = _inset_band(lower, p.band_inset_frac)
+    return upper, lower, (upper[1], lower[0])
+
+
+def _inset_band(band: RowBand, frac: float) -> RowBand:
+    y0, y1 = band
+    d = int(round(frac * (y1 - y0)))
+    return (y0 + d, max(y0 + d + 1, y1 - d))
+
+
+# --------------------------------------------------------------------------------------
+# Illuminated mask over the tube bands
+# --------------------------------------------------------------------------------------
+def _band_threshold(gray: np.ndarray, bands: Sequence[RowBand], x_extent: Tuple[int, int],
+                    p: MarkerCalibParams) -> float:
+    """Grey level separating "lit" from "unlit", computed over IN-BAND pixels only.
+
+    Restricting the statistic to the tube rows (and to the vial columns' x extent) is what
+    makes it meaningful: an Otsu over the FULL frame is dominated by the saturated stage and
+    the large dark surround, neither of which is a tube.
+    """
+    x0, x1 = x_extent
+    pool = np.concatenate([gray[y0:y1, x0:x1 + 1].ravel() for y0, y1 in bands])
+    if pool.size == 0:
+        return 0.0
+    if p.illum_method == "relative":
+        dark = float(np.percentile(pool, p.illum_dark_pct))
+        bright = float(np.percentile(pool, p.illum_bright_pct))
+        return dark + p.illum_rel * (bright - dark)
+    thr, _ = cv2.threshold(pool.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return float(thr)
+
+
+def _marker_illum_mask(gray: np.ndarray, bands: Sequence[RowBand], x_extent: Tuple[int, int],
+                       p: MarkerCalibParams) -> np.ndarray:
+    """Lit pixels inside the tube rows; everything else (incl. the central band) zeroed."""
+    H, W = gray.shape[:2]
+    thr = _band_threshold(gray, bands, x_extent, p)
+    mask = np.where(gray > thr, np.uint8(255), np.uint8(0))
+
+    if p.morph_open and p.morph_open > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (p.morph_open, p.morph_open))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    if p.morph_close and p.morph_close > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (p.morph_close, p.morph_close))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    # Keep ONLY the two tube rows: this is what excludes the central marker/hardware band
+    # (and, for free, the saturated stage along the bottom edge and the dark surround).
+    keep = np.zeros((H, W), dtype=bool)
+    x0, x1 = x_extent
+    for y0, y1 in bands:
+        keep[max(0, y0):min(H, y1), max(0, x0):min(W, x1 + 1)] = True
+    mask[~keep] = 0
+    return _drop_small_components(mask, int(p.min_component_frac * H * W))
+
+
+# --------------------------------------------------------------------------------------
+# Public API -- one face
+# --------------------------------------------------------------------------------------
+def build_calibration_from_markers(
+    frame_gray: np.ndarray,
+    face: str,
+    marker_detector,
+    params: Optional[MarkerCalibParams] = None,
+    illum_mask_path: Optional[str] = None,
+) -> Tuple[FaceCalibration, np.ndarray, np.ndarray]:
+    """Build ONE face's calibration from the physical marker band (see module docstring).
+
+    Args:
+        frame_gray: HxW grayscale still of this face, taken during a dwell.
+        face: face name ("A"/"B").
+        marker_detector: duck-typed; needs ``vial_boundaries(frame) -> [(x0, x1), ...]`` and
+            ``find_strips(frame) -> [(r0, r1), ...]`` -- i.e. a
+            `marker_band.MarkerBandDetector`.
+        params: `MarkerCalibParams` (defaults if None).
+        illum_mask_path: stored path for the mask PNG (default ``illum_mask_<face>.png``).
+
+    Returns:
+        ``(face_calibration, illum_mask_uint8, overlay_bgr)``. **Every vial is
+        `present=True`** -- see the module docstring for why this path refuses to auto-exclude.
+        Slots that look empty are reported instead: on the overlay (orange box, "?" suffix) and
+        in ``face_calibration.marker["suspicious"]`` (read back via `suspicious_vials`).
+
+    Raises:
+        ValueError: the detector found no marker band / not enough vial spans, or no tube row
+            could be located on one side of the band.
+    """
+    p = params or MarkerCalibParams()
+    gray = _as_gray(frame_gray)
+    H, W = gray.shape[:2]
+
+    find_strips = getattr(marker_detector, "find_strips", None)
+    if not callable(find_strips):
+        raise ValueError(
+            "marker_detector has no find_strips(); the marker path needs the marker band's row "
+            "position to tell the two tube rows apart (use marker_band.MarkerBandDetector)"
+        )
+    strips = list(find_strips(gray))
+    spans = [(int(a), int(b)) for a, b in marker_detector.vial_boundaries(gray)]
+    if not strips:
+        raise ValueError("marker band not visible in this frame; cannot calibrate face %r" % face)
+    if len(spans) != N_VIAL_COLUMNS:
+        # Hard failure, not a best-effort fallback. Vial ids run 1..2*len(spans) here, while
+        # `pipeline.TrackerPipeline` computes global ids as `face_index * 16 + local_id` with 16
+        # hard-coded (DESIGN.md §2). A face that produced 9 columns would emit local ids up to
+        # 18, and id 17 on face A would silently collide with id 1 on face B -- two different
+        # physical vials logged under one global id, with nothing anywhere reporting it. Better
+        # to stop now, while a human is watching the calibration.
+        raise ValueError(
+            "marker detector returned %d vial span(s) for face %r; expected exactly %d (one per "
+            "vial column). The 16-slots-per-face id scheme depends on it -- check the marker "
+            "band is unobstructed in this frame, or calibrate by hand with `calibrate --wizard`."
+            % (len(spans), face, N_VIAL_COLUMNS)
+        )
+
+    x_extent = (min(a for a, _ in spans), max(b for _, b in spans))
+    upper, lower, central = tube_row_bands(gray, strips, x_extent, p)
+    mask = _marker_illum_mask(gray, (upper, lower), x_extent, p)
+
+    # 16 boxes, row-major: upper band -> ids 1..8, lower band -> ids 9..16, left->right.
+    vials: List[VialROI] = []
+    qc: List[VialQC] = []
+    for row, (y0, y1) in enumerate((upper, lower)):
+        for col, (sx0, sx1) in enumerate(spans):
+            span_w = sx1 - sx0 + 1
+            bw = max(1, int(round(span_w * p.box_w_frac)))
+            bx = int(round(sx0 + (span_w - bw) / 2.0))
+            bx = max(0, min(bx, W - 1))
+            bw = min(bw, W - bx)
+            box = (bx, int(y0), int(bw), int(y1 - y0))
+            # PRESENCE IS ALWAYS TRUE HERE -- see the module docstring.
+            vials.append(VialROI(id=row * len(spans) + col + 1, row=row, col=col,
+                                 x=box[0], y=box[1], w=box[2], h=box[3], present=True))
+            qc.append(_vial_qc(vials[-1].id, gray, mask, box))
+
+    _flag_suspicious(qc, p)
+    face_cal = FaceCalibration(
+        name=face,
+        vials=vials,
+        illum_mask_path=illum_mask_path or ("illum_mask_%s.png" % face),
+        marker={
+            "source": "marker_band",
+            "strips": [[int(a), int(b)] for a, b in strips],
+            "vial_spans": [[int(a), int(b)] for a, b in spans],
+            "row_bands": {"upper": [int(upper[0]), int(upper[1])],
+                          "lower": [int(lower[0]), int(lower[1])]},
+            "central_band": [int(central[0]), int(central[1])],
+            "presence_policy": "all present; empties are reported, never auto-excluded",
+            "suspicious": [q.id for q in qc if q.suspicious],
+            "vial_qc": [q.as_dict() for q in qc],
+        },
+    )
+    overlay = _draw_marker_overlay(gray, vials, mask, spans, (upper, lower), central, qc)
+    return face_cal, mask, overlay
+
+
+def _vial_qc(vial_id: int, gray: np.ndarray, mask: np.ndarray, box: Box) -> VialQC:
+    x, y, w, h = box
+    sub_mask = mask[y:y + h, x:x + w]
+    sub_gray = gray[y:y + h, x:x + w]
+    lit_frac = float((sub_mask > 0).mean()) if sub_mask.size else 0.0
+    median_gray = float(np.median(sub_gray)) if sub_gray.size else 0.0
+    return VialQC(id=vial_id, lit_frac=lit_frac, median_gray=median_gray, suspicious=False)
+
+
+def _flag_suspicious(qc: Sequence[VialQC], p: MarkerCalibParams) -> None:
+    """Mark slots whose lit area is far below the rest of the face's. ADVISORY ONLY.
+
+    A slot is suspicious when its lit fraction is below BOTH thresholds, i.e. below their
+    MINIMUM:
+
+      * ``suspect_lit_frac_rel * median(lit_frac)`` -- the substantive test. It has to be
+        relative to the face's own median because the back-lighting is non-uniform and
+        left-biased (DESIGN.md §2): "dim" only means anything compared with this face's norm.
+      * ``suspect_lit_frac_abs`` -- a ceiling, not a floor. However far under the median a slot
+        sits, a slot that is still 60% lit is plainly a real, measurable vial and saying
+        otherwise would be noise.
+
+    Taking the MINIMUM (an AND) is what keeps the flag informative on a globally dim rig: if
+    every slot images at ~0.5 lit, the maximum would put the cut at 0.60 and flag all 16, which
+    tells a human nothing. The minimum puts it at 0.30 and flags only what genuinely stands out.
+
+    Nothing here touches `VialROI.present` -- see the module docstring.
+    """
+    if not qc:
+        return
+    med = float(np.median([q.lit_frac for q in qc]))
+    thr = min(p.suspect_lit_frac_abs, p.suspect_lit_frac_rel * med)
+    for q in qc:
+        q.suspicious = bool(q.lit_frac < thr)
+
+
+def suspicious_vials(face_cal: FaceCalibration) -> List[int]:
+    """Ids a marker-built face flagged as looking empty (they are still `present=True`).
+
+    Returns ``[]`` for a face built by any other path, or one with nothing flagged.
+    """
+    marker = face_cal.marker
+    if not isinstance(marker, dict):
+        return []
+    return [int(i) for i in marker.get("suspicious", [])]
+
+
+def _draw_marker_overlay(gray: np.ndarray, vials: Sequence[VialROI], mask: np.ndarray,
+                         spans: Sequence[Tuple[int, int]], bands: Sequence[RowBand],
+                         central: RowBand, qc: Sequence[VialQC]) -> np.ndarray:
+    """Human-check overlay for the marker path.
+
+    Draws: the trackable (lit) pixels tinted green; the two tube row-bands as blue rules; the
+    excluded central marker/hardware band as a cyan wash; the 8 marker-derived vial spans as
+    magenta ticks along the top; and the 16 boxes with their ids -- GREEN for a normal slot,
+    ORANGE with a "?" for a slot flagged suspicious (which is still measured; see the module
+    docstring).
+    """
+    vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    H, W = gray.shape[:2]
+
+    tint = np.zeros_like(vis)
+    tint[mask > 0] = (0, 60, 0)
+    vis = cv2.add(vis, tint)
+
+    # excluded central band (marker strips + mounting hardware)
+    cy0, cy1 = max(0, central[0]), min(H, central[1])
+    if cy1 > cy0:
+        band = vis.copy()
+        cv2.rectangle(band, (0, cy0), (W - 1, cy1), (255, 255, 0), -1)
+        vis = cv2.addWeighted(vis, 0.75, band, 0.25, 0)
+        cv2.rectangle(vis, (0, cy0), (W - 1, cy1), (255, 255, 0), 2)
+        cv2.putText(vis, "marker/hardware band - EXCLUDED", (10, cy0 + 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+    # tube row bands
+    for y0, y1 in bands:
+        for y in (y0, y1 - 1):
+            cv2.line(vis, (0, int(y)), (W - 1, int(y)), (255, 120, 0), 1)
+
+    # marker-derived vial spans (the x source of truth)
+    for i, (sx0, sx1) in enumerate(spans):
+        cv2.line(vis, (int(sx0), 2), (int(sx1), 2), (255, 0, 255), 4)
+        cv2.line(vis, (int(sx0), 0), (int(sx0), 14), (255, 0, 255), 2)
+        cv2.line(vis, (int(sx1), 0), (int(sx1), 14), (255, 0, 255), 2)
+        cv2.putText(vis, "c%d" % (i + 1), (int(sx0) + 4, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
+    flagged = {q.id: q for q in qc}
+    for v in vials:
+        q = flagged.get(v.id)
+        suspect = bool(q is not None and q.suspicious)
+        color = (0, 165, 255) if suspect else (0, 200, 0)
+        cv2.rectangle(vis, (v.x, v.y), (v.x + v.w, v.y + v.h), color, 2)
+        label = "%d?" % v.id if suspect else str(v.id)
+        cv2.putText(vis, label, (v.x + 4, v.y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        if q is not None:
+            cv2.putText(vis, "lit %.2f" % q.lit_frac, (v.x + 4, v.y + v.h - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    if any(q.suspicious for q in qc):
+        ids = ",".join(str(q.id) for q in qc if q.suspicious)
+        cv2.putText(vis, "suspicious (still measured): %s" % ids, (10, H - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+    return vis
+
+
+# --------------------------------------------------------------------------------------
+# Public API -- both faces, from a flip video
+# --------------------------------------------------------------------------------------
+@dataclass
+class Dwell:
+    """One stationary period of the drum, as found by `find_dwells`."""
+
+    start: int            # first frame index of the dwell
+    end: int              # last frame index (inclusive)
+    rep_index: int        # the representative frame index picked from it (its midpoint)
+    face: Optional[str] = None        # filled in by `register_faces_from_dwells`
+    face_score: float = float("nan")  # marker similarity to `face` (1.0 = the registration frame)
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
+
+
+def find_dwells(video_path: str, params: Optional[MarkerCalibParams] = None
+                ) -> Tuple[List[Dwell], Dict[int, np.ndarray], Tuple[int, int]]:
+    """Find the drum's stationary periods in a flip video and grab one frame from each.
+
+    The drum alternates rotate / dwell / rotate / dwell..., and only a dwell is calibratable.
+    Dwells are the runs of low global ``mean|frame - prev_frame|`` (DESIGN.md §5.1's metric,
+    used here purely as an offline segmenter, not as the online detector).
+
+    The threshold is ``dwell_quiet_ratio`` x the clip's own MEDIAN metric, so it scales itself
+    to the rig's noise floor instead of assuming a magnitude. The median is a dwell-population
+    value whenever the drum spends more of the clip parked than turning, which is true by
+    construction for a calibration recording. Measured on `Good Markers.avi`: dwell frames sit
+    at 0.32-0.45 (median 0.352, occasional micro-event excursions to ~1.5) and rotation frames
+    at 8.4-72.7, so the default 10x (= 3.5) lands in an empty gap that is 5x wide on either
+    side. Anything from ~4x to ~20x segments this clip identically; dropping to 2-3x additionally
+    splits each dwell at its internal micro-events (43 fragments instead of 14 true dwells),
+    which costs nothing but noise since only a midpoint frame per dwell is used.
+
+    Two passes over the file: the first measures the metric (a float per frame), the second
+    re-reads and keeps ONLY the chosen representative frames, so memory stays at ~one frame per
+    dwell rather than the whole clip.
+
+    Returns:
+        ``(dwells, {frame_index: gray_frame}, (width, height))``.
+
+    Raises:
+        ValueError: the video cannot be opened, or holds fewer than 2 frames.
+    """
+    p = params or MarkerCalibParams()
+    metric: List[float] = []
+    prev: Optional[np.ndarray] = None
+    size = (0, 0)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("could not open video %r" % video_path)
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = _as_gray(frame)
+            size = (gray.shape[1], gray.shape[0])
+            if prev is not None:
+                metric.append(float(cv2.absdiff(gray, prev).mean()))
+            prev = gray
+    finally:
+        cap.release()
+
+    if len(metric) < 1:
+        raise ValueError("video %r holds fewer than 2 frames" % video_path)
+
+    # `<=` (not `<`) so a perfectly static clip -- median 0, threshold 0 -- still reads as one
+    # long dwell instead of raising "no dwell found". On real footage sensor noise makes the
+    # metric strictly positive and the distinction is immaterial.
+    quiet = np.asarray(metric) <= p.dwell_quiet_ratio * float(np.median(metric))
+    dwells: List[Dwell] = []
+    for a, b in _bright_runs(quiet, max(1, int(p.dwell_min_frames))):
+        # metric[i] compares frame i+1 with frame i, so a quiet metric run [a, b) means
+        # frames a..b are mutually still.
+        start, end = a, b
+        dwells.append(Dwell(start=start, end=end, rep_index=(start + end) // 2))
+    if not dwells:
+        raise ValueError(
+            "no dwell (stationary period) found in %r: the drum never held still for "
+            "%d frames" % (video_path, p.dwell_min_frames)
+        )
+
+    wanted = {d.rep_index for d in dwells}
+    reps: Dict[int, np.ndarray] = {}
+    cap = cv2.VideoCapture(video_path)
+    try:
+        idx = 0
+        while wanted:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx in wanted:
+                reps[idx] = _as_gray(frame)
+                wanted.discard(idx)
+            idx += 1
+    finally:
+        cap.release()
+    return dwells, reps, size
+
+
+#: Face names assigned to distinct faces in the order they are first seen.
+FACE_NAMES = ("A", "B")
+
+
+def register_faces_from_dwells(
+    dwells: Sequence[Dwell],
+    reps: Mapping[int, np.ndarray],
+    marker_detector,
+    params: Optional[MarkerCalibParams] = None,
+) -> Dict[str, List[Dwell]]:
+    """Register one marker template per DISTINCT face and label every dwell with its face.
+
+    This is the bootstrap: `identify_face` needs a template per face, but a template can only be
+    registered from a frame already known to show that face. Walking the dwells in time order
+    solves it -- the first dwell defines face "A"; the first dwell that does not match "A"
+    defines face "B"; everything after that is scored against both.
+
+    WHY THE MARKER SIGNATURE AND NOT RAW FRAME SIMILARITY. Comparing raw frames
+    (``mean|rep_i - rep_0|``) looks like it should work -- on adjacent dwells of `Good Markers.avi`
+    same-face pairs differ by ~1.2 grey levels and flips by ~19.4. But that statistic DRIFTS
+    over a clip: face A's own dwells measure 1.28 against the first dwell early on and 9.28-9.71
+    by the end, which overlaps the flipped population and mislabels 5 of 14 dwells (measured).
+    The marker signature has no such drift -- it is percentile-relative, cropped to the strips'
+    lit extent and resampled (see `marker_band`), so it measures the sticker PATTERN and not the
+    scene. Measured over the same dwells: same-face score 0.9876..1.0000, other-face
+    -0.2494..-0.2327, i.e. a **gap of 1.22** with the `face_match_score` cut (0.50) sitting in
+    the middle of it. It labels 14/14 (and 43/43 under the finer segmentation) correctly.
+
+    Mutates `marker_detector` (registers templates) and the `Dwell` objects (sets `face` and
+    `face_score`), so the same detector instance can be handed straight to `TrackerPipeline`.
+
+    Returns:
+        ``{face_name: [Dwell, ...]}`` in time order. Dwells whose marker band is not readable
+        are skipped entirely (they appear in no group).
+
+    Raises:
+        ValueError: not one dwell had a readable marker band.
+    """
+    p = params or MarkerCalibParams()
+    groups: Dict[str, List[Dwell]] = {}
+    registered: List[str] = []
+
+    for d in dwells:
+        frame = reps.get(d.rep_index)
+        if frame is None:
+            continue
+        if not registered:
+            try:
+                marker_detector.register_face(frame, FACE_NAMES[0])
+            except ValueError:
+                continue                       # no band in this frame; try the next dwell
+            registered.append(FACE_NAMES[0])
+            d.face, d.face_score = FACE_NAMES[0], 1.0
+            groups.setdefault(FACE_NAMES[0], []).append(d)
+            continue
+
+        scores = marker_detector.score_faces(frame)
+        if not scores:
+            continue                           # band not readable in this dwell
+        best = max(scores, key=lambda f: scores[f])
+        if scores[best] < p.face_match_score and len(registered) < len(FACE_NAMES):
+            best = FACE_NAMES[len(registered)]
+            marker_detector.register_face(frame, best)
+            registered.append(best)
+            d.face_score = 1.0
+        else:
+            d.face_score = float(scores[best])
+        d.face = best
+        groups.setdefault(best, []).append(d)
+
+    if not groups:
+        raise ValueError(
+            "the marker band was not readable in any of the %d dwell frame(s); cannot identify "
+            "faces (is this a marker-band rig? see marker_band.MarkerBandDetector)" % len(dwells)
+        )
+    return groups
+
+
+def build_two_face_calibration(
+    video_path: str,
+    marker_detector,
+    out_dir: str,
+    params: Optional[MarkerCalibParams] = None,
+) -> Calibration:
+    """Calibrate BOTH drum faces from one flip video and save the bundle to `out_dir`.
+
+    Pipeline:
+      1. `find_dwells` -- segment the clip into stationary periods, one representative frame each.
+      2. `register_faces_from_dwells` -- walk the dwells in time order, registering a
+         `marker_detector` template from the FIRST dwell of each distinct face ("A", then "B")
+         and labelling every dwell with the face it shows.
+      3. Pick each face's representative frame from its LONGEST dwell -- the most settled one.
+      4. `build_calibration_from_markers` per face -> a 16-slot `FaceCalibration` (all
+         `present=True`), an illuminated mask and an overlay.
+      5. Save via `save_calibration`: ``calibration.json`` + ``illum_mask_<face>.png`` +
+         ``overlay_<face>.png`` per face.
+
+    The detector is mutated in place (its templates are registered in step 2), so the SAME
+    instance can be handed straight to `pipeline.TrackerPipeline(marker_detector=...)`. The
+    templates are also stored in each face's ``marker["band_templates"]``, so a later run can
+    rebuild an equivalent detector from the bundle alone -- see
+    `marker_detector_from_calibration`.
+
+    Returns:
+        The saved `Calibration` (1 face if the clip only ever showed one, else 2).
+
+    Raises:
+        ValueError: no dwell found, or the marker band is unusable in the chosen frames.
+    """
+    p = params or MarkerCalibParams()
+    dwells, reps, (width, height) = find_dwells(video_path, p)
+    groups = register_faces_from_dwells(dwells, reps, marker_detector, p)
+    n_labelled = sum(len(g) for g in groups.values())
+
+    faces: Dict[str, FaceCalibration] = {}
+    masks: Dict[str, np.ndarray] = {}
+    overlays: Dict[str, np.ndarray] = {}
+    notes: List[str] = []
+    for name in sorted(groups):
+        group = groups[name]
+        best = max(group, key=lambda d: d.length)
+        face_cal, mask, overlay = build_calibration_from_markers(
+            reps[best.rep_index], name, marker_detector, p)
+        sig = getattr(marker_detector, "templates", {}).get(name)
+        if sig is not None:
+            face_cal.marker["band_templates"] = [np.asarray(s).tolist() for s in sig]
+        face_cal.marker["source_frame"] = int(best.rep_index)
+        face_cal.marker["n_dwells"] = len(group)
+        faces[name] = face_cal
+        masks[name] = mask
+        overlays[name] = overlay
+        scored = [d.face_score for d in group if d.face_score == d.face_score]  # drop NaN
+        flagged = suspicious_vials(face_cal)
+        notes.append("face %s: frame %d (longest of %d dwells, %d frames), %d vials, "
+                     "min marker score %.3f, suspicious=%s"
+                     % (name, best.rep_index, len(group), best.length, len(face_cal.vials),
+                        min(scored) if scored else float("nan"),
+                        flagged if flagged else "none"))
+
+    calib = Calibration(
+        image_width=int(width), image_height=int(height), faces=faces,
+        created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        notes=("marker-band calibration from %s: %d dwells, %d labelled, %d face(s). "
+               "ALL slots present=True by policy -- suspicious slots are reported, not "
+               "excluded. " % (os.path.basename(video_path), len(dwells), n_labelled,
+                               len(faces))) + "; ".join(notes),
+    )
+    save_calibration(calib, masks, out_dir, overlay=overlays)
+    return calib
+
+
+def marker_detector_from_calibration(calib: Calibration):
+    """Rebuild a `marker_band.MarkerBandDetector` from templates stored in a saved bundle.
+
+    Lets a restarted run identify faces with exactly the templates it was calibrated with,
+    instead of re-deriving them. Returns ``None`` if the bundle carries no band templates
+    (i.e. it was not built by the marker path).
+    """
+    from flygym_tracker.marker_band import MarkerBandDetector
+
+    templates = {}
+    for name, fc in calib.faces.items():
+        marker = fc.marker
+        if isinstance(marker, dict) and marker.get("band_templates"):
+            templates[name] = marker["band_templates"]
+    if not templates:
+        return None
+    return MarkerBandDetector(templates=templates)

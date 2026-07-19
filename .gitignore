@@ -14,3 +14,4 @@ output/
 calib/overlay_*.png
 # keep calibration bundle + committed sample docs
 !docs/*.png
+calib_faces/overlay_*.png

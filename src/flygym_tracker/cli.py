@@ -33,14 +33,18 @@ import yaml
 
 from flygym_tracker.calibrate_wizard import run_wizard
 from flygym_tracker.calibration import (
+    MarkerCalibParams,
     boxes_from_calibration,
+    build_two_face_calibration,
     detect_calibration,
     load_calibration,
     save_calibration,
+    suspicious_vials,
 )
 from flygym_tracker.config import load_config
 from flygym_tracker.frame_source import HikCameraSource, VideoFileSource
 from flygym_tracker.logger import ActivityLogger
+from flygym_tracker.marker_band import MarkerBandDetector
 from flygym_tracker.markers import MarkerDetector
 from flygym_tracker.monitor import LiveMonitor
 from flygym_tracker.pipeline import TrackerPipeline, measure_noise
@@ -232,6 +236,88 @@ def _cmd_calibrate(args) -> int:
 
 
 # =============================================================================================
+# calibrate-faces (marker-band driven, both drum faces from one flip video)
+# =============================================================================================
+def _marker_params_from_config(config) -> Optional[MarkerCalibParams]:
+    """Build a `MarkerCalibParams` from an optional ``calibration.marker_params`` config block.
+
+    The packaged config has no such block, so this normally returns None (= library defaults).
+    It exists so an odd rig can be re-tuned from a YAML file instead of a code change; unknown
+    keys are rejected loudly rather than silently ignored.
+    """
+    calibration_cfg = config.get("calibration") if config is not None else None
+    raw = calibration_cfg.get("marker_params") if calibration_cfg is not None else None
+    if raw is None:
+        return None
+    raw = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw)
+    known = set(MarkerCalibParams.__dataclass_fields__)
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(
+            "unknown calibration.marker_params key(s): %s (valid: %s)"
+            % (", ".join(unknown), ", ".join(sorted(known)))
+        )
+    return MarkerCalibParams(**raw)
+
+
+def _cmd_calibrate_faces(args) -> int:
+    """Calibrate BOTH drum faces from one flip video, using the physical marker band.
+
+    This is the 32-vial path: the rig shows Face A then Face B (16 vials each), so a clip that
+    contains at least one flip carries everything needed to calibrate both at once. Vial x
+    positions come from the marker band (a measurement) rather than a brightness guess, and NO
+    slot is auto-excluded -- see `calibration`'s module docstring for why that asymmetry matters.
+    """
+    config = None
+    if args.config is not None:
+        try:
+            config = load_config(path=args.config)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    try:
+        params = _marker_params_from_config(config)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    detector = MarkerBandDetector()
+    try:
+        calib = build_two_face_calibration(args.video, detector, args.out, params=params)
+    except ValueError as e:
+        print(
+            f"error: {e}\n"
+            "Check that the clip contains at least one full dwell and that the marker band is "
+            "visible; otherwise calibrate each face by hand with `calibrate --wizard`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    total = sum(len(fc.vials) for fc in calib.faces.values())
+    print(f"calibration saved to {args.out!r}")
+    print(f"  faces found : {', '.join(sorted(calib.faces))} ({len(calib.faces)})")
+    print(f"  vials       : {total} total")
+    for name in sorted(calib.faces):
+        fc = calib.faces[name]
+        flagged = suspicious_vials(fc)
+        gvids = [_face_index(calib, name) * 16 + v.id for v in fc.vials]
+        print(f"  face {name}: {len(fc.vials)} vials (global ids {min(gvids)}-{max(gvids)}), "
+              f"all present=True")
+        if flagged:
+            print(f"    SUSPICIOUS (little of the slot is lit -- still measured, review "
+                  f"overlay_{name}.png): local ids {flagged}")
+        else:
+            print("    no suspicious slots")
+    print(f"  notes       : {calib.notes}")
+    return 0
+
+
+def _face_index(calib, name: str) -> int:
+    """Face ordinal used for global vial ids (matches `pipeline.TrackerPipeline`)."""
+    return sorted(calib.faces).index(name)
+
+
+# =============================================================================================
 # noise
 # =============================================================================================
 def _cmd_noise(args) -> int:
@@ -369,6 +455,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cal.add_argument("--config", default=None, help="Config YAML (only consulted with --from-camera).")
     p_cal.set_defaults(handler=_cmd_calibrate)
+
+    # -- calibrate-faces ----------------------------------------------------------------------
+    p_faces = subparsers.add_parser(
+        "calibrate-faces",
+        help="Calibrate BOTH drum faces (32 vials) from one flip video, using the marker band.",
+        description=(
+            "Marker-band calibration of both drum faces from a single video containing at least "
+            "one 180-degree flip. Vial columns are read from the rig's physical IR sticker band "
+            "rather than inferred from brightness, and every slot is emitted present=True -- "
+            "slots that look empty are flagged for review, never silently excluded."
+        ),
+    )
+    p_faces.add_argument("--video", required=True, help="Flip video (must contain >= 1 dwell per face).")
+    p_faces.add_argument("--out", required=True, help="Output calibration bundle directory.")
+    p_faces.add_argument(
+        "--config", default=None,
+        help="Config YAML; an optional `calibration.marker_params` block overrides the tuning defaults.",
+    )
+    p_faces.set_defaults(handler=_cmd_calibrate_faces)
 
     # -- noise --------------------------------------------------------------------------------
     p_noise = subparsers.add_parser(
