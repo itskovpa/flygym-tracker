@@ -42,6 +42,7 @@ from flygym_tracker.config import load_config
 from flygym_tracker.frame_source import HikCameraSource, VideoFileSource
 from flygym_tracker.logger import ActivityLogger
 from flygym_tracker.markers import MarkerDetector
+from flygym_tracker.monitor import LiveMonitor
 from flygym_tracker.pipeline import TrackerPipeline, measure_noise
 
 #: Shared "thresholds are missing" remediation, appended to the pipeline's own ValueError text.
@@ -121,11 +122,18 @@ def _load_run_config(args):
     return load_config(path=args.config, overrides=overrides)
 
 
-def _run_pipeline_or_report(config, calib, source, logger, marker_detector, *, clock, max_frames, stop_flag) -> int:
+def _run_pipeline_or_report(
+    config, calib, source, logger, marker_detector, *, clock, max_frames, stop_flag, monitor=False,
+) -> int:
     """Construct + run a `TrackerPipeline`, turning its two documented construction-time failure
     modes into a short message instead of a traceback: null thresholds (ValueError -- DESIGN.md
     section 5.1/5.3, the "last bit" that needs `noise`) and an unreadable calibration mask
-    (RuntimeError -- e.g. a hand-edited or half-written calibration bundle)."""
+    (RuntimeError -- e.g. a hand-edited or half-written calibration bundle).
+
+    `monitor=True` (the `--monitor` flag) wires a `LiveMonitor` (monitor.py) as a pipeline
+    observer -- a live tracking/activity window the scientist can watch (and nudge
+    `pixel_threshold` from) while the run is in progress, without changing anything about the run
+    itself (DESIGN.md's `noise`/output-file wiring is unaffected either way)."""
     try:
         pipe = TrackerPipeline(config, calib, source, logger, marker_detector=marker_detector, clock=clock)
     except ValueError as e:
@@ -137,7 +145,19 @@ def _run_pipeline_or_report(config, calib, source, logger, marker_detector, *, c
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    summary = pipe.run(max_frames=max_frames, stop_flag=stop_flag)
+    live_monitor = None
+    if monitor:
+        live_monitor = LiveMonitor(
+            calib, config, on_threshold_change=lambda v: setattr(pipe, "pixel_threshold", v),
+        )
+        pipe.add_observer(live_monitor.on_frame)
+        pipe.add_bin_observer(live_monitor.on_bin)
+
+    try:
+        summary = pipe.run(max_frames=max_frames, stop_flag=stop_flag)
+    finally:
+        if live_monitor is not None:
+            live_monitor.close()
     print(json.dumps(summary, indent=2))
     return 0
 
@@ -295,7 +315,7 @@ def _cmd_run(args) -> int:
 
     return _run_pipeline_or_report(
         config, calib, source, logger, marker_detector,
-        clock="auto", max_frames=args.max_frames, stop_flag=stop_flag,
+        clock="auto", max_frames=args.max_frames, stop_flag=stop_flag, monitor=args.monitor,
     )
 
 
@@ -318,7 +338,7 @@ def _cmd_replay(args) -> int:
     # (pipeline.py), which is exactly the "offline dev path bins by content time" behaviour wanted.
     return _run_pipeline_or_report(
         config, calib, source, logger, marker_detector,
-        clock="auto", max_frames=args.max_frames, stop_flag=None,
+        clock="auto", max_frames=args.max_frames, stop_flag=None, monitor=args.monitor,
     )
 
 
@@ -370,6 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
     p_run.add_argument("--duration", type=float, default=None, help="Stop after this many wall-clock seconds.")
     p_run.add_argument("--out", default=None, help="Output directory (default: config output.dir).")
+    p_run.add_argument(
+        "--monitor", action="store_true",
+        help="Show a live tracking/activity monitor window while running (monitor.py).",
+    )
     p_run.set_defaults(handler=_cmd_run)
 
     # -- replay -------------------------------------------------------------------------------
@@ -382,6 +406,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--bin-seconds", type=float, default=None, help="Override binning.bin_seconds.")
     p_replay.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
     p_replay.add_argument("--out", default=None, help="Output directory (default: config output.dir).")
+    p_replay.add_argument(
+        "--monitor", action="store_true",
+        help="Show a live tracking/activity monitor window while replaying (monitor.py).",
+    )
     p_replay.set_defaults(handler=_cmd_replay)
 
     return parser

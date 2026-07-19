@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -73,6 +73,8 @@ DEFAULT_READ_RETRY_SLEEP = 0.5
 #: measure_noise: enter/exit threshold heuristic multipliers on the per-frame metric std.
 DEFAULT_ENTER_K = 8.0
 DEFAULT_EXIT_K = 4.0
+#: Rolling window (frame count) for the observer-facing `fps_est` estimate (see `add_observer`).
+DEFAULT_FPS_WINDOW = 30
 
 Bbox = Tuple[int, int, int, int]
 
@@ -258,6 +260,69 @@ class TrackerPipeline:
         self.frames_read_errors = 0
         self._per_face_frames: Dict[str, int] = {name: 0 for name in calibration.faces}
 
+        # -- observers (opt-in; see "observers" section below) --------------------------------
+        self._observers: List[Callable[[dict], None]] = []
+        self._bin_observers: List[Callable[[dict], None]] = []
+        self.observer_failures = 0
+        self._fps_times: List[float] = []
+
+    # ---- observers ----------------------------------------------------------------------------
+    #
+    # Optional, opt-in hooks for a live-monitoring UI (monitor.py) or any other passive watcher.
+    # Registering nothing costs nothing: `_process_frame`/`_emit_bin` only build a payload and walk
+    # the observer list when at least one is registered, so an unmonitored run's behaviour and
+    # performance are unchanged from before these hooks existed. Every observer call is wrapped in
+    # try/except -- a raising observer is counted in `observer_failures` and otherwise ignored; it
+    # can never abort the run.
+
+    def add_observer(self, callback: Callable[[dict], None]) -> None:
+        """Register a per-frame observer, called after every processed frame with a dict:
+        ``{"frame", "index", "elapsed_s", "state", "face", "vial_results", "n_rotations",
+        "fps_est", "pixel_threshold"}``. ``vial_results`` is the same
+        ``{gvid: (motion_px, lit_area_px, active_fraction)}`` mapping (or ``{}``/``None``) that was
+        just fed to the accumulator for this frame -- see `_process_frame`. Purely additive/
+        read-only from the pipeline's point of view; nothing an observer does can feed back into
+        measurement.
+        """
+        self._observers.append(callback)
+
+    def add_bin_observer(self, callback: Callable[[dict], None]) -> None:
+        """Register a bin-completion observer, called whenever a bin rolls over (including the
+        final, possibly-partial bin flushed at run end) with
+        ``{"bin": ActivityBin, "records": [ActivityRecord, ...]}``."""
+        self._bin_observers.append(callback)
+
+    def _notify(self, observers: List[Callable[[dict], None]], payload: dict) -> None:
+        """Call every observer with `payload`, isolating (and counting) failures."""
+        for callback in observers:
+            try:
+                callback(payload)
+            except Exception:
+                self.observer_failures += 1
+
+    def _notify_frame_observers(self, frame, gray, elapsed_s, state, vial_results) -> None:
+        now = float(frame.t_monotonic)
+        self._fps_times.append(now)
+        if len(self._fps_times) > DEFAULT_FPS_WINDOW:
+            del self._fps_times[0]
+        if len(self._fps_times) >= 2:
+            span = self._fps_times[-1] - self._fps_times[0]
+            fps_est = (len(self._fps_times) - 1) / span if span > 0 else 0.0
+        else:
+            fps_est = 0.0
+        payload = {
+            "frame": gray,
+            "index": int(frame.index),
+            "elapsed_s": float(elapsed_s),
+            "state": state,
+            "face": self._current_face,
+            "vial_results": vial_results,
+            "n_rotations": self.n_rotations,
+            "fps_est": fps_est,
+            "pixel_threshold": self.pixel_threshold,
+        }
+        self._notify(self._observers, payload)
+
     # ---- precompute -------------------------------------------------------------------------
 
     def _precompute_faces(self) -> None:
@@ -366,6 +431,7 @@ class TrackerPipeline:
             "faces_seen": list(self._faces_seen),
             "per_face_frames": dict(self._per_face_frames),
             "stopped_reason": stopped_reason,
+            "observer_failures": self.observer_failures,
         }
 
     # ---- per-frame processing ---------------------------------------------------------------
@@ -395,21 +461,28 @@ class TrackerPipeline:
             self._handle_onset(gray, elapsed_s, frame)
             self._prev_stationary = None  # fresh baseline for the new stationary period
 
-        # Accumulate EVERY frame so bins keep rolling even through long rotations.
+        # Accumulate EVERY frame so bins keep rolling even through long rotations. `obs_vial_results`
+        # mirrors exactly whatever vial_results dict (or None) was fed to the accumulator this frame
+        # -- captured only so an observer (monitor.py) can see the same numbers; it is never read
+        # back into measurement.
+        obs_vial_results: Optional[Dict[int, Tuple[int, int, float]]] = None
         if state == TrackState.STATIONARY:
             if self._prev_stationary is None:
                 # First stationary frame after a reset: seed the baseline, no pair yet -> no motion.
                 self._prev_stationary = gray
-                rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, {})
+                obs_vial_results = {}
+                rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, obs_vial_results)
             else:
                 vial_results = self._compute_vial_results(gray)
                 self._prev_stationary = gray
+                obs_vial_results = vial_results
                 rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, vial_results)
         elif state == TrackState.ROTATING:
             # Feed present-vial keys (motion/active ignored by the accumulator for ROTATING) so
             # `n_rotating_frames`/`lit_area_px` stay populated -> a bin straddling a rotation is
             # interpretable (DESIGN §5.3), instead of vanishing from the table entirely.
-            rolled = self.accumulator.add(elapsed_s, state, self._rotating_placeholder())
+            obs_vial_results = self._rotating_placeholder()
+            rolled = self.accumulator.add(elapsed_s, state, obs_vial_results)
         else:
             # SETTLING / UNKNOWN: excluded from activity; add() only advances the bin clock.
             rolled = self.accumulator.add(elapsed_s, state, None)
@@ -418,6 +491,9 @@ class TrackerPipeline:
 
         self._per_face_frames[self._current_face] = self._per_face_frames.get(self._current_face, 0) + 1
         self._prev_state = state
+
+        if self._observers:
+            self._notify_frame_observers(frame, gray, elapsed_s, state, obs_vial_results)
 
     def _handle_onset(self, gray: np.ndarray, elapsed_s: float, frame) -> None:
         """Stationary onset: identify face (marker or default 'A'), maybe face_change, register."""
@@ -513,6 +589,8 @@ class TrackerPipeline:
         if records:
             self.logger.log_activity(records)
             self.n_activity_records += len(records)
+        if self._bin_observers:
+            self._notify(self._bin_observers, {"bin": bin_obj, "records": records})
 
     def _bin_to_records(self, bin_obj) -> List[ActivityRecord]:
         bin_start_iso = self._iso_at(bin_obj.bin_start_s)
