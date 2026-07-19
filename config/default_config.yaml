@@ -37,8 +37,11 @@ binning:
   bin_seconds: 60
 
 markers:
-  enabled: false          # flip to true once physical IR-opaque markers are added
-  # decode params filled in when markers exist
+  # The FlyGym v2 drum flips ~180 degrees and shows both faces, so face identification is on by
+  # default. The physical markers exist (IR-opaque stickers on the rotation axis) and are decoded
+  # by marker_band.MarkerBandDetector; a bundle learns one template per face via `select-vials`.
+  # Set false only for a rig that genuinely presents a single face.
+  enabled: true
 
 output:
   dir: "output"

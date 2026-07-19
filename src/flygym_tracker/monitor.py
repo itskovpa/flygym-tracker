@@ -321,7 +321,9 @@ class LiveMonitor:
         state = payload.get("state")
         color = _STATE_COLORS.get(state, (200, 200, 200))
         state_label = getattr(state, "value", str(state)).upper()
-        face = payload.get("face", "?")
+        # `face` is None until the first confident identification (pipeline._handle_onset); the
+        # monitor says "?" rather than "None", because "not yet known" is the honest reading.
+        face = payload.get("face") or "?"
         elapsed_s = float(payload.get("elapsed_s", 0.0))
         fps_est = float(payload.get("fps_est", 0.0))
         n_rot = int(payload.get("n_rotations", 0))

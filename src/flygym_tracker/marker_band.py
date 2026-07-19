@@ -429,6 +429,15 @@ class MarkerBandDetector:
         self.templates[face_name] = sig
         return sig
 
+    def can_identify(self) -> bool:
+        """True if `identify_face` could ever return a face -- i.e. two templates are registered.
+
+        `pipeline.TrackerPipeline` asks this at startup to decide whether face identification is
+        something it should WAIT for. A detector that cannot discriminate must not put the run
+        into "face unknown" forever; it has to be reported instead (`cli.face_id_readiness`).
+        """
+        return len(self.templates) >= 2
+
     def score_faces(self, frame_gray) -> Dict[str, float]:
         """Similarity in [-1, 1] of this frame to every registered face. ``{}`` if no band.
 

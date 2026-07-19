@@ -34,7 +34,10 @@ binning:
   bin_seconds: 10             # user-defined; 10 s shown here, set per experiment
 
 markers:
-  enabled: false              # NOT needed: the rig rocks (one face), it does not flip to a back side
+  # REQUIRED: the drum flips ~180 degrees and shows BOTH faces for roughly equal time, so the
+  # marker band is the only thing that says which 16 vials are on screen. With this off, every
+  # face-B vial is recorded as face A (it happened - see face_learning.py).
+  enabled: true
 
 output:
   dir: "output"

@@ -64,6 +64,7 @@ decides, and marks a slot absent by hand (edit `calibration.json`, or re-run the
 from __future__ import annotations
 
 import collections.abc
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1754,14 +1755,120 @@ def marker_detector_from_calibration(calib: Calibration):
     Lets a restarted run identify faces with exactly the templates it was calibrated with,
     instead of re-deriving them. Returns ``None`` if the bundle carries no band templates
     (i.e. it was not built by the marker path).
+
+    THIS IS THE DETECTOR THE RUN PATH MUST USE. `MarkerBandDetector` is the face-ID scheme that
+    was validated on real rig footage (43/43 dwells); `markers.MarkerDetector` is the older
+    generic contour scheme that no bundle from either current calibration flow can feed. For a
+    long time nothing in ``src/`` called this function -- only a test did -- and `cli` built the
+    generic detector instead, so the validated code was never in the run path at all and every
+    face came back as the default. See `cli._build_marker_detector`.
+
+    Any band-detector SETTINGS stored alongside the templates (`attach_face_templates` writes
+    them under ``marker["band_detector"]``) are restored too. Templates are only comparable to
+    profiles extracted the same way, so rebuilding a detector on default settings when the
+    templates were learned on custom ones would silently degrade every score.
     """
     from flygym_tracker.marker_band import MarkerBandDetector
 
     templates = {}
+    settings = None
     for name, fc in calib.faces.items():
         marker = fc.marker
         if isinstance(marker, dict) and marker.get("band_templates"):
             templates[name] = marker["band_templates"]
+            if settings is None and isinstance(marker.get("band_detector"), dict):
+                settings = marker["band_detector"]
     if not templates:
         return None
+    if settings:
+        return MarkerBandDetector.from_dict(dict(settings, templates=templates))
     return MarkerBandDetector(templates=templates)
+
+
+def calibration_band_faces(calib: Calibration) -> List[str]:
+    """Names of the faces in `calib` that carry a marker band template, sorted.
+
+    The question every caller actually has is "can this bundle tell the faces apart?", and the
+    answer is ``len(...) >= 2`` -- `marker_band.MarkerBandDetector.identify_face` returns None
+    with fewer than two templates because with one there is nothing to discriminate against.
+    """
+    out = []
+    for name, fc in calib.faces.items():
+        marker = fc.marker
+        if isinstance(marker, dict) and marker.get("band_templates"):
+            out.append(name)
+    return sorted(out)
+
+
+def calibration_signature_faces(calib: Calibration) -> List[str]:
+    """Names of the faces carrying an OLD-STYLE `markers.MarkerDetector` contour signature."""
+    out = []
+    for name, fc in calib.faces.items():
+        marker = fc.marker
+        if isinstance(marker, dict) and marker.get("signature") is not None:
+            out.append(name)
+    return sorted(out)
+
+
+def attach_face_templates(out_dir: str, detector, extra: Optional[Mapping[str, object]] = None
+                          ) -> List[str]:
+    """Add a learned marker template per face to the bundle in `out_dir`. Adds ONLY that.
+
+    WHAT THIS PROTECTS. `calib_faces/` holds polygons the rig owner drew by hand, one click per
+    vertex, and they are not reproducible -- redrawing them is a fresh session of clicking and a
+    fresh set of slightly different shapes. So this function edits the SAVED JSON TEXT surgically:
+    it loads `calibration.json` as a plain dict, writes into ``faces[name]["marker"]`` and dumps
+    it back with the same settings `Calibration.to_json` uses. It never constructs a `VialROI`,
+    never rebuilds a `FaceCalibration`, never rewrites a mask or overlay PNG, and never touches
+    `faces[name]["vials"]` -- so every vial's `polygon`, `quad`, `present` flag and id survives
+    byte for byte. (`test_face_learning.py` asserts exactly that.)
+
+    Storing the detector's own settings next to the templates is not optional: profiles are only
+    comparable to profiles extracted the same way, so `marker_detector_from_calibration` restores
+    them rather than assuming defaults.
+
+    Args:
+        out_dir: the bundle directory, holding `calibration.json`.
+        detector: a `marker_band.MarkerBandDetector` carrying the learned templates.
+        extra: additional JSON-safe keys to record in every touched face's marker dict (e.g.
+            when and from what the templates were learned).
+
+    Returns:
+        The face names actually written, sorted. A face the detector learned but the bundle does
+        not contain is skipped -- writing it would invent a face the vials know nothing about.
+
+    Raises:
+        FileNotFoundError: there is no bundle in `out_dir`.
+        ValueError: the detector carries no templates at all.
+    """
+    path = os.path.join(out_dir, "calibration.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError("no calibration.json in %r to attach face templates to" % out_dir)
+
+    snapshot = detector.to_dict()
+    templates = snapshot.pop("templates", None) or {}
+    if not templates:
+        raise ValueError("the detector carries no face templates; nothing to attach")
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    written: List[str] = []
+    for name, pair in templates.items():
+        face = payload.get("faces", {}).get(name)
+        if face is None:
+            continue
+        marker = face.get("marker")
+        if not isinstance(marker, dict):
+            marker = {}
+        marker["band_templates"] = pair
+        marker["band_detector"] = snapshot
+        for key, value in (extra or {}).items():
+            marker[key] = value
+        face["marker"] = marker
+        written.append(name)
+
+    if written:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    return sorted(written)

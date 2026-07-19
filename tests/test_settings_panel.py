@@ -1118,15 +1118,51 @@ def test_a_setting_change_leaves_exactly_one_event_naming_the_key_and_both_value
 
 
 def test_setting_the_same_value_again_is_accepted_but_logged_once_only(tmp_path):
-    """A drag lands on the same step repeatedly; the log must record transitions, not mouse work."""
-    pipe = _mini_pipeline(tmp_path, _scene(4), pixel_threshold=30.0)
-    assert pipe.apply_setting("activity.pixel_threshold", 12.0) is True
-    for _ in range(5):
-        assert pipe.apply_setting("activity.pixel_threshold", 12.0) is True
+    """A drag lands on the same step repeatedly; the log must record transitions, not mouse work.
+
+    Applied MID-RUN via an observer, because that is when a change is a regime change at all --
+    see `test_settings_chosen_before_the_first_frame_are_not_logged_as_changes`.
+    """
+    pipe = _mini_pipeline(tmp_path, _scene(), pixel_threshold=30.0)
+    pipe.add_observer(lambda p: p["index"] == 4 and [
+        pipe.apply_setting("activity.pixel_threshold", 12.0) for _ in range(6)])
     pipe.run()
 
     events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
     assert (events["event"] == "setting_change").sum() == 1
+
+
+def test_settings_chosen_before_the_first_frame_are_not_logged_as_changes(tmp_path):
+    """A value picked in the pre-run panel replaced nothing that was ever measured.
+
+    Regression: one drag in the `--settings` panel that opens ahead of the run wrote EIGHT
+    `setting_change` rows, all at elapsed_s=0.0 -- a chain describing measurements at 17.5 and
+    21.5 that never happened, because no frame had been read. What the run started with is
+    metadata, not a change; `ActivityLogger.update_meta` records it (see the CLI).
+    """
+    pipe = _mini_pipeline(tmp_path, _scene(), pixel_threshold=30.0)
+    for value in (25.0, 20.0, 15.0, 12.0):          # a pre-run drag
+        assert pipe.apply_setting("activity.pixel_threshold", value) is True
+    assert pipe.pixel_threshold == 12.0             # ...still fully APPLIED
+    pipe.run()
+
+    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    assert (events["event"] == "setting_change").sum() == 0
+
+
+def test_a_change_after_the_first_frame_is_still_logged(tmp_path):
+    """The counterpart: once frames exist, every transition is on the record as before."""
+    pipe = _mini_pipeline(tmp_path, _scene(), pixel_threshold=30.0)
+    pipe.apply_setting("activity.pixel_threshold", 20.0)                  # pre-run: silent
+    pipe.add_observer(lambda p: p["index"] == 4
+                      and pipe.apply_setting("activity.pixel_threshold", 10.0))
+    pipe.run()
+
+    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    rows = events[events["event"] == "setting_change"]
+    assert len(rows) == 1
+    assert rows.iloc[0]["detail"].endswith("-> 10.0")
+    assert "20.0 ->" in rows.iloc[0]["detail"]      # from what the run actually started at
 
 
 def test_a_multi_step_drag_logs_an_unbroken_chain_of_transitions(tmp_path):

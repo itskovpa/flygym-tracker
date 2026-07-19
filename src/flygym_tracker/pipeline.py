@@ -100,6 +100,26 @@ def _fmt_setting(value) -> str:
     return str(value)
 
 
+def _detector_can_identify(detector) -> bool:
+    """Can this marker detector ever name a face? Drives whether a run WAITS for an identification.
+
+    Both shipped detectors answer with `can_identify()` (`marker_band.MarkerBandDetector` needs
+    two templates; `markers.MarkerDetector` needs to be enabled and hold two signatures). A
+    duck-typed detector that does not implement it is assumed capable -- it implements
+    `identify_face`, which is the only contract this pipeline has ever required, and assuming
+    otherwise would silently downgrade it to the guess-a-face behaviour that caused the bug.
+    """
+    if detector is None:
+        return False
+    probe = getattr(detector, "can_identify", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe())
+    except Exception:
+        return True
+
+
 def _clip_bbox(bbox: Bbox, width: int, height: int) -> Bbox:
     """Clip an (x, y, w, h) bbox to the image; returns (x, y, w, h) with w/h >= 0."""
     x, y, w, h = bbox
@@ -227,8 +247,16 @@ class TrackerPipeline:
             for name, ref in reference_frames.items():
                 self._face_refs[name] = np.asarray(ref).copy()
 
-        self._current_face = self._default_face
-        self._faces_seen: List[str] = [self._default_face]
+        # Face identification is only something to WAIT for when it can both matter and work:
+        # more than one face in the bundle, and a detector actually able to tell them apart.
+        # When it does, the run starts with NO current face and attributes nothing until the
+        # first confident identification (see `_handle_onset`). When it does not -- a single-face
+        # bundle, or no usable detector -- the default face stands from frame 0, exactly as
+        # before, so single-face rigs are untouched and no run is left recording nothing.
+        self._face_id_required = len(calibration.faces) > 1 and _detector_can_identify(
+            marker_detector)
+        self._current_face: Optional[str] = None if self._face_id_required else self._default_face
+        self._faces_seen: List[str] = [] if self._face_id_required else [self._default_face]
         self._prev_stationary: Optional[np.ndarray] = None
         self._prev_state: Optional[TrackState] = None
 
@@ -282,6 +310,9 @@ class TrackerPipeline:
 
         # -- counters -------------------------------------------------------------------------
         self._last_elapsed = 0.0
+        #: Frames actually handled. Distinguishes "the run has not started" from "elapsed is 0.0
+        #: on frame 1", which `_last_elapsed` alone cannot -- see `apply_setting`.
+        self._frames_seen = 0
         self.n_rotations = 0
         self.n_bins = 0
         self.n_activity_records = 0
@@ -446,6 +477,12 @@ class TrackerPipeline:
         and the analysis can reconstruct which threshold was in force for any frame. Collapsing
         that to the final value would re-create, in miniature, the exact untracked-regime problem
         this event exists to prevent.
+
+        BEFORE THE FIRST FRAME, none of that applies and nothing is logged. A value chosen in the
+        ``--settings`` panel that opens ahead of the run was never a regime CHANGE -- no frame was
+        ever measured under the value it replaced -- so a chain of eight rows at ``elapsed_s=0``
+        from one pre-run drag describes measurements that do not exist. What the run actually
+        started with belongs in `run_meta.json`, which the CLI updates once the panel closes.
         """
         route = self._setting_routes.get(str(key))
         if route is None:
@@ -459,10 +496,11 @@ class TrackerPipeline:
             return False
         if new == old:
             return True
-        self._log_event(
-            self._last_elapsed, None, "setting_change",
-            detail="%s: %s -> %s" % (key, _fmt_setting(old), _fmt_setting(new)),
-        )
+        if self._frames_seen > 0:
+            self._log_event(
+                self._last_elapsed, None, "setting_change",
+                detail="%s: %s -> %s" % (key, _fmt_setting(old), _fmt_setting(new)),
+            )
         return True
 
     # ---- precompute -------------------------------------------------------------------------
@@ -534,25 +572,35 @@ class TrackerPipeline:
         return cb, sub
 
     def _default_max_shift(self) -> float:
-        """`DEFAULT_MAX_SHIFT_FRAC` x the tightest vial-center pitch across all present vials.
+        """`DEFAULT_MAX_SHIFT_FRAC` x the tightest vial-center pitch, measured WITHIN EACH FACE.
 
-        The tightest pitch is the smallest center-to-center distance between any two vials, i.e. the
-        offset at which a registration shift would alias one vial onto its nearest neighbour. Capping
-        below it rejects lattice-pitch lock-ons while still allowing realistic sub-pitch drift. Falls
-        back to a quarter of the smaller image dimension when there are fewer than two vials.
+        The tightest pitch is the smallest center-to-center distance between two vials of the same
+        face, i.e. the offset at which a registration shift would alias one vial onto its nearest
+        neighbour. Capping below it rejects lattice-pitch lock-ons while still allowing realistic
+        sub-pitch drift. Falls back to a quarter of the smaller image dimension when no face has
+        two vials to measure between.
+
+        REGRESSION THIS GUARDS. The pitch used to be measured over all faces POOLED. That was
+        harmless only while the two faces had different coordinates. The hand-drawing flow gives
+        face B face A's polygons VERBATIM (one drawing covers the drum), so every vial gained a
+        twin at distance exactly 0 -- on the real 32-vial bundle, 16 of the 31 sorted centre gaps
+        were 0.0. The tightest pitch collapsed to 0.0, `max_shift` with it, and the guard then
+        rejected EVERY shift including (0.0, 0.0): registration silently stopped correcting ROI
+        drift for the whole run, reported only as a stream of `mis_registration` events.
+
+        Two vials of DIFFERENT faces are never candidates for aliasing anyway -- only one face is
+        in view at a time, and a shift is only ever applied to the face being measured.
         """
-        centers = []
-        for active in self._face_active.values():
-            for _gvid, (bbox, _sub) in active.items():
-                x, y, w, h = bbox
-                centers.append((x + w / 2.0, y + h / 2.0))
         best: Optional[float] = None
-        for i in range(len(centers)):
-            for j in range(i + 1, len(centers)):
-                d = float(np.hypot(centers[i][0] - centers[j][0], centers[i][1] - centers[j][1]))
-                if best is None or d < best:
-                    best = d
-        if best is None:
+        for active in self._face_active.values():
+            centers = [(x + w / 2.0, y + h / 2.0) for _gvid, (( x, y, w, h), _sub) in active.items()]
+            for i in range(len(centers)):
+                for j in range(i + 1, len(centers)):
+                    d = float(np.hypot(centers[i][0] - centers[j][0],
+                                       centers[i][1] - centers[j][1]))
+                    if best is None or d < best:
+                        best = d
+        if best is None or best <= 0.0:
             return 0.25 * float(min(self._W, self._H))
         return DEFAULT_MAX_SHIFT_FRAC * best
 
@@ -620,6 +668,7 @@ class TrackerPipeline:
         state = self.rotation.update(gray)
         elapsed_s = self._elapsed(frame)
         self._last_elapsed = elapsed_s
+        self._frames_seen += 1
         prev_state = self._prev_state
 
         entered_rotating = state == TrackState.ROTATING and prev_state != TrackState.ROTATING
@@ -665,30 +714,47 @@ class TrackerPipeline:
         if rolled is not None:
             self._emit_bin(rolled)
 
-        self._per_face_frames[self._current_face] = self._per_face_frames.get(self._current_face, 0) + 1
+        if self._current_face is not None:
+            self._per_face_frames[self._current_face] = (
+                self._per_face_frames.get(self._current_face, 0) + 1)
         self._prev_state = state
 
         if self._observers:
             self._notify_frame_observers(frame, gray, elapsed_s, state, obs_vial_results)
 
     def _handle_onset(self, gray: np.ndarray, elapsed_s: float, frame) -> None:
-        """Stationary onset: identify face (marker or default 'A'), maybe face_change, register."""
+        """Stationary onset: identify the face, maybe face_change, re-register the ROIs.
+
+        FAILING SAFE IS THE POINT HERE. This used to reset to the default face on every failed
+        identification, which is how a 3-day run came to record both drum faces as face A: with
+        no marker templates in the bundle `identify_face` returned None every time, and every
+        reset looked exactly like a correct answer. Now a failure NEVER invents a face --
+        it keeps the last confidently identified one, or, before there has been one, attributes
+        nothing at all (see `_face_for_failed_id`).
+        """
         face = None
         if self.marker_detector is not None:
             try:
                 face = self.marker_detector.identify_face(gray)
             except Exception:
                 face = None
-        if face is None:
-            face = self._default_face
-            self._log_event(elapsed_s, frame, "marker_absent", detail=f"defaulted to face {face}")
 
-        if face not in self.calibration.faces:
+        if face is not None and face not in self.calibration.faces:
+            # A name the vials know nothing about is not an identification, so it is treated as
+            # a FAILURE rather than adopted -- measuring against another face's ROIs would be
+            # worse than measuring against none.
             self._log_event(
                 elapsed_s, frame, "mis_registration",
                 detail=f"identified face {face!r} not in calibration; keeping {self._current_face!r}",
             )
-            face = self._current_face
+            face = None
+
+        if face is None:
+            face = self._face_for_failed_id(elapsed_s, frame)
+            if face is None:
+                # Still unknown. Do not register, do not adopt a reference frame, and leave
+                # `_current_face` None so this stationary period contributes to no vial.
+                return
 
         if face != self._current_face:
             self._log_event(elapsed_s, frame, "face_change", detail=f"{self._current_face} -> {face}")
@@ -699,6 +765,36 @@ class TrackerPipeline:
             self._faces_seen.append(face)
 
         self._register(gray, face, elapsed_s, frame)
+
+    def _face_for_failed_id(self, elapsed_s: float, frame) -> Optional[str]:
+        """Which face to use when identification failed. ``None`` = none; attribute nothing.
+
+        Three cases, and the difference between them is the whole fix:
+
+        * **Face id is not required** (single-face bundle, or no detector able to discriminate):
+          the default face stands, as it always has. There is no ambiguity to get wrong.
+        * **A face has already been identified**: KEEP IT. The drum was showing that face a
+          moment ago and one unreadable onset is not evidence it flipped -- and if it did flip,
+          the next readable onset corrects it. Resetting to the default here is precisely what
+          mislabelled a whole experiment.
+        * **Nothing has been identified yet** (the start of a run): stay unknown. Guessing costs
+          mislabelled vial identities for as long as the guess survives; waiting costs a short
+          gap at the beginning of a run measured in hours or days. The gap is recoverable, the
+          mislabelling is not.
+        """
+        if not self._face_id_required:
+            face = self._current_face or self._default_face
+            self._log_event(elapsed_s, frame, "marker_absent", detail=f"defaulted to face {face}")
+            return face
+        if self._current_face is not None:
+            self._log_event(elapsed_s, frame, "marker_absent",
+                            detail=f"kept last known face {self._current_face}")
+            return self._current_face
+        self._log_event(
+            elapsed_s, frame, "marker_absent",
+            detail="face not identified yet; activity attributed to no face until it is",
+        )
+        return None
 
     def _register(self, gray: np.ndarray, face: str, elapsed_s: float, frame) -> None:
         ref = self._face_refs.get(face)
@@ -747,16 +843,26 @@ class TrackerPipeline:
         The accumulator's ROTATING branch ignores motion/active_fraction and uses each entry only
         to bump `n_rotating_frames` and refresh `lit_area_px`, so we pass the true lit area and
         zeros for the rest.
+
+        Empty while the face is still unknown: which vials these frames belong to is exactly what
+        has not been established yet, so crediting them to any face would be a guess.
         """
         out: Dict[int, Tuple[int, int, float]] = {}
+        if self._current_face is None:
+            return out
         for gvid, (_bbox, submask) in self._face_active[self._current_face].items():
             out[gvid] = (0, int(np.count_nonzero(submask)), 0.0)
         return out
 
     def _compute_vial_results(self, gray: np.ndarray) -> Dict[int, Tuple[int, int, float]]:
-        """Per-frame per-vial activity for the current face vs `self._prev_stationary`."""
+        """Per-frame per-vial activity for the current face vs `self._prev_stationary`.
+
+        Empty while the face is still unknown -- no face, no vials to attribute motion to.
+        """
         prev = self._prev_stationary
         results: Dict[int, Tuple[int, int, float]] = {}
+        if self._current_face is None:
+            return results
         for gvid, (bbox, submask) in self._face_active[self._current_face].items():
             x, y, w, h = bbox
             if w <= 0 or h <= 0 or submask.size == 0:

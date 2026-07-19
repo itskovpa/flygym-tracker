@@ -119,6 +119,25 @@ class ActivityLogger:
         self._save_run_meta()
 
     # -- public API ----------------------------------------------------------------------------
+    def update_meta(self, patch: dict) -> None:
+        """Deep-merge `patch` into ``run_meta.json``'s ``meta`` block and re-save immediately.
+
+        Exists so the snapshot can record what the run REALLY used, not merely what was loaded
+        from the config file. The settings panel can be opened before the first frame, so the
+        config captured at construction is a statement of intent that the operator may then
+        change; a run whose data was measured at ``pixel_threshold`` 30.0 while its own metadata
+        says 12.0 misreports its provenance to whoever reads that folder later.
+        """
+        def merge(dst: dict, src: dict) -> None:
+            for key, value in src.items():
+                if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                    merge(dst[key], value)
+                else:
+                    dst[key] = value
+
+        merge(self._run_meta["meta"], patch)
+        self._save_run_meta()
+
 
     def log_activity(self, records: list) -> None:
         """Append rows, routing each record to the day file matching its own `bin_start_iso`.

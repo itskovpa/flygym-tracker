@@ -338,6 +338,15 @@ class MarkerDetector:
         sig = _signature(candidate.contour)
         return self.match_fn(sig, self.registry, self.params.max_match_distance)
 
+    def can_identify(self) -> bool:
+        """True if `identify_face` could ever return a face: enabled, with two faces to tell apart.
+
+        `pipeline.TrackerPipeline` asks this at startup to decide whether face identification is
+        something it should WAIT for. A disabled or empty detector must not put the run into
+        "face unknown" forever; it has to be reported instead (`cli.face_id_readiness`).
+        """
+        return bool(self.enabled) and len(self.registry) >= 2
+
     def register_marker(self, frame_gray: np.ndarray, face_name: str) -> None:
         """Learn/store the current frame's marker signature under `face_name`.
 

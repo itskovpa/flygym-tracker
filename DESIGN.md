@@ -62,7 +62,9 @@ Each module is one file under `src/flygym_tracker/`. Interfaces reference datacl
 | `frame_source.py` | `FrameSource` ABC; `VideoFileSource` (cv2); `HikCameraSource` (MvImport live). |
 | `calibration.py` | Auto-detect vial lattice + illuminated mask + tube presence on a still → `Calibration` bundle (JSON + mask PNGs). Also `load()`. |
 | `rotation.py` | `RotationDetector`: global frame-diff → STATIONARY/ROTATING with hysteresis + debounce. |
-| `markers.py` | `MarkerDetector`: find IR-opaque silhouette marker(s) → face id + orientation. FRAMEWORK now; decode tuned once physical markers exist. |
+| `markers.py` | `MarkerDetector`: generic contour/Hu-moment fiducial → face id. Written before any physical marker existed; kept as the fallback, NOT the rig's path. |
+| `marker_band.py` | `MarkerBandDetector`: decodes the rig's real IR-sticker band → face id + vial column spans. **This is the face-ID scheme the run path uses**; validated on `Good Markers.avi`. |
+| `face_learning.py` | `FaceLearner` / `learn_faces`: watch the drum flip and register one `MarkerBandDetector` template per face, then merge them into the bundle. |
 | `activity.py` | `ActivityMeter`: per-vial frame-diff activity within (bbox ∩ illum mask ∩ present); per-frame + bin aggregation. |
 | `registration.py` | Align current stationary frame to the calibration frame (translation/rotation) so ROIs stay locked under drift. |
 | `logger.py` | `ActivityLogger`: append `ActivityRecord`/`EventRecord` to CSV/XLSX; rolling files; resumable. |
@@ -84,8 +86,23 @@ Each module is one file under `src/flygym_tracker/`. Interfaces reference datacl
   rotation clip).
 
 ### 5.2 Face id + registration (stationary onset)
-- On each stationary onset (after settling): run `MarkerDetector` → face name. If markers absent
-  (current state), default to face "A" and log `marker_absent`.
+- On each stationary onset (after settling): run the marker detector → face name. The detector in
+  the run path is `marker_band.MarkerBandDetector`, rebuilt from the templates in the bundle by
+  `calibration.marker_detector_from_calibration` (validated 43/43 on real footage).
+  `markers.MarkerDetector` remains only for a bundle carrying old-style contour `signature`s.
+- **Identification failure NEVER invents a face** (`pipeline._handle_onset`). It logs
+  `marker_absent` and then:
+  - keeps the **last confidently identified** face, if there has been one;
+  - before the first identification, attributes activity to **no face at all** until one arrives.
+    A short gap at the start of a multi-day run is recoverable; mislabelled vial identities are not.
+  - a **single-face** bundle (or a run with no detector able to discriminate) keeps the old
+    default-face behaviour — with one face there is nothing to get wrong.
+  A run whose bundle covers 2 faces but carries no marker templates cannot identify anything, and
+  says so loudly at startup (`cli.face_id_readiness`) rather than silently producing half the data.
+- Templates are learned once per rig by `face_learning.learn_faces`, straight after the vials are
+  drawn: it watches the drum through at least one flip and registers a template from the first
+  settled dwell of each distinct face. `calibration.attach_face_templates` merges them into the
+  saved bundle **additively** — the hand-drawn polygons are never rewritten.
 - `registration.py`: estimate small (dx,dy) aligning the current frame's rigid structure to the
   calibration/reference frame (phase correlation on the masked frame). Apply the offset to ROIs.
   Two mis-registration guards, both log `mis_registration` and keep ROIs at their calibration anchors:
@@ -183,7 +200,7 @@ Two ways to produce a calibration bundle, both emitting the IDENTICAL `Calibrati
    noise floor, calibration on the real face, rotation detection on a real (empty) rotation clip.
 2. **Deferred ("last bit", needs flies loaded):** tune `pixel_threshold`/`k` and the activity metric
    against real fly motion; confirm shadow SNR; validate per-vial activity vs. eyeball/known stimulus.
-   Also finalize marker decode once physical markers are added.
+   Marker decode is DONE (`marker_band.py`), as is learning a template per face (`face_learning.py`).
 
 ## 10. Confirmed parameters (from the rig owner)
 

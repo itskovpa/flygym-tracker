@@ -43,9 +43,12 @@ from flygym_tracker.calibration import (
     VIALS_PER_FACE,
     boxes_from_calibration,
     build_two_face_calibration,
+    calibration_band_faces,
+    calibration_signature_faces,
     detect_calibration,
     draw_quad_overlay,
     load_calibration,
+    marker_detector_from_calibration,
     quad_lit_fraction,
     relativize_mask_paths,
     save_calibration,
@@ -100,10 +103,64 @@ def _make_run_id() -> str:
     return datetime.now().strftime("run_%Y%m%d_%H%M%S")
 
 
-def _build_marker_detector(config, calib) -> MarkerDetector:
-    """Build a `MarkerDetector` from `config.markers`, seeded with any registry already saved in
-    the calibration bundle (DESIGN.md section 5.2; see markers.py's `to_dict`/`from_dict` for the
-    `FaceCalibration.marker = {"signature": [...]}` convention this reads back)."""
+def face_id_readiness(config, calib) -> list:
+    """Lines warning that this bundle cannot identify drum faces. Empty list = it can (or need not).
+
+    THE REGRESSION THIS EXISTS FOR. A two-face bundle with no marker data runs perfectly happily:
+    `identify_face` returns None on every frame, the pipeline falls back to one face, and a
+    3-day experiment fills its CSV with face-B vials labelled face A. Nothing failed, nothing
+    was empty, and the only trace was a repeated `marker_absent` line buried in the event log.
+    A run that cannot possibly produce correct face identities has to SAY SO at startup, while
+    it still costs 20 seconds to fix instead of three days.
+
+    A SINGLE-face bundle never warns: with one face there is nothing to identify, and inventing
+    a marker requirement for it would break the rigs that only ever show one side.
+    """
+    if len(calib.faces) < 2:
+        return []
+    if len(calibration_band_faces(calib)) >= 2 or len(calibration_signature_faces(calib)) >= 2:
+        return []
+
+    default = sorted(calib.faces)[0]
+    lines = [
+        "WARNING: this calibration covers %d drum faces but carries no marker templates."
+        % len(calib.faces),
+        "         It CANNOT identify faces: all activity will be attributed to face %s and the"
+        % default,
+        "         other face's vials will never appear in the output.",
+        "         Fix: run the face-learning step (`select-vials`, and answer yes when it offers",
+        "         to learn the drum faces) before starting a real experiment.",
+    ]
+    if not bool(config.markers.enabled):
+        # Both halves of the original failure at once: no templates AND markers switched off.
+        # Turning markers on alone would not help, so say what actually has to happen.
+        lines.insert(1, "         `markers.enabled` is also false, so face identification is "
+                        "switched off entirely.")
+    return lines
+
+
+def _build_marker_detector(config, calib):
+    """Build the face-ID detector this bundle can actually use, preferring the validated one.
+
+    ORDER MATTERS, and getting it wrong is what caused the bug this function was rewritten for.
+    `marker_band.MarkerBandDetector` is the scheme validated on real rig footage (43/43 dwells,
+    and 943/943 stationary frames of `Good Markers.avi`); it is what both calibration flows
+    produce, storing its templates in ``FaceCalibration.marker["band_templates"]``.
+    `markers.MarkerDetector` is the older generic contour scheme, which reads
+    ``marker["signature"]`` -- a key NO current flow writes. This function used to build only the
+    generic one, so it was always handed an empty registry, always returned None from
+    `identify_face`, and the tested-and-validated detector was never in the run path at all.
+
+    So: band templates win; the generic detector is built only for a bundle that really carries
+    contour signatures; and a bundle with neither is reported by `face_id_readiness` rather than
+    quietly starting a run that can only ever produce half the data.
+    """
+    for line in face_id_readiness(config, calib):
+        print(line, file=sys.stderr)
+
+    if calibration_band_faces(calib):
+        return marker_detector_from_calibration(calib)
+
     registry = {}
     for name, fc in calib.faces.items():
         marker = fc.marker
@@ -217,6 +274,22 @@ def _run_pipeline_or_report(
             settings_model, on_change=pipe.apply_setting, on_save=save_hook,
             subtitle="applies from the first frame - close this window to start",
         ).run()
+        # The snapshot written when the logger was built records the config as LOADED. Anything
+        # adjusted just now is in force for frame 1, so without this the folder would claim its
+        # data was measured at a threshold it never used. `apply_setting` deliberately logs no
+        # event before the first frame -- nothing was re-measured, only chosen -- which makes
+        # this the ONLY record of what the run actually started with.
+        changed = settings_model.changed()
+        if changed:
+            logger.update_meta({
+                "config": settings_model.to_overrides(),
+                "settings_adjusted_before_start": [
+                    "%s: %s -> %s" % (s.key, settings_model.baseline(s.key), s.value)
+                    for s in changed
+                ],
+            })
+            print("run starts with %d adjusted setting(s); run_meta.json records the values used"
+                  % len(changed))
 
     live_monitor = None
     if monitor:

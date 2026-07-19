@@ -14,6 +14,7 @@ import glob
 import cv2
 import numpy as np
 import pandas as pd
+import pytest
 
 from flygym_tracker.calibration import (
     build_calibration_from_boxes,
@@ -120,3 +121,42 @@ def test_registration_guard_keeps_per_vial_attribution_after_rotation(tmp_path):
     assert b_late > 100, f"vial B should carry phase-3 motion, got {b_late}"
     assert a_late < 20, f"vial A must stay quiet in phase 3 (no ROI aliasing), got {a_late}"
     assert "mis_registration" in set(edf["event"]), "the lattice-pitch lock should be rejected"
+
+
+def test_max_shift_is_measured_within_a_face_not_across_faces(tmp_path):
+    """Regression: identical two-face coordinates collapsed `max_shift` to 0.0.
+
+    The hand-drawing flow gives face B face A's polygons VERBATIM -- one drawing covers the whole
+    drum -- so once the pitch was measured over both faces POOLED, every vial had a twin at
+    distance exactly 0. On the real 32-vial bundle 16 of the 31 sorted centre gaps were 0.0, the
+    tightest pitch became 0.0, `max_shift` went with it, and the guard then rejected EVERY shift
+    including (0.0, 0.0): ROI drift correction silently stopped for the entire run, visible only
+    as a stream of `mis_registration` events.
+    """
+    from flygym_tracker.calibration import build_two_face_calibration_from_polygons
+    from flygym_tracker.pipeline import DEFAULT_MAX_SHIFT_FRAC
+
+    # Two vials 60 px apart, drawn once and shared by both faces -- the real geometry.
+    polys = [[[10, 20], [50, 20], [50, 220], [10, 220]],
+             [[70, 20], [110, 20], [110, 220], [70, 220]]]
+    calib, masks, overlays = build_two_face_calibration_from_polygons(
+        polys, _base(), (_base().shape[1], _base().shape[0]), faces=("A", "B"))
+    cdir = tmp_path / "calib"
+    cdir.mkdir()
+    save_calibration(calib, masks, str(cdir), overlay=overlays)
+    calibration = load_calibration(str(cdir))
+
+    centres = [(v.x + v.w / 2.0) for v in calibration.faces["A"].vials]
+    assert len(calibration.faces) == 2
+    assert [round(c) for c in centres] == [round(c) for c in
+                                           [(v.x + v.w / 2.0) for v in calibration.faces["B"].vials]],         "the two faces must share coordinates -- that is what made this bug possible"
+
+    pipe = TrackerPipeline(
+        load_config(overrides={"binning": {"bin_seconds": 1}}), calibration,
+        _SeqSource([_base()]), ActivityLogger(str(tmp_path / "out"), run_id="ms", fmt="csv"),
+        clock="index", pixel_threshold=30, enter_threshold=15, exit_threshold=8,
+    )
+
+    assert pipe.max_shift > 0.0, "a zero max_shift rejects every shift, even (0.0, 0.0)"
+    within_face_pitch = 60.0
+    assert pipe.max_shift == pytest.approx(DEFAULT_MAX_SHIFT_FRAC * within_face_pitch, rel=0.05)

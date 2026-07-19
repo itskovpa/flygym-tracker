@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -49,7 +49,9 @@ import numpy as np
 
 from flygym_tracker.calibration import (
     SavedSelection,
+    attach_face_templates,
     build_two_face_calibration_from_polygons,
+    calibration_band_faces,
     load_calibration,
     save_calibration,
     saved_selection,
@@ -736,10 +738,128 @@ class SelectionResult:
     calibration: Optional[Calibration]
     reused: bool                       # True = loaded from disk, no drawing happened
     out_dir: str
+    #: Faces whose marker template was learned in THIS session (empty when nothing was learned,
+    #: including when the bundle already had them). Reported so a caller can say what happened.
+    faces_learned: List[str] = field(default_factory=list)
 
     @property
     def n_vials(self) -> int:
         return len(self.polygons)
+
+
+# ==========================================================================================
+# Learning the drum faces -- the second half of a session (see face_learning.py)
+# ==========================================================================================
+def faces_need_learning(calib: Optional[Calibration]) -> bool:
+    """True if this bundle covers more than one face but cannot yet tell them apart.
+
+    A SINGLE-face bundle is never in this state: with one face there is nothing to identify, so
+    demanding a marker template from it would be a requirement invented out of nothing.
+    """
+    if calib is None or len(calib.faces) < 2:
+        return False
+    return len(calibration_band_faces(calib)) < 2
+
+
+def learn_faces_question(calib: Calibration) -> str:
+    """The prompt offering the face-learning step, saying what is lost by declining."""
+    return (
+        "These vials cover %d drum faces, but this bundle cannot yet tell the faces apart -- "
+        "without that, EVERYTHING gets recorded as face %s. Learn the faces now? "
+        "(the drum needs to turn once, ~10-20 s) [Y/n]: "
+        % (len(calib.faces), sorted(calib.faces)[0])
+    )
+
+
+def prompt_learn_faces(calib: Calibration,
+                       input_fn: Optional[Callable[[str], str]] = None) -> bool:
+    """Ask whether to learn the drum faces now. Defaults to YES.
+
+    YES is the default because declining is the option that quietly produces wrong data: the run
+    still starts, still fills a CSV, and silently attributes every face-B vial to face A. Saying
+    no costs one keystroke; a mistaken yes costs 20 seconds.
+
+    An unanswerable stdin (no terminal) takes NO, unlike `prompt_reuse`. The asymmetry is
+    deliberate: reusing saved positions is the only action an unattended start could complete,
+    whereas learning faces needs a window and a turning drum, so blocking a scripted run on one
+    would hang it. The caller is expected to print the consequence loudly instead.
+    """
+    if input_fn is None and not _stdin_is_interactive():
+        return False
+    ask = input_fn if input_fn is not None else input
+    try:
+        answer = ask(learn_faces_question(calib))
+    except (EOFError, KeyboardInterrupt):
+        print("(no answer - skipping the face-learning step)")
+        return False
+    return not str(answer).strip().lower().startswith("n")
+
+
+def _warn_faces_not_learned(calib: Calibration) -> None:
+    """Say, in full, what a bundle that cannot identify faces will do to the data."""
+    default = sorted(calib.faces)[0]
+    print("\n  !! the drum faces were NOT learned.")
+    print("     This bundle cannot identify faces, so every stationary period will be")
+    print("     attributed to face %s and the other face's vials will never appear in the" % default)
+    print("     output. Re-run this step (or `select-vials` again) before a real experiment.\n")
+
+
+def learn_faces_for_bundle(
+    source: FrameSource,
+    result: SelectionResult,
+    learn: Optional[bool] = None,
+    input_fn: Optional[Callable[[str], str]] = None,
+    max_frames: Optional[int] = None,
+    show: bool = True,
+) -> SelectionResult:
+    """Learn a marker template per face and merge it into the bundle `result` points at.
+
+    Called straight after the polygons are settled so that drawing the vials and learning the
+    faces are ONE session: the camera is already open, the operator is already at the rig, and a
+    bundle that leaves here can identify faces. Splitting the two is what let a hand-drawn bundle
+    reach a 3-day run with no templates at all (see `face_learning`'s module docstring).
+
+    Nothing here can lose work. The polygons are already saved before this runs, the merge only
+    ADDS to the marker dict (`calibration.attach_face_templates`), and every failure path -- the
+    operator aborting, the drum never turning, an unreadable band -- returns the bundle exactly
+    as it arrived, with the consequence printed.
+
+    Args:
+        learn: None = ask (the normal case); True = learn without asking; False = skip entirely.
+        max_frames: forwarded to `face_learning.learn_faces` as a give-up budget.
+        show: False runs it headlessly, for replaying a recorded clip in a test.
+    """
+    # Imported HERE, not at module scope: `face_learning` imports this module's view helpers, so
+    # a top-level import either way round would be a cycle. Same reason (and same shape) as
+    # `calibration.marker_detector_from_calibration`'s deferred import of `marker_band`.
+    from flygym_tracker.face_learning import learn_faces
+
+    calib = result.calibration
+    if learn is False or not faces_need_learning(calib):
+        return result
+    if learn is not True and not prompt_learn_faces(calib, input_fn):
+        _warn_faces_not_learned(calib)
+        return result
+
+    outcome = learn_faces(source, n_faces=len(calib.faces), face_names=sorted(calib.faces),
+                          max_frames=max_frames, show=show)
+    if not outcome.complete:
+        if outcome.aborted:
+            print("  face learning was skipped - your %d drawn vial(s) are untouched"
+                  % result.n_vials)
+        _warn_faces_not_learned(calib)
+        return result
+
+    written = attach_face_templates(
+        result.out_dir, outcome.detector,
+        extra={"band_learned": datetime.now().isoformat(timespec="seconds"),
+               "band_dwells": len(outcome.dwells)},
+    )
+    print("  face templates saved for face(s) %s - this bundle can now identify faces"
+          % ", ".join(written))
+    merged = load_calibration(result.out_dir)
+    return SelectionResult(polygons=result.polygons, calibration=merged, reused=result.reused,
+                           out_dir=result.out_dir, faces_learned=written)
 
 
 def load_or_select_vials(
@@ -751,6 +871,8 @@ def load_or_select_vials(
     on_frame: Optional[Callable[[np.ndarray], None]] = None,
     input_fn: Optional[Callable[[str], str]] = None,
     reuse: Optional[bool] = None,
+    learn_markers: Optional[bool] = None,
+    learn_input_fn: Optional[Callable[[str], str]] = None,
 ) -> SelectionResult:
     """Start a round: offer the saved vial positions, else draw them live. Then SAVE them.
 
@@ -760,7 +882,14 @@ def load_or_select_vials(
       1. if `out_dir` already holds a hand-drawn bundle, ask ``Load them? [Y/n]`` -- yes (the
          default) loads it and NO drawing happens at all;
       2. otherwise (or on "no") the operator draws every vial on the live feed;
-      3. what was drawn is saved to `out_dir` immediately, so the next round can offer it back.
+      3. what was drawn is saved to `out_dir` immediately, so the next round can offer it back;
+      4. if the bundle covers both drum faces but cannot yet TELL THEM APART, offer the
+         face-learning step (`learn_faces_for_bundle`) and merge what it learns into the bundle.
+
+    Step 4 is part of the same session on purpose. A two-face bundle with no marker templates
+    runs perfectly happily and silently records every face-B vial as face A, so the moment to
+    fix it is while the operator is still at the rig -- not days later when the CSV is short.
+    A bundle that already carries templates is never re-learned.
 
     The saved bundle is self-contained -- polygons, image size, face assignment, illumination
     masks and overlays -- so a later session needs nothing but this directory.
@@ -778,6 +907,13 @@ def load_or_select_vials(
         input_fn: injected for testing; defaults to the builtin `input`, looked up when asked.
         reuse: None = ask when a saved bundle exists (the normal case); True = reuse it without
             asking; False = always draw, ignoring anything saved.
+        learn_markers: None = offer the face-learning step when it would help (the normal case);
+            True = run it without asking; False = never run it.
+        learn_input_fn: injected for testing, for the FACE-LEARNING question only. Deliberately
+            separate from `input_fn` and deliberately NOT defaulted to it: "load the saved
+            positions?" and "learn the drum faces?" are different questions asked for different
+            reasons, and a caller that scripts an answer to one has said nothing about the other.
+            Left None (with no terminal) the step is skipped and the consequence printed.
 
     Returns:
         A `SelectionResult`. ``polygons`` is empty only if the operator drew nothing, in which
@@ -789,8 +925,13 @@ def load_or_select_vials(
     if saved is not None and (reuse is True or prompt_reuse(saved, input_fn)):
         print("using the saved vial positions (%d vials, face(s) %s) - no drawing needed"
               % (saved.n_vials, ", ".join(saved.faces)))
-        return SelectionResult(polygons=saved.polygons, calibration=load_calibration(out_dir),
-                               reused=True, out_dir=out_dir)
+        reused = SelectionResult(polygons=saved.polygons, calibration=load_calibration(out_dir),
+                                 reused=True, out_dir=out_dir)
+        # A bundle drawn before the face-learning step existed still has no templates, so the
+        # offer is made on the reuse path too -- otherwise reusing yesterday's polygons would
+        # quietly reintroduce the very bug this step exists to close.
+        return learn_faces_for_bundle(source, reused, learn=learn_markers,
+                                      input_fn=learn_input_fn)
 
     last: dict = {"image": None}
 
@@ -814,4 +955,5 @@ def load_or_select_vials(
     # can feed either straight to the pipeline. Re-saving this object needs
     # `calibration.relativize_mask_paths` first, same as any loaded bundle.
     calib.resolve_mask_paths(os.path.abspath(out_dir))
-    return SelectionResult(polygons=polygons, calibration=calib, reused=False, out_dir=out_dir)
+    drawn = SelectionResult(polygons=polygons, calibration=calib, reused=False, out_dir=out_dir)
+    return learn_faces_for_bundle(source, drawn, learn=learn_markers, input_fn=learn_input_fn)
