@@ -3,6 +3,8 @@
 Four subcommands, matching the build order in DESIGN.md section 9 ("validate on the empty rig:
 live capture, noise floor, calibration on the real face, rotation detection"):
 
+  * ``select-vials`` -- THE START OF EVERY SESSION: the operator draws each vial as a polygon on
+    the LIVE feed (`live_vial_selector`) and that bundle is the calibration. No detection is run.
   * ``calibrate`` -- build a per-face `Calibration` bundle (DESIGN.md section 5.4/5.5) from a still
     image or a single live-camera grab, optionally refined with the interactive manual wizard.
   * ``edit-rois`` -- hand-edit a face's 4-vertex vial ROIs (`roi_editor`) so they follow the
@@ -38,6 +40,7 @@ import yaml
 from flygym_tracker.calibrate_wizard import run_wizard
 from flygym_tracker.calibration import (
     MarkerCalibParams,
+    VIALS_PER_FACE,
     boxes_from_calibration,
     build_two_face_calibration,
     detect_calibration,
@@ -49,6 +52,7 @@ from flygym_tracker.calibration import (
     suspicious_vials,
     transfer_quads,
     vial_quad,
+    vial_shape,
 )
 from flygym_tracker.config import load_config
 from flygym_tracker.gui_support import gui_diagnosis, has_gui_support, require_gui
@@ -196,6 +200,47 @@ def _load_calibration_or_report(calib_dir: str):
         return None
 
 
+def _calibration_for_round(args, source):
+    """Every round starts here: offer the saved vial positions, else draw them on the live feed.
+
+    This is the requirement in one function -- "before each round prompt to load the vial
+    positions from disk; if the user opts out, go on to drawing". `run` and `replay` both come
+    through it, so the rig behaves the same whichever one was launched, and neither can start
+    measuring against a bundle the operator never confirmed.
+
+    The source is handed over ALREADY OPEN (the selector opens it and deliberately does not
+    close it), so the camera is grabbed exactly once for both the drawing and the experiment --
+    it allows only one program at a time. A video is rewound instead, so the run still sees the
+    whole clip and not just what was left after the drawing.
+
+    Returns the `Calibration`, or None with the reason already printed.
+    """
+    from flygym_tracker.live_vial_selector import load_or_select_vials  # interactive-only import
+
+    reuse = True if getattr(args, "reuse", False) else (
+        False if getattr(args, "redraw", False) else None)
+    try:
+        result = load_or_select_vials(
+            source, args.calib, n_vials=getattr(args, "n_vials", VIALS_PER_FACE), reuse=reuse)
+    except (RuntimeError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        if _looks_like_camera_busy(e):
+            print(_CAMERA_BUSY_HINT, file=sys.stderr)
+        return None
+
+    if not result.polygons:
+        print("no vials were selected; nothing to track", file=sys.stderr)
+        return None
+    if isinstance(source, VideoFileSource):
+        source.close()   # reopened (and so rewound to frame 0) by the pipeline
+
+    n_faces = len(result.calibration.faces)
+    print(f"tracking {result.n_vials} vial(s) per face on {n_faces} face(s) "
+          f"= {result.n_vials * n_faces} vials"
+          + (" (positions loaded from disk)" if result.reused else " (just drawn, and saved)"))
+    return result.calibration
+
+
 # =============================================================================================
 # calibrate
 # =============================================================================================
@@ -334,6 +379,101 @@ def _cmd_calibrate_faces(args) -> int:
 def _face_index(calib, name: str) -> int:
     """Face ordinal used for global vial ids (matches `pipeline.TrackerPipeline`)."""
     return sorted(calib.faces).index(name)
+
+
+# =============================================================================================
+# select-vials (hand-drawn polygons on the LIVE feed -- how every session starts)
+# =============================================================================================
+#: USB3 Vision is exclusive, and "camera busy" is BY FAR the most common failure on this rig.
+_CAMERA_BUSY_HINT = (
+    "The camera is already open somewhere else. USB3 Vision access is EXCLUSIVE:\n"
+    "  1. close the MVS Viewer (its exit dialog asks 'Exit the client?' -- click OK),\n"
+    "  2. close any other Bonsai/Python session holding the camera,\n"
+    "  3. run this command again.\n"
+    "Or pass --video <clip> to draw the vials on a recorded clip instead."
+)
+
+
+def _looks_like_camera_busy(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "already in use" in text or "may already be in use" in text or "openDevice".lower() in text
+
+
+def _requested_faces(args) -> list:
+    """Faces the drawn polygons apply to: ``--faces A,B`` (default), or ``--face X`` for one."""
+    if getattr(args, "face", None):
+        return [args.face]
+    return [f.strip() for f in str(args.faces).split(",") if f.strip()]
+
+
+def _cmd_select_vials(args) -> int:
+    """Offer the saved vial positions, else draw them live; then save. No detection anywhere.
+
+    Automatic vial detection is not used on this rig (see `live_vial_selector`'s module docstring
+    -- it produced ROIs the operator had to fix by hand every time). A round starts here: reuse
+    what was drawn before, or draw all 16 vials as polygons while watching the real feed. Either
+    way THAT is the calibration -- what was drawn is what gets measured, on both drum faces.
+    """
+    from flygym_tracker.live_vial_selector import load_or_select_vials  # interactive-only import
+
+    if args.video:
+        source, where = VideoFileSource(args.video), args.video
+    else:
+        try:
+            config = load_config(path=args.config)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        source, where = _camera_source_from_config(config), "the live camera"
+
+    faces = _requested_faces(args)
+    reuse = True if args.reuse else (False if args.redraw else None)
+    try:
+        result = load_or_select_vials(
+            source, args.out, n_vials=args.n_vials, faces=faces, reuse=reuse)
+    except (RuntimeError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        if _looks_like_camera_busy(e):
+            print(_CAMERA_BUSY_HINT, file=sys.stderr)
+        return 1
+    finally:
+        # Closed HERE, not with `with source:`: a close() failure must never throw away polygons
+        # the operator just spent minutes clicking.
+        try:
+            source.close()
+        except Exception as e:
+            print(f"warning: closing the frame source failed: {e}", file=sys.stderr)
+
+    if not result.polygons:
+        print("no vials were selected; nothing saved")
+        return 0
+
+    calib = result.calibration
+    if result.reused:
+        print(f"\nreusing the vial positions already saved in {args.out!r}")
+    else:
+        print(f"\nsaved vial positions to {args.out!r} "
+              f"(reusable next round -- you will be asked before any redraw)")
+    print(f"  faces       : {', '.join(sorted(calib.faces))}   "
+          f"(identical polygon coordinates on each)")
+    print(f"  vials       : {result.n_vials} per face, {result.n_vials * len(calib.faces)} total")
+    print(f"  frame       : {calib.image_width}x{calib.image_height}"
+          + ("" if result.reused else f" from {where}"))
+    if result.n_vials < args.n_vials and not result.reused:
+        print(f"  NOTE: finished early -- only {result.n_vials} of {args.n_vials} vial(s) were "
+              f"drawn. Re-run with --redraw to do this over.")
+
+    face = sorted(calib.faces)[0]
+    mask = cv2.imread(calib.faces[face].illum_mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is not None:
+        print("  vial   points   lit fraction")
+        for v in calib.faces[face].vials:
+            lit = quad_lit_fraction(vial_shape(v), mask)
+            flag = "   <-- little of this polygon is lit; check the overlay" if lit < 0.5 else ""
+            n_points = len(v.polygon) if v.polygon is not None else 4
+            print(f"  {v.id:>4}   {n_points:>6}   {lit:.3f}{flag}")
+    print(f"  overlay     : {os.path.join(args.out, 'overlay_%s.png' % face)}")
+    return 0
 
 
 # =============================================================================================
@@ -531,11 +671,17 @@ def _cmd_run(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    calib = _load_calibration_or_report(args.calib)
+    source = _camera_source_from_config(config)
+    # Vial positions FIRST, on the same camera handle the run will use: the round either reuses
+    # what is saved or the operator draws it, and only then does anything get measured.
+    calib = _calibration_for_round(args, source)
     if calib is None:
+        try:
+            source.close()
+        except Exception:
+            pass
         return 1
 
-    source = _camera_source_from_config(config)
     logger = _build_logger(config, args, _make_run_id())
     marker_detector = _build_marker_detector(config, calib)
 
@@ -557,11 +703,15 @@ def _cmd_replay(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    calib = _load_calibration_or_report(args.calib)
+    source = VideoFileSource(args.video)
+    calib = _calibration_for_round(args, source)
     if calib is None:
+        try:
+            source.close()
+        except Exception:
+            pass
         return 1
 
-    source = VideoFileSource(args.video)
     logger = _build_logger(config, args, _make_run_id())
     marker_detector = _build_marker_detector(config, calib)
 
@@ -576,6 +726,21 @@ def _cmd_replay(args) -> int:
 # =============================================================================================
 # argument parser
 # =============================================================================================
+def _add_selection_flags(parser) -> None:
+    """The vial-position flags shared by `run` and `replay`.
+
+    With neither flag the round ASKS (the documented behaviour); the flags exist so an unattended
+    or scripted start can answer in advance instead of blocking on a prompt nobody will see.
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--reuse", action="store_true",
+                       help="Use the saved vial positions without asking.")
+    group.add_argument("--redraw", action="store_true",
+                       help="Always draw the vials, ignoring anything saved.")
+    parser.add_argument("--n-vials", type=int, default=VIALS_PER_FACE,
+                        help=f"Vials to draw per face when drawing (default: {VIALS_PER_FACE}).")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flygym-tracker",
@@ -619,6 +784,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Config YAML; an optional `calibration.marker_params` block overrides the tuning defaults.",
     )
     p_faces.set_defaults(handler=_cmd_calibrate_faces)
+
+    # -- select-vials -------------------------------------------------------------------------
+    p_select = subparsers.add_parser(
+        "select-vials",
+        help="Draw every vial by hand as a polygon on the LIVE feed (how a session starts).",
+        description=(
+            "Live-video vial selection. Automatic vial detection is NOT used on this rig, so "
+            "every round begins here. If the output folder already holds vial positions you are "
+            "asked whether to load them (ENTER = yes) and no drawing happens at all. Otherwise: "
+            "watch the live camera, click a vertex at a time around each vial, press ENTER to "
+            "store it and move to the next. BACKSPACE removes the last vertex, 'u' re-opens the "
+            "previous vial, 'c' clears the one in progress, SPACE freezes the feed for precise "
+            "clicking, and q/ESC finishes early with whatever has been drawn. What you draw IS "
+            "the measured region -- nothing is fitted or snapped. You draw ONE face; both drum "
+            "faces are written with the same coordinates, since they present in the same "
+            "orientation. The result is saved immediately and offered back next round."
+        ),
+    )
+    p_select.add_argument("--out", required=True, help="Calibration bundle directory to write.")
+    face_sel = p_select.add_mutually_exclusive_group()
+    face_sel.add_argument(
+        "--faces", default="A,B",
+        help="Faces these polygons apply to, comma separated (default: A,B -- one drawing, "
+             "32 vials, identical coordinates on both drum faces).",
+    )
+    face_sel.add_argument(
+        "--face", default=None,
+        help="Shorthand for a SINGLE-face bundle, e.g. --face A.",
+    )
+    p_select.add_argument(
+        "--video", default=None,
+        help="Select on a recorded clip instead of the live camera (dry runs, or a rig you are "
+             "not standing at).",
+    )
+    p_select.add_argument("--n-vials", type=int, default=16,
+                          help="Vials to draw per face (default: 16).")
+    reuse_sel = p_select.add_mutually_exclusive_group()
+    reuse_sel.add_argument("--reuse", action="store_true",
+                           help="Load saved vial positions without asking (for scripts).")
+    reuse_sel.add_argument("--redraw", action="store_true",
+                           help="Always draw, ignoring any saved vial positions.")
+    p_select.add_argument(
+        "--config", default=None,
+        help="Config YAML for the camera settings (only consulted without --video).",
+    )
+    p_select.set_defaults(handler=_cmd_select_vials)
 
     # -- edit-rois ----------------------------------------------------------------------------
     p_edit = subparsers.add_parser(
@@ -664,7 +875,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- run ----------------------------------------------------------------------------------
     p_run = subparsers.add_parser("run", help="Live tracking against the HikRobot camera.")
     p_run.add_argument("--config", required=True, help="Config YAML (thresholds normally come from `noise --out`).")
-    p_run.add_argument("--calib", required=True, help="Calibration bundle directory (from `calibrate`).")
+    p_run.add_argument(
+        "--calib", required=True,
+        help="Vial-position folder. Offered back at the start of the round; drawn live if empty.")
+    _add_selection_flags(p_run)
     p_run.add_argument("--bin-seconds", type=float, default=None, help="Override binning.bin_seconds.")
     p_run.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
     p_run.add_argument("--duration", type=float, default=None, help="Stop after this many wall-clock seconds.")
@@ -681,7 +895,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_replay.add_argument("--video", required=True, help="Recorded video file (e.g. an .avi clip).")
     p_replay.add_argument("--config", required=True, help="Config YAML (thresholds normally come from `noise --out`).")
-    p_replay.add_argument("--calib", required=True, help="Calibration bundle directory (from `calibrate`).")
+    p_replay.add_argument(
+        "--calib", required=True,
+        help="Vial-position folder. Offered back at the start of the round; drawn live if empty.")
+    _add_selection_flags(p_replay)
     p_replay.add_argument("--bin-seconds", type=float, default=None, help="Override binning.bin_seconds.")
     p_replay.add_argument("--max-frames", type=int, default=None, help="Stop after this many frames.")
     p_replay.add_argument("--out", default=None, help="Output directory (default: config output.dir).")

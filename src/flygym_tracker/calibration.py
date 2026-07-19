@@ -516,13 +516,29 @@ def bbox_from_quad(quad: Sequence[Sequence[float]]) -> Box:
 
 
 def vial_quad(vial: VialROI) -> Quad:
-    """This vial's EFFECTIVE quad: its own if it has one, else its bbox as a rectangle.
+    """This vial's EFFECTIVE 4-CORNER quad: its own if it has one, else its bbox as a rectangle.
 
-    Use this anywhere a shape is needed regardless of whether the bundle predates quads.
+    Use this anywhere a strictly 4-vertex shape is needed regardless of whether the bundle
+    predates quads -- notably `roi_editor`, whose whole model is four draggable corners. It
+    deliberately IGNORES `VialROI.polygon` (arbitrary vertex count); use `vial_shape` for
+    anything that just needs the shape the pipeline will actually measure.
     """
     if vial.quad is not None:
         return [[int(px), int(py)] for px, py in vial.quad]
     return quad_from_bbox((vial.x, vial.y, vial.w, vial.h))
+
+
+def vial_shape(vial: VialROI) -> Quad:
+    """This vial's EFFECTIVE MEASURED shape, applying the `types.VialROI` precedence.
+
+    ``polygon`` (N >= 3, hand-drawn on the live feed) > ``quad`` (4 corners) > bbox rectangle.
+    This is the one place that precedence is spelled out for non-pipeline callers (overlays,
+    reports), so a polygon bundle and a quad bundle can be drawn and scored by the same code.
+    """
+    polygon = getattr(vial, "polygon", None)
+    if polygon is not None:
+        return [[int(px), int(py)] for px, py in polygon]
+    return vial_quad(vial)
 
 
 def face_quads(face_cal: FaceCalibration) -> List[Quad]:
@@ -761,8 +777,11 @@ def draw_quad_overlay(gray: np.ndarray, face_cal: FaceCalibration,
         tint[illum_mask > 0] = (0, 60, 0)
         vis = cv2.add(vis, tint)
     for v in face_cal.vials:
-        quad = vial_quad(v)
-        edited = v.quad is not None
+        # `vial_shape`, not `vial_quad`: a face drawn with `live_vial_selector` carries N-vertex
+        # polygons, and an overlay that quietly drew their bounding boxes instead would be a
+        # record of something the operator never approved.
+        quad = vial_shape(v)
+        edited = v.quad is not None or getattr(v, "polygon", None) is not None
         color = (0, 200, 0) if v.present else (0, 0, 255)
         pts = np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(vis, [pts], True, color, 2)
@@ -777,6 +796,238 @@ def draw_quad_overlay(gray: np.ndarray, face_cal: FaceCalibration,
         cv2.putText(vis, label, (int(quad[0][0]) + 4, int(quad[0][1]) + dy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return vis
+
+
+# --------------------------------------------------------------------------------------
+# HAND-DRAWN POLYGON CALIBRATION  (the `live_vial_selector` path)
+# --------------------------------------------------------------------------------------
+def polygon_centroid(polygon: Sequence[Sequence[float]]) -> Tuple[float, float]:
+    """Mean of a polygon's vertices -- good enough for labelling and row/col ordering."""
+    pts = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    return float(pts[:, 0].mean()), float(pts[:, 1].mean())
+
+
+def build_calibration_from_polygons(
+    polygons: Sequence[Sequence[Sequence[float]]],
+    face: str,
+    frame_gray: np.ndarray,
+    image_size: Tuple[int, int],
+    illum_mask: Optional[np.ndarray] = None,
+) -> Tuple[FaceCalibration, np.ndarray, np.ndarray]:
+    """Turn hand-drawn polygons into a `FaceCalibration`. Returns ``(face_cal, mask, overlay)``.
+
+    This is the whole calibration path for a session that starts with
+    `live_vial_selector.select_vials_live`: the operator draws every vial, and THE POLYGON IS THE
+    VIAL. Nothing here detects, fits, snaps or second-guesses the drawn shape -- vial `i` is
+    exactly the points clicked for it, in the order they were clicked.
+
+    * ids are sequential 1..N in DRAW ORDER (so "vial 3" is the third one drawn, which is what
+      the operator watched being numbered on screen).
+    * `polygon` carries the shape; `x, y, w, h` are its bounding box (`bbox_from_quad`), i.e. the
+      pipeline's crop rectangle, kept in sync by construction.
+    * every vial is ``present=True``. A slot the operator did not want measured is a slot they
+      did not draw -- there is no auto-exclusion here, exactly as in the marker-band path.
+    * `row`/`col` are LABELS ONLY, derived from position (centroid above the frame's mid-line =>
+      row 0, else row 1; `col` = left-to-right rank within that row). Nothing measures with them;
+      they exist so the activity table's row/col columns stay meaningful.
+
+    Args:
+        polygons: one ``[[x, y], ...]`` (>= 3 points) per vial, in draw order.
+        face: face name ("A"/"B").
+        frame_gray: the frame the polygons were drawn on (HxW grayscale) -- used for the derived
+            illumination mask and the overlay.
+        image_size: ``(width, height)`` of the full frame.
+        illum_mask: full-frame lit mask (255 = trackable), used EXACTLY as given when supplied.
+            When None it is derived: a simple Otsu lit mask of `frame_gray`, PLUS the interior of
+            every drawn polygon. That second part matters -- the operator said this region is a
+            vial, so a fly sitting in a tube (a dark blob) at selection time must not carve a
+            permanent hole out of that vial's measurement mask. Outside the drawn vials the mask
+            is still just "what is lit", which is all the rest of the pipeline wants from it.
+
+    Raises:
+        ValueError: if `polygons` is empty (a face with no vials measures nothing).
+    """
+    if not len(polygons):
+        raise ValueError("no polygons were drawn - a face needs at least one vial")
+
+    gray = _as_gray(frame_gray)
+    width, height = int(image_size[0]), int(image_size[1])
+    if illum_mask is None:
+        mask = _illuminated_mask(gray, CalibParams())
+        cv2.fillPoly(mask, [np.round(np.asarray(p, dtype=np.float64).reshape(-1, 2)).astype(np.int32)
+                            for p in polygons], 255)
+    else:
+        mask = illum_mask
+
+    # Row/col are pure labels, so they are assigned from geometry AFTER ids are fixed by draw
+    # order: the operator may well draw the bottom row first.
+    centroids = [polygon_centroid(p) for p in polygons]
+    rows = [0 if cy < height / 2.0 else 1 for _cx, cy in centroids]
+    cols = [0] * len(polygons)
+    for row in (0, 1):
+        members = [i for i, r in enumerate(rows) if r == row]
+        for col, i in enumerate(sorted(members, key=lambda j: centroids[j][0])):
+            cols[i] = col
+
+    vials = []
+    for i, poly in enumerate(polygons):
+        x, y, w, h = bbox_from_quad(poly)
+        vials.append(VialROI(id=i + 1, row=rows[i], col=cols[i], x=x, y=y, w=w, h=h,
+                             present=True, polygon=[[int(px), int(py)] for px, py in poly]))
+
+    face_cal = FaceCalibration(
+        name=face,
+        vials=vials,
+        illum_mask_path="illum_mask_%s.png" % face,
+        marker={"source": "live_vial_selector", "n_vials": len(vials),
+                "image_size": [width, height]},
+    )
+    overlay = draw_quad_overlay(gray, face_cal, mask)
+    return face_cal, mask, overlay
+
+
+#: Vials per drum face. `pipeline.TrackerPipeline` computes global vial ids as
+#: ``face_index * 16 + local_id``, so more than this per face would alias face B's vial 1 onto
+#: face A's vial 17. It is a contract, not a tunable (DESIGN.md section 2).
+VIALS_PER_FACE = 16
+
+
+def build_two_face_calibration_from_polygons(
+    polygons: Sequence[Sequence[Sequence[float]]],
+    frame_gray: np.ndarray,
+    image_size: Tuple[int, int],
+    faces: Sequence[str] = ("A", "B"),
+    illum_mask: Optional[np.ndarray] = None,
+) -> Tuple[Calibration, Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """One hand-drawn set of polygons -> a 32-vial, TWO-FACE bundle with IDENTICAL coordinates.
+
+    The rig owner's constraint, verbatim: *"I will draw 16 vials on 1 face of the machine, and
+    they will be exactly the same as the positions of the vials on the other side."* The drum's
+    two faces present in the SAME orientation (measured: identity correlates +0.60, while a
+    vertical flip and a 180 degree rotation are both strongly negative), so face B gets face A's
+    polygons COPIED VERBATIM -- no mirroring, no rescaling, no snapping to marker spans, no
+    `transfer_quads`. The operator draws once.
+
+    Local ids run 1..16 on each face, so the pipeline's ``face_index * 16 + local_id`` yields
+    global ids 1..16 (face A) and 17..32 (face B).
+
+    Returns:
+        ``(calibration, {face: illum_mask}, {face: overlay})`` -- the mapping form
+        `save_calibration` wants, so every face gets its own PNGs.
+
+    Raises:
+        ValueError: if `polygons` is empty, `faces` is empty, or more than `VIALS_PER_FACE`
+            polygons are given for a multi-face bundle (which would alias global vial ids).
+    """
+    if not len(faces):
+        raise ValueError("at least one face name is required")
+    if len(faces) > 1 and len(polygons) > VIALS_PER_FACE:
+        raise ValueError(
+            "%d polygons is more than the %d vials per face the pipeline's global-id arithmetic "
+            "allows; face %r's ids would collide with face %r's"
+            % (len(polygons), VIALS_PER_FACE, faces[0], faces[1])
+        )
+
+    calib_faces: Dict[str, FaceCalibration] = {}
+    masks: Dict[str, np.ndarray] = {}
+    overlays: Dict[str, np.ndarray] = {}
+    for name in faces:
+        face_cal, mask, overlay = build_calibration_from_polygons(
+            polygons, name, frame_gray, image_size, illum_mask=illum_mask)
+        calib_faces[name] = face_cal
+        masks[name] = mask
+        overlays[name] = overlay
+
+    calib = Calibration(
+        image_width=int(image_size[0]), image_height=int(image_size[1]), faces=calib_faces,
+        created=datetime.now().isoformat(timespec="seconds"),
+        notes="%d vial(s) drawn by hand on the live feed; face(s) %s share identical coordinates"
+              % (len(polygons), ", ".join(faces)),
+    )
+    return calib, masks, overlays
+
+
+def polygons_from_calibration(calib: Calibration, face: Optional[str] = None
+                              ) -> Optional[List[List[List[int]]]]:
+    """The hand-drawn polygons stored in a bundle, in vial-id order. None if it has none.
+
+    Returning None (rather than falling back to bboxes) is deliberate: this answers "was this
+    bundle DRAWN BY HAND?", which is a different question from "can this bundle be reused?".
+    Reuse is `saved_selection`'s job, and it accepts older box/quad bundles too -- but it has to
+    be able to tell the operator WHICH KIND it found, and this is how.
+    """
+    if not calib.faces:
+        return None
+    name = face if face is not None else sorted(calib.faces)[0]
+    face_cal = calib.faces.get(name)
+    if face_cal is None or not face_cal.vials:
+        return None
+    vials = sorted(face_cal.vials, key=lambda v: int(v.id))
+    if any(getattr(v, "polygon", None) is None for v in vials):
+        return None
+    return [[[int(px), int(py)] for px, py in v.polygon] for v in vials]
+
+
+@dataclass
+class SavedSelection:
+    """A previously saved vial selection, as offered back to the operator at the start of a round."""
+    polygons: List[List[List[int]]]
+    faces: List[str]
+    image_size: Tuple[int, int]
+    created: str
+    path: str
+    #: How the shapes got into the bundle. ``"drawn"`` = polygons clicked on the feed by hand.
+    #: ``"boxes"`` = rectangles/quads from the retired auto-detector, which the rig owner judged
+    #: too misaligned to trust. Both are REUSABLE -- an existing bundle must never be thrown away
+    #: just because it predates the selector -- but callers are expected to treat "boxes" as the
+    #: weaker offer and not default to accepting it.
+    kind: str = "drawn"
+
+    @property
+    def n_vials(self) -> int:
+        return len(self.polygons)
+
+    @property
+    def hand_drawn(self) -> bool:
+        return self.kind == "drawn"
+
+
+def saved_selection(out_dir: str) -> Optional[SavedSelection]:
+    """Read a reusable vial selection back from the bundle in `out_dir`, or None.
+
+    None means there is genuinely nothing to offer: no bundle, an unreadable one, or one with no
+    vials in it. Never raises -- a corrupt leftover bundle must send the operator to the drawing
+    flow, not to a traceback.
+
+    ANY bundle holding vials is offered, not just one the live selector wrote. A bundle full of
+    hand-drawn polygons and one full of older auto-detected boxes are both real work that the
+    operator may not want to redo, and refusing to see the second kind would silently force a
+    redraw of a rig that was already calibrated. `kind` says which was found so the caller can
+    ask about it honestly.
+    """
+    path = os.path.join(out_dir, "calibration.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        calib = Calibration.from_json(path)
+        polygons = polygons_from_calibration(calib)
+        kind = "drawn"
+        if not polygons:
+            # No polygons: fall back to each vial's effective shape (quad, else bbox corners),
+            # which is exactly what the pipeline would have measured from this bundle anyway.
+            kind = "boxes"
+            name = sorted(calib.faces)[0]
+            vials = sorted(calib.faces[name].vials, key=lambda v: int(v.id))
+            polygons = [[[int(px), int(py)] for px, py in vial_shape(v)] for v in vials]
+    except Exception:
+        return None
+    if not polygons:
+        return None
+    return SavedSelection(
+        polygons=polygons, faces=sorted(calib.faces),
+        image_size=(int(calib.image_width), int(calib.image_height)),
+        created=str(calib.created or ""), path=path, kind=kind,
+    )
 
 
 # --------------------------------------------------------------------------------------

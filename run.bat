@@ -69,11 +69,10 @@ echo    config : %CONFIG%
 echo    calib  : %CALIB%
 echo    output : %OUTDIR%     bin: %BIN_SECONDS%s
 echo.
-echo    [1]  Start experiment      (live camera + live monitor)
-echo    [2]  Calibrate vial ROIs   (auto-detect, from a flip video)
-echo    [3]  Edit / fine-tune ROIs (drag vertices; saves to BOTH faces)
-echo    [4]  Replay a recorded video
-echo    [5]  Measure noise floor
+echo    [1]  Start experiment      (asks about vial positions, then tracks)
+echo    [2]  Draw vial positions   (16 polygons on the live feed; both faces)
+echo    [3]  Replay a recorded video
+echo    [4]  Measure noise floor
 echo    [Q]  Quit
 echo.
 set "CH="
@@ -81,44 +80,38 @@ set /p CH="   Choose [1]: "
 if not defined CH set "CH=1"
 
 if /I "%CH%"=="1" goto run
-if /I "%CH%"=="2" goto calib
-if /I "%CH%"=="3" goto editrois
-if /I "%CH%"=="4" goto replay
-if /I "%CH%"=="5" goto noise
+if /I "%CH%"=="2" goto selectvials
+if /I "%CH%"=="3" goto replay
+if /I "%CH%"=="4" goto noise
 if /I "%CH%"=="Q" exit /b 0
 goto menu
 
 :run
 echo.
-echo   Starting acquisition. Close the monitor window, or press Ctrl+C here, to stop.
+echo   The round starts by offering the vial positions saved in "%CALIB%".
+echo   Press ENTER to reuse them, or answer n to draw them again on the live feed.
+echo   Then: close the monitor window, or press Ctrl+C here, to stop the experiment.
 echo   IMPORTANT: make sure MVS is CLOSED - the camera allows only one program at a time.
 echo.
 %PY% -m flygym_tracker.cli run --config "%CONFIG%" --calib "%CALIB%" --out "%OUTDIR%" --bin-seconds %BIN_SECONDS% --monitor
 goto done
 
-:calib
+:selectvials
+echo.
+echo   Draw one polygon around each vial on ONE face; the other face gets the same
+echo   positions automatically, so 16 drawings cover all 32 vials.
+echo     left click = add a corner        ENTER     = this vial is done, next one
+echo     BACKSPACE  = undo a corner       u         = redo the previous vial
+echo     c          = clear this vial     SPACE     = freeze the picture to click
+echo     q / ESC    = stop early, keeping the vials drawn so far
+echo   IMPORTANT: make sure MVS is CLOSED - the camera allows only one program at a time.
 echo.
 set "VID="
-set /p VID="   Video file to calibrate from (blank = grab live from camera): "
+set /p VID="   Video to draw on (blank = draw on the LIVE camera): "
 if not defined VID (
-  %PY% -m flygym_tracker.cli calibrate --from-camera --out "%CALIB%" --config "%CONFIG%" --wizard
+  %PY% -m flygym_tracker.cli select-vials --out "%CALIB%" --config "%CONFIG%"
 ) else (
-  %PY% -m flygym_tracker.cli calibrate-faces --video "%VID%" --out "%CALIB%" --config "%CONFIG%"
-)
-goto done
-
-:editrois
-echo.
-echo   Drag the ROI corners to fit each tube. Keys: Tab next vial, v pick corner,
-echo   arrows nudge, c copy shape to all, z undo, s SAVE, q quit.
-echo   Saving also transfers your shapes to the other face automatically.
-echo.
-set "VID="
-set /p VID="   Video to pull the calibration frame from (blank = use stored overlay): "
-if not defined VID (
-  %PY% -m flygym_tracker.cli edit-rois --calib "%CALIB%" --face A
-) else (
-  %PY% -m flygym_tracker.cli edit-rois --calib "%CALIB%" --face A --video "%VID%"
+  %PY% -m flygym_tracker.cli select-vials --out "%CALIB%" --video "%VID%"
 )
 goto done
 

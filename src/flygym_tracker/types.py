@@ -45,6 +45,16 @@ class VialROI:
 
     ``quad=None`` means "no polygon" and behaves EXACTLY as before quads existed, which is what
     keeps calibration bundles written by older versions valid.
+
+    `polygon` (OPTIONAL) is the SAME idea with an arbitrary vertex count -- ``[[x, y], ...]``,
+    3 or more points, in the order the operator clicked them. It is what
+    `live_vial_selector.select_vials_live` produces: the rig owner draws every vial by hand on
+    the live feed at the start of a session, so the shape is whatever it takes to follow that
+    tube (4 corners, 6, 12 -- the drum is cylindrical and no fixed vertex count fits every slot).
+
+    PRECEDENCE, enforced in `pipeline.TrackerPipeline._bbox_submask`:
+    ``polygon`` (if set) > ``quad`` (if set) > plain bbox. A vial carrying neither behaves
+    exactly as it always has, which is what keeps older bundles valid.
     """
     id: int                    # local id within the face, 1..16 (row-major, top row 1..8, bottom 9..16)
     row: int                   # 0 = upper, 1 = lower
@@ -55,23 +65,31 @@ class VialROI:
     h: int
     present: bool = True       # False = empty/missing tube slot, skip in activity
     quad: Optional[list] = None  # [[x,y]] * 4, clockwise from top-left; None = plain bbox
+    polygon: Optional[list] = None  # [[x,y]] * N (N >= 3), click order; None = fall back to quad/bbox
 
     def __post_init__(self) -> None:
-        """Normalise `quad` to ``list[list[int]]`` so JSON round-trips are byte-identical.
+        """Normalise `quad`/`polygon` to ``list[list[int]]`` so JSON round-trips are byte-identical.
 
-        Accepts anything 4-point-shaped (tuples, numpy rows, floats) and stores plain ints, so a
-        quad built by the editor, loaded from JSON or produced by `transfer_quads` all compare
-        equal.
+        Accepts anything point-shaped (tuples, numpy rows, floats) and stores plain ints, so a
+        shape built by the editor/selector, loaded from JSON or produced by `transfer_quads` all
+        compare equal.
         """
-        if self.quad is None:
-            return
-        pts = [[int(round(float(p[0]))), int(round(float(p[1])))] for p in self.quad]
-        if len(pts) != 4:
-            raise ValueError(
-                "VialROI.quad must have exactly 4 corners (clockwise from top-left), got %d"
-                % len(pts)
-            )
-        self.quad = pts
+        if self.quad is not None:
+            pts = [[int(round(float(p[0]))), int(round(float(p[1])))] for p in self.quad]
+            if len(pts) != 4:
+                raise ValueError(
+                    "VialROI.quad must have exactly 4 corners (clockwise from top-left), got %d"
+                    % len(pts)
+                )
+            self.quad = pts
+        if self.polygon is not None:
+            pts = [[int(round(float(p[0]))), int(round(float(p[1])))] for p in self.polygon]
+            if len(pts) < 3:
+                raise ValueError(
+                    "VialROI.polygon needs at least 3 vertices to enclose an area, got %d"
+                    % len(pts)
+                )
+            self.polygon = pts
 
 
 @dataclass
