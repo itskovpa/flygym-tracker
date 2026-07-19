@@ -56,9 +56,10 @@ echo    calib  : %CALIB%
 echo    output : %OUTDIR%     bin: %BIN_SECONDS%s
 echo.
 echo    [1]  Start experiment      (live camera + live monitor)
-echo    [2]  Calibrate vial ROIs   (do this before a new experiment)
-echo    [3]  Replay a recorded video
-echo    [4]  Measure noise floor
+echo    [2]  Calibrate vial ROIs   (auto-detect, from a flip video)
+echo    [3]  Edit / fine-tune ROIs (drag vertices; saves to BOTH faces)
+echo    [4]  Replay a recorded video
+echo    [5]  Measure noise floor
 echo    [Q]  Quit
 echo.
 set "CH="
@@ -67,8 +68,9 @@ if not defined CH set "CH=1"
 
 if /I "%CH%"=="1" goto run
 if /I "%CH%"=="2" goto calib
-if /I "%CH%"=="3" goto replay
-if /I "%CH%"=="4" goto noise
+if /I "%CH%"=="3" goto editrois
+if /I "%CH%"=="4" goto replay
+if /I "%CH%"=="5" goto noise
 if /I "%CH%"=="Q" exit /b 0
 goto menu
 
@@ -88,6 +90,21 @@ if not defined VID (
   %PY% -m flygym_tracker.cli calibrate --from-camera --out "%CALIB%" --config "%CONFIG%" --wizard
 ) else (
   %PY% -m flygym_tracker.cli calibrate-faces --video "%VID%" --out "%CALIB%" --config "%CONFIG%"
+)
+goto done
+
+:editrois
+echo.
+echo   Drag the ROI corners to fit each tube. Keys: Tab next vial, v pick corner,
+echo   arrows nudge, c copy shape to all, z undo, s SAVE, q quit.
+echo   Saving also transfers your shapes to the other face automatically.
+echo.
+set "VID="
+set /p VID="   Video to pull the calibration frame from (blank = use stored overlay): "
+if not defined VID (
+  %PY% -m flygym_tracker.cli edit-rois --calib "%CALIB%" --face A
+) else (
+  %PY% -m flygym_tracker.cli edit-rois --calib "%CALIB%" --face A --video "%VID%"
 )
 goto done
 
