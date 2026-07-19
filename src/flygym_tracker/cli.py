@@ -5,6 +5,9 @@ live capture, noise floor, calibration on the real face, rotation detection"):
 
   * ``calibrate`` -- build a per-face `Calibration` bundle (DESIGN.md section 5.4/5.5) from a still
     image or a single live-camera grab, optionally refined with the interactive manual wizard.
+  * ``edit-rois`` -- hand-edit a face's 4-vertex vial ROIs (`roi_editor`) so they follow the
+    cylindrical drum's foreshortened edge tubes, then transfer the shapes to the other face
+    (`calibration.transfer_quads`) and re-write the bundle.
   * ``noise``     -- measure the static-rig noise floor (`pipeline.measure_noise`) and suggest the
     ``activity.pixel_threshold`` / ``rotation.enter_threshold`` / ``rotation.exit_threshold`` values
     a calibration alone cannot provide (DESIGN.md section 5.1/5.3: thresholds are seeded from real
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -37,9 +41,14 @@ from flygym_tracker.calibration import (
     boxes_from_calibration,
     build_two_face_calibration,
     detect_calibration,
+    draw_quad_overlay,
     load_calibration,
+    quad_lit_fraction,
+    relativize_mask_paths,
     save_calibration,
     suspicious_vials,
+    transfer_quads,
+    vial_quad,
 )
 from flygym_tracker.config import load_config
 from flygym_tracker.frame_source import HikCameraSource, VideoFileSource
@@ -318,6 +327,131 @@ def _face_index(calib, name: str) -> int:
 
 
 # =============================================================================================
+# edit-rois (manual QUAD ROI editor + transfer to the other face)
+# =============================================================================================
+def _grab_video_frame(video_path: str, index: int):
+    """Grab frame `index` from a video as grayscale, or None.
+
+    Tries a seek first and falls back to reading sequentially -- seeking is unreliable on some
+    AVI/codec combinations and silently lands on the wrong frame, which would put the operator in
+    front of the WRONG drum face without saying so.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    try:
+        if index > 0 and cap.set(cv2.CAP_PROP_POS_FRAMES, float(index)):
+            ok, frame = cap.read()
+            if ok and abs(int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - (index + 1)) <= 1:
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            cap.release()
+            cap = cv2.VideoCapture(video_path)
+        for i in range(index + 1):
+            ok, frame = cap.read()
+            if not ok:
+                return None
+            if i == index:
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    finally:
+        cap.release()
+    return None
+
+
+def _face_source_frame(calib, face: str, args):
+    """The still to edit/draw a face on: --frame, --video (the face's own calibration frame), or
+    the saved overlay as a last resort. Returns ``(gray, description)`` or ``(None, reason)``."""
+    if getattr(args, "frame", None):
+        gray = cv2.imread(args.frame, cv2.IMREAD_GRAYSCALE)
+        return (gray, args.frame) if gray is not None else (None, f"could not read {args.frame!r}")
+    if getattr(args, "video", None):
+        marker = calib.faces[face].marker
+        idx = int(marker.get("source_frame", 0)) if isinstance(marker, dict) else 0
+        gray = _grab_video_frame(args.video, idx)
+        if gray is None:
+            return None, f"could not read frame {idx} of {args.video!r}"
+        return gray, f"{args.video} frame {idx} (face {face}'s own calibration frame)"
+    path = os.path.join(args.calib, "overlay_%s.png" % face)
+    gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        return None, ("no --frame/--video given and no %s to fall back on" % path)
+    return gray, path + " (saved overlay -- pass --frame/--video for a clean image)"
+
+
+def _lit_report(face_cal, illum_mask):
+    """``{vial_id: lit_fraction}`` for a face -- the before/after evidence an edit actually helped."""
+    return {int(v.id): quad_lit_fraction(vial_quad(v), illum_mask) for v in face_cal.vials}
+
+
+def _cmd_edit_rois(args) -> int:
+    """Hand-edit one face's 4-vertex vial ROIs, then mirror the shapes onto the other face.
+
+    The drum is cylindrical, so edge tubes are foreshortened and no axis-aligned rectangle can
+    follow them (DESIGN.md section 2's non-uniform, curved geometry). This is the escape hatch the
+    rig owner asked for: shape ONE face by hand before an experiment, save, and have both faces
+    covered for the whole run -- the two present in the SAME orientation, so
+    `calibration.transfer_quads` maps shapes across directly and re-snaps them to the destination
+    face's own marker-derived columns.
+    """
+    from flygym_tracker.roi_editor import run_roi_editor  # interactive-only import
+
+    calib = _load_calibration_or_report(args.calib)
+    if calib is None:
+        return 1
+    face = args.face or ("A" if "A" in calib.faces else sorted(calib.faces)[0])
+    if face not in calib.faces:
+        print(f"error: face {face!r} not in calibration (have: {sorted(calib.faces)})", file=sys.stderr)
+        return 1
+
+    illum = cv2.imread(calib.faces[face].illum_mask_path, cv2.IMREAD_GRAYSCALE)
+    if illum is None:
+        print(f"error: could not read illum mask at {calib.faces[face].illum_mask_path!r}", file=sys.stderr)
+        return 1
+    gray, source = _face_source_frame(calib, face, args)
+    if gray is None:
+        print(f"error: {source}", file=sys.stderr)
+        return 1
+
+    before = _lit_report(calib.faces[face], illum)
+    print(f"editing face {face!r} from {source}")
+    edited = run_roi_editor(gray, calib.faces[face], illum)
+    if edited is None:
+        print("cancelled; calibration bundle left unchanged")
+        return 0
+
+    calib.faces[face] = edited
+    after = _lit_report(edited, illum)
+    overlays = {face: draw_quad_overlay(gray, edited, illum)}
+
+    transferred = []
+    if not args.no_transfer:
+        for other in sorted(n for n in calib.faces if n != face):
+            calib.faces[other] = transfer_quads(
+                edited, calib.faces[other], image_size=(calib.image_width, calib.image_height))
+            transferred.append(other)
+            other_gray, _ = _face_source_frame(calib, other, args) if args.video else (None, "")
+            other_mask = cv2.imread(calib.faces[other].illum_mask_path, cv2.IMREAD_GRAYSCALE)
+            if other_gray is not None:
+                overlays[other] = draw_quad_overlay(other_gray, calib.faces[other], other_mask)
+
+    # Mask paths were absolutized by `load_calibration`; undo that or the re-saved bundle bakes in
+    # this machine's directory and stops being movable.
+    relativize_mask_paths(calib)
+    save_calibration(calib, {}, args.calib, overlay=overlays)
+
+    print(f"\nsaved to {args.calib!r}: face {face!r} quads updated"
+          + (f", transferred to face(s) {', '.join(transferred)}" if transferred else ""))
+    print("  vial   lit before -> after")
+    for vid in sorted(after):
+        b, a = before.get(vid, float("nan")), after[vid]
+        flag = "  <-- worse" if a < b - 0.005 else ("  ++" if a > b + 0.005 else "")
+        print(f"  {vid:>4}   {b:9.3f} -> {a:.3f}{flag}")
+    mean_b = sum(before.values()) / max(1, len(before))
+    mean_a = sum(after.values()) / max(1, len(after))
+    print(f"  mean   {mean_b:9.3f} -> {mean_a:.3f}")
+    return 0
+
+
+# =============================================================================================
 # noise
 # =============================================================================================
 def _cmd_noise(args) -> int:
@@ -474,6 +608,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Config YAML; an optional `calibration.marker_params` block overrides the tuning defaults.",
     )
     p_faces.set_defaults(handler=_cmd_calibrate_faces)
+
+    # -- edit-rois ----------------------------------------------------------------------------
+    p_edit = subparsers.add_parser(
+        "edit-rois",
+        help="Hand-edit one face's 4-vertex vial ROIs, then transfer the shapes to the other face.",
+        description=(
+            "Interactive quad-ROI editor. The drum is cylindrical, so tubes near the left/right "
+            "edge are foreshortened and an axis-aligned rectangle cannot follow them. Drag the "
+            "VERTICES of a vial's ROI (with a magnifier for precision), press 'c' to copy that "
+            "shape to every vial, 's' to save. Saving writes the edited quads back to the bundle "
+            "and, unless --no-transfer, maps them onto the other drum face as well -- the two "
+            "faces present in the same orientation, so shapes carry across directly and are "
+            "re-snapped to the destination face's own marker-derived columns."
+        ),
+    )
+    p_edit.add_argument("--calib", required=True, help="Calibration bundle directory to edit IN PLACE.")
+    p_edit.add_argument("--face", default=None, help="Face to edit (default: A, or the first face).")
+    edit_src = p_edit.add_mutually_exclusive_group()
+    edit_src.add_argument("--frame", default=None, help="Still image of the face to edit on.")
+    edit_src.add_argument(
+        "--video", default=None,
+        help="Video the bundle was calibrated from; each face's own calibration frame is pulled "
+             "from it (and both overlays are regenerated).",
+    )
+    p_edit.add_argument(
+        "--no-transfer", action="store_true",
+        help="Edit this face only; leave the other face's ROIs alone.",
+    )
+    p_edit.set_defaults(handler=_cmd_edit_rois)
 
     # -- noise --------------------------------------------------------------------------------
     p_noise = subparsers.add_parser(

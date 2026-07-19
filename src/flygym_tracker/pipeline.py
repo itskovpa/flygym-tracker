@@ -53,6 +53,7 @@ import cv2
 import numpy as np
 
 from flygym_tracker.activity import ActivityAccumulator, per_frame_activity
+from flygym_tracker.calibration import bbox_from_quad, quad_polygon_mask, shift_quad
 from flygym_tracker.frame_source import FrameSource, VideoFileSource
 from flygym_tracker.registration import apply_shift, estimate_shift
 from flygym_tracker.adaptive_rotation import AdaptiveRotationDetector
@@ -198,6 +199,7 @@ class TrackerPipeline:
         self._face_lit_mask: Dict[str, np.ndarray] = {}  # face -> full-frame bool (==255)
         self._face_active: Dict[str, Dict[int, Tuple[Bbox, np.ndarray]]] = {}   # face -> gvid -> (bbox, submask)
         self._face_calib_bbox: Dict[str, Dict[int, Bbox]] = {}                  # face -> gvid -> anchor bbox
+        self._face_calib_quad: Dict[str, Dict[int, Optional[list]]] = {}        # face -> gvid -> anchor quad|None
         self._vial_meta: Dict[int, Tuple[str, object]] = {}                     # gvid -> (face, VialROI)
         self._precompute_faces()
         self.max_shift = (
@@ -338,24 +340,44 @@ class TrackerPipeline:
             fidx = self._face_index[name]
             active: Dict[int, Tuple[Bbox, np.ndarray]] = {}
             calib: Dict[int, Bbox] = {}
+            quads: Dict[int, Optional[list]] = {}
             for v in fc.vials:
                 if not v.present:
                     continue
                 gvid = fidx * 16 + v.id
-                anchor = (int(v.x), int(v.y), int(v.w), int(v.h))
+                quad = getattr(v, "quad", None)
+                # With a quad, the crop rectangle is the quad's OWN bounding box rather than the
+                # stored one. They are equal for any bundle written by the editor
+                # (`calibration.sync_bbox_to_quad` enforces it), so this changes nothing there --
+                # it only stops a hand-edited bundle whose bbox went stale from silently
+                # truncating the polygon it says it wants measured.
+                anchor = bbox_from_quad(quad) if quad is not None else (
+                    int(v.x), int(v.y), int(v.w), int(v.h))
                 calib[gvid] = anchor
-                active[gvid] = self._bbox_submask(mask_img, anchor)
+                quads[gvid] = quad
+                active[gvid] = self._bbox_submask(mask_img, anchor, quad)
                 self._vial_meta[gvid] = (name, v)
             self._face_active[name] = active
             self._face_calib_bbox[name] = calib
+            self._face_calib_quad[name] = quads
 
-    def _bbox_submask(self, illum_mask: np.ndarray, bbox: Bbox) -> Tuple[Bbox, np.ndarray]:
-        """Clip a bbox to the frame and return (clipped_bbox, bbox-local bool submask == 255)."""
+    def _bbox_submask(self, illum_mask: np.ndarray, bbox: Bbox,
+                      quad: Optional[list] = None) -> Tuple[Bbox, np.ndarray]:
+        """Clip a bbox to the frame; return (clipped_bbox, bbox-local effective bool mask).
+
+        The effective mask is ``illum_mask == 255`` inside the bbox, AND -- when the vial carries
+        a 4-vertex `quad` (DESIGN.md's cylindrical-drum ROIs, `types.VialROI`) -- the filled
+        polygon of that quad. `quad=None` (every pre-quad calibration bundle) leaves the mask
+        exactly as it has always been.
+        """
         cb = _clip_bbox(bbox, self._W, self._H)
         x, y, w, h = cb
         if w <= 0 or h <= 0:
             return cb, np.zeros((0, 0), dtype=bool)
-        return cb, (illum_mask[y:y + h, x:x + w] == 255)
+        sub = illum_mask[y:y + h, x:x + w] == 255
+        if quad is not None:
+            sub = sub & quad_polygon_mask(quad, cb)
+        return cb, sub
 
     def _default_max_shift(self) -> float:
         """`DEFAULT_MAX_SHIFT_FRAC` x the tightest vial-center pitch across all present vials.
@@ -549,11 +571,18 @@ class TrackerPipeline:
             )
 
     def _apply_registration(self, face: str, dx: float, dy: float) -> None:
-        """Re-derive each present vial's bbox+submask from its calibration anchor by (dx, dy)."""
+        """Re-derive each present vial's bbox+submask from its calibration anchor by (dx, dy).
+
+        A vial's quad is translated by the SAME rounded offset as its bbox (`shift_quad` mirrors
+        `apply_shift`'s rounding), so the polygon keeps its exact position within the crop.
+        """
         illum = self._illum_mask[face]
         active = self._face_active[face]
+        quads = self._face_calib_quad[face]
         for gvid, anchor in self._face_calib_bbox[face].items():
-            active[gvid] = self._bbox_submask(illum, apply_shift(anchor, dx, dy))
+            quad = quads.get(gvid)
+            shifted = shift_quad(quad, dx, dy) if quad is not None else None
+            active[gvid] = self._bbox_submask(illum, apply_shift(anchor, dx, dy), shifted)
 
     def _rotating_placeholder(self) -> Dict[int, Tuple[int, int, float]]:
         """Zero-motion per-vial results for the current face (only the keys + lit area matter here).

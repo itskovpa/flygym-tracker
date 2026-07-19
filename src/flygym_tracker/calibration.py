@@ -470,6 +470,315 @@ def boxes_from_calibration(calib: Calibration, face: str) -> Tuple[List[Box], Li
     return boxes, present
 
 
+# ======================================================================================
+# QUAD (4-vertex) VIAL ROIs
+# ======================================================================================
+# The drum is a CYLINDER. Tubes near the left/right edge of the frame curve away from the
+# camera and are foreshortened, so an axis-aligned rectangle either spills onto the dark
+# surround or clips the tube -- measured on the real 2-face bundle, face A's edge vials 1 and
+# 8 have lit fractions of only 0.28 and 0.50 against ~0.95 for the central ones. A 4-corner
+# quad can follow that taper; a rectangle cannot.
+#
+# Everything below is PURE geometry over `VialROI.quad` (``[[x, y]] * 4``, clockwise from the
+# top-left) so it is testable headlessly. `roi_editor` drives it interactively, `pipeline`
+# consumes it (`quad_polygon_mask`), and `transfer_quads` moves an edited face's shapes onto
+# the other face.
+#
+# INVARIANT: a vial's `x, y, w, h` is the bounding box of its quad. `sync_bbox_to_quad`
+# restores it after any edit; the pipeline additionally re-derives the crop rectangle from the
+# quad, so a hand-edited bundle whose bbox went stale still measures the full polygon rather
+# than silently truncating it.
+
+#: A 4-corner polygon: ``[[x, y], [x, y], [x, y], [x, y]]``, clockwise from the top-left.
+Quad = List[List[int]]
+#: Inclusive ``(x0, x1)`` column span, as `marker_band.MarkerBandDetector.vial_boundaries` returns.
+Span = Tuple[int, int]
+
+
+def quad_from_bbox(box: Box) -> Quad:
+    """The rectangle `box` as a quad -- clockwise from the top-left: TL, TR, BR, BL.
+
+    This is the default shape for a vial that has never been hand-edited, so a bundle with no
+    quads at all behaves identically to one whose quads are all straight rectangles.
+    """
+    x, y, w, h = (int(v) for v in box)
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+
+def bbox_from_quad(quad: Sequence[Sequence[float]]) -> Box:
+    """The integer bounding box ``(x, y, w, h)`` of a quad (w/h always >= 1)."""
+    pts = np.asarray(quad, dtype=np.float64).reshape(-1, 2)
+    x0 = int(np.floor(pts[:, 0].min()))
+    y0 = int(np.floor(pts[:, 1].min()))
+    x1 = int(np.ceil(pts[:, 0].max()))
+    y1 = int(np.ceil(pts[:, 1].max()))
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def vial_quad(vial: VialROI) -> Quad:
+    """This vial's EFFECTIVE quad: its own if it has one, else its bbox as a rectangle.
+
+    Use this anywhere a shape is needed regardless of whether the bundle predates quads.
+    """
+    if vial.quad is not None:
+        return [[int(px), int(py)] for px, py in vial.quad]
+    return quad_from_bbox((vial.x, vial.y, vial.w, vial.h))
+
+
+def face_quads(face_cal: FaceCalibration) -> List[Quad]:
+    """Effective quads for every vial of a face, in `face_cal.vials` order."""
+    return [vial_quad(v) for v in face_cal.vials]
+
+
+def sync_bbox_to_quad(vial: VialROI) -> VialROI:
+    """Reset `vial`'s bbox to the bounding box of its quad, IN PLACE. No-op without a quad."""
+    if vial.quad is not None:
+        vial.x, vial.y, vial.w, vial.h = bbox_from_quad(vial.quad)
+    return vial
+
+
+def shift_quad(quad: Sequence[Sequence[float]], dx: float, dy: float) -> Quad:
+    """Translate a quad by ``(dx, dy)``, rounding exactly as `registration.apply_shift` does.
+
+    Matching that rounding is what keeps a registered quad aligned with its registered bbox
+    (they must land on the same integer grid or the polygon would drift inside the crop).
+    """
+    ix, iy = int(round(float(dx))), int(round(float(dy)))
+    return [[int(px) + ix, int(py) + iy] for px, py in quad]
+
+
+def polygon_area(quad: Sequence[Sequence[float]]) -> float:
+    """Shoelace area of a quad (always >= 0). Analytic; see `quad_polygon_mask` for the raster."""
+    pts = np.asarray(quad, dtype=np.float64).reshape(-1, 2)
+    x, y = pts[:, 0], pts[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def quad_polygon_mask(quad: Sequence[Sequence[float]], bbox: Box) -> np.ndarray:
+    """Filled polygon as a BBOX-LOCAL bool mask of shape ``(h, w)``.
+
+    `bbox` is the crop rectangle the mask must line up with (normally the quad's own bounding
+    box, already clipped to the frame). Vertices outside it are clipped by `cv2.fillPoly`, so a
+    quad hanging off the frame edge simply contributes the part that is inside.
+    """
+    x, y, w, h = (int(v) for v in bbox)
+    if w <= 0 or h <= 0:
+        return np.zeros((0, 0), dtype=bool)
+    pts = np.asarray(quad, dtype=np.float64).reshape(-1, 2) - np.array([x, y], dtype=np.float64)
+    canvas = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(canvas, [np.round(pts).astype(np.int32)], 255)
+    return canvas > 0
+
+
+def quad_lit_fraction(quad: Sequence[Sequence[float]], illum_mask: np.ndarray) -> float:
+    """``(quad ∩ illuminated) / quad`` in PIXELS -- the editor's live coverage readout.
+
+    Both terms are rasterised over the quad's frame-clipped bounding box, so this is exactly
+    the ratio the pipeline will measure: the numerator is the vial's effective measurement mask
+    (`pipeline.TrackerPipeline._bbox_submask`) and the denominator is the polygon's own pixel
+    count. Returns 0.0 for a degenerate (zero-area or fully off-frame) quad.
+    """
+    H, W = illum_mask.shape[:2]
+    x, y, w, h = bbox_from_quad(quad)
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    cb = (x0, y0, x1 - x0, y1 - y0)
+    poly = quad_polygon_mask(quad, cb)
+    area = int(np.count_nonzero(poly))
+    if area == 0:
+        return 0.0
+    lit = int(np.count_nonzero(poly & (illum_mask[y0:y1, x0:x1] == 255)))
+    return lit / float(area)
+
+
+def face_column_spans(face_cal: FaceCalibration) -> List[Span]:
+    """Per-column inclusive ``(x0, x1)`` spans for a face, indexed by `VialROI.col`.
+
+    Prefers the marker band's measured spans (``marker["vial_spans"]`` -- see
+    `build_calibration_from_markers`, where the columns come from the physical sticker band
+    rather than a brightness guess). Falls back to the union of each column's own vial bboxes,
+    so a face built by any other path still has usable spans.
+    """
+    marker = face_cal.marker
+    if isinstance(marker, dict) and marker.get("vial_spans"):
+        return [(int(a), int(b)) for a, b in marker["vial_spans"]]
+    by_col: Dict[int, List[VialROI]] = {}
+    for v in face_cal.vials:
+        by_col.setdefault(int(v.col), []).append(v)
+    return [
+        (min(v.x for v in by_col[c]), max(v.x + v.w - 1 for v in by_col[c]))
+        for c in sorted(by_col)
+    ]
+
+
+def face_row_bands(face_cal: FaceCalibration) -> Dict[int, RowBand]:
+    """Per-row half-open ``(y0, y1)`` tube bands for a face, keyed by `VialROI.row`.
+
+    Prefers ``marker["row_bands"]``; falls back to the union of each row's own vial bboxes.
+    """
+    marker = face_cal.marker
+    if isinstance(marker, dict) and isinstance(marker.get("row_bands"), dict):
+        rb = marker["row_bands"]
+        out = {}
+        for row, key in ((0, "upper"), (1, "lower")):
+            if rb.get(key):
+                out[row] = (int(rb[key][0]), int(rb[key][1]))
+        if out:
+            return out
+    bands: Dict[int, RowBand] = {}
+    for v in face_cal.vials:
+        r = int(v.row)
+        y0, y1 = (v.y, v.y + v.h)
+        if r in bands:
+            y0 = min(y0, bands[r][0])
+            y1 = max(y1, bands[r][1])
+        bands[r] = (y0, y1)
+    return bands
+
+
+def transfer_quads(
+    src_face_cal: FaceCalibration,
+    dst_face_cal: FaceCalibration,
+    src_spans: Optional[Sequence[Span]] = None,
+    dst_spans: Optional[Sequence[Span]] = None,
+    *,
+    src_bands: Optional[Mapping[int, RowBand]] = None,
+    dst_bands: Optional[Mapping[int, RowBand]] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+) -> FaceCalibration:
+    """Carry hand-edited quads from one drum face onto the other. Returns a NEW FaceCalibration.
+
+    WHY THIS IS AN IDENTITY MAP AND NOT A MIRROR. The rig owner edits ONE face before an
+    experiment and expects both to be covered ("the system is symmetric"). It is -- and,
+    measured, it is symmetric in the *simplest* way: correlating face A's frame against face B's
+    gives +0.60 under the IDENTITY transform, while a vertical flip and a 180 deg rotation both
+    score strongly NEGATIVE. The drum presents its two faces in the SAME orientation, so vial 1
+    is top-left on both and a shape transfers directly. Mirroring would be wrong.
+
+    What is left over is the small pose difference between the two dwells (the drum does not
+    stop at exactly the same angle, and the two faces are not machined identically): face A's
+    column 0 spans x=57..209 while face B's spans x=34..195. So each quad is rescaled from its
+    SOURCE column span onto the DESTINATION column span, and from the source row band onto the
+    DESTINATION row band -- i.e. the shape is expressed in the source column's own normalised
+    frame and stamped into the destination column's. The destination face keeps its own marker-
+    derived geometry; only the SHAPE comes from the source.
+
+    Args:
+        src_face_cal: the face that was edited (quads are read from here).
+        dst_face_cal: the face to write onto; untouched (a copy is returned).
+        src_spans / dst_spans: inclusive per-column ``(x0, x1)`` spans. Default: each face's own
+            (`face_column_spans`) -- normally the marker band's measured columns.
+        src_bands / dst_bands: per-row half-open ``(y0, y1)`` tube bands. Default:
+            `face_row_bands` of each face, i.e. the DESTINATION's own vertical extent is
+            preserved.
+        image_size: optional ``(width, height)`` to clip transferred quads to the frame.
+
+    Returns:
+        A new `FaceCalibration` for `dst_face_cal.name` with quads set and bboxes re-synced.
+        Vials the source has no quad for (or no matching id) are copied through unchanged.
+    """
+    src_spans = list(src_spans) if src_spans is not None else face_column_spans(src_face_cal)
+    dst_spans = list(dst_spans) if dst_spans is not None else face_column_spans(dst_face_cal)
+    sb = dict(src_bands) if src_bands is not None else face_row_bands(src_face_cal)
+    db = dict(dst_bands) if dst_bands is not None else face_row_bands(dst_face_cal)
+    src_by_id = {int(v.id): v for v in src_face_cal.vials}
+
+    vials: List[VialROI] = []
+    n_transferred = 0
+    for dv in dst_face_cal.vials:
+        sv = src_by_id.get(int(dv.id))
+        new = VialROI(id=dv.id, row=dv.row, col=dv.col, x=dv.x, y=dv.y, w=dv.w, h=dv.h,
+                      present=dv.present, quad=dv.quad)
+        if (sv is not None and sv.quad is not None
+                and int(sv.col) < len(src_spans) and int(dv.col) < len(dst_spans)
+                and int(sv.row) in sb and int(dv.row) in db):
+            new.quad = _map_quad(sv.quad, src_spans[int(sv.col)], dst_spans[int(dv.col)],
+                                 sb[int(sv.row)], db[int(dv.row)], image_size)
+            sync_bbox_to_quad(new)
+            n_transferred += 1
+        vials.append(new)
+
+    marker = dict(dst_face_cal.marker) if isinstance(dst_face_cal.marker, dict) else dst_face_cal.marker
+    if isinstance(marker, dict):
+        marker["quad_source"] = {"face": src_face_cal.name, "n_transferred": n_transferred,
+                                 "orientation": "identity (faces present in the same orientation)"}
+    return FaceCalibration(name=dst_face_cal.name, vials=vials,
+                           illum_mask_path=dst_face_cal.illum_mask_path, marker=marker)
+
+
+def _map_quad(quad: Sequence[Sequence[float]], src_span: Span, dst_span: Span,
+              src_band: RowBand, dst_band: RowBand,
+              image_size: Optional[Tuple[int, int]]) -> Quad:
+    """Affine-map one quad from (src column span x src row band) into the destination's."""
+    sx0, sx1 = int(src_span[0]), int(src_span[1])
+    dx0, dx1 = int(dst_span[0]), int(dst_span[1])
+    sy0, sy1 = int(src_band[0]), int(src_band[1])
+    dy0, dy1 = int(dst_band[0]), int(dst_band[1])
+    kx = (dx1 - dx0) / float(sx1 - sx0) if sx1 != sx0 else 1.0
+    ky = (dy1 - dy0) / float(sy1 - sy0) if sy1 != sy0 else 1.0
+    out: Quad = []
+    for px, py in quad:
+        nx = dx0 + (float(px) - sx0) * kx
+        ny = dy0 + (float(py) - sy0) * ky
+        if image_size is not None:
+            nx = min(max(nx, 0.0), float(image_size[0]))
+            ny = min(max(ny, 0.0), float(image_size[1]))
+        out.append([int(round(nx)), int(round(ny))])
+    return out
+
+
+def apply_quads_to_face(face_cal: FaceCalibration, quads: Sequence[Sequence[Sequence[float]]],
+                        ) -> FaceCalibration:
+    """A copy of `face_cal` carrying `quads` (one per vial, same order) with bboxes re-synced."""
+    if len(quads) != len(face_cal.vials):
+        raise ValueError("expected %d quad(s) for face %r, got %d"
+                         % (len(face_cal.vials), face_cal.name, len(quads)))
+    vials: List[VialROI] = []
+    for v, q in zip(face_cal.vials, quads):
+        nv = VialROI(id=v.id, row=v.row, col=v.col, x=v.x, y=v.y, w=v.w, h=v.h,
+                     present=v.present, quad=[[int(round(float(p[0]))), int(round(float(p[1])))]
+                                              for p in q])
+        sync_bbox_to_quad(nv)
+        vials.append(nv)
+    return FaceCalibration(name=face_cal.name, vials=vials,
+                           illum_mask_path=face_cal.illum_mask_path, marker=face_cal.marker)
+
+
+def draw_quad_overlay(gray: np.ndarray, face_cal: FaceCalibration,
+                      illum_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Human-check overlay for a quad-edited face: polygons + per-vial lit fraction.
+
+    Same idea as `_draw_marker_overlay` (green tint over trackable pixels, ids drawn on each
+    slot) but the ROI is drawn as its POLYGON with its corners marked, and each label carries
+    the coverage number the editor was showing -- so the saved overlay is a faithful record of
+    what the operator approved.
+    """
+    vis = cv2.cvtColor(_as_gray(gray), cv2.COLOR_GRAY2BGR)
+    if illum_mask is not None:
+        tint = np.zeros_like(vis)
+        tint[illum_mask > 0] = (0, 60, 0)
+        vis = cv2.add(vis, tint)
+    for v in face_cal.vials:
+        quad = vial_quad(v)
+        edited = v.quad is not None
+        color = (0, 200, 0) if v.present else (0, 0, 255)
+        pts = np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(vis, [pts], True, color, 2)
+        for px, py in quad:
+            cv2.circle(vis, (int(px), int(py)), 4, (0, 255, 255) if edited else color, -1)
+        label = str(v.id) if v.present else "%d X" % v.id
+        if illum_mask is not None:
+            label += "  lit %.2f" % quad_lit_fraction(quad, illum_mask)
+        # Stagger alternate columns' labels: edge vials are narrow, so same-height labels on
+        # neighbouring slots overprint each other and the overlay stops being checkable.
+        dy = 24 + 28 * (int(v.col) % 2)
+        cv2.putText(vis, label, (int(quad[0][0]) + 4, int(quad[0][1]) + dy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return vis
+
+
 # --------------------------------------------------------------------------------------
 # Overlay + persistence
 # --------------------------------------------------------------------------------------
@@ -538,6 +847,19 @@ def load_calibration(out_dir: str) -> Calibration:
     """Load a bundle from `out_dir`, resolving mask paths to absolute locations."""
     calib = Calibration.from_json(os.path.join(out_dir, "calibration.json"))
     calib.resolve_mask_paths(os.path.abspath(out_dir))
+    return calib
+
+
+def relativize_mask_paths(calib: Calibration) -> Calibration:
+    """Strip mask paths back to bare filenames, IN PLACE (inverse of `resolve_mask_paths`).
+
+    `load_calibration` absolutizes them for the current machine; re-saving a loaded bundle
+    without undoing that would bake this machine's directory into `calibration.json` and make
+    the bundle unmovable. Any code path that loads a bundle, edits it and saves it again (see
+    `cli` ``edit-rois``) must call this first.
+    """
+    for fc in calib.faces.values():
+        fc.illum_mask_path = os.path.basename(fc.illum_mask_path)
     return calib
 
 

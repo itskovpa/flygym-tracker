@@ -141,7 +141,15 @@ Two ways to produce a calibration bundle, both emitting the IDENTICAL `Calibrati
 ## 6. Shared data contracts — see `src/flygym_tracker/types.py` (provided, authoritative)
 
 - `TrackState` enum: `STATIONARY`, `ROTATING`, `SETTLING`, `UNKNOWN`.
-- `VialROI(id,row,col,x,y,w,h,present)`.
+- `VialROI(id,row,col,x,y,w,h,present,quad=None)`. `quad` = 4 corners `[[x,y]]*4` clockwise from
+  top-left, following the vial's real outline. The drum is CYLINDRICAL, so edge tubes curve away and
+  an axis-aligned rectangle cannot follow them (measured: edge vials only 0.28–0.50 lit fraction).
+  When `quad` is set the per-vial measurement mask is `illum_mask ∩ polygon(quad)`; `x,y,w,h` remain
+  the crop bounding box. `quad=None` behaves exactly as before quads existed (old bundles stay valid,
+  verified byte-identical). Edited by hand once per experiment via `roi_editor.run_roi_editor`
+  (CLI: `edit-rois`), then transferred to the other face — the faces present in the SAME orientation
+  (identity, NOT mirrored; verified by correlation), so shapes copy across and snap to the target
+  face's own marker-derived column spans.
 - `FaceCalibration(name, vials: list[VialROI], illum_mask_path, marker)`.
 - `Calibration(image_width,image_height,faces: dict[str,FaceCalibration],created,notes)` + `to_json/from_json/load`.
 - `ActivityRecord(...)` — one row per vial per bin (schema = §5.3 fields).

@@ -30,7 +30,22 @@ class Frame:
 
 @dataclass
 class VialROI:
-    """A single vial slot on a face. bbox in pixel coords of the full frame."""
+    """A single vial slot on a face. bbox in pixel coords of the full frame.
+
+    `quad` (OPTIONAL) is a 4-corner polygon — ``[[x, y], [x, y], [x, y], [x, y]]``, clockwise
+    from the TOP-LEFT corner — that follows the vial's real outline. The drum is cylindrical,
+    so tubes near the left/right edges curve away and are foreshortened; an axis-aligned
+    rectangle cannot follow them (measured: edge vials only 0.28–0.50 "lit fraction"). The
+    quad is edited by hand once per experiment via `roi_editor.run_roi_editor`.
+
+    `x, y, w, h` REMAIN the bounding box and stay the cheap crop rectangle; when a quad is
+    present the per-vial measurement mask is ``illum_mask ∩ polygon(quad)`` inside that crop
+    (see `pipeline.TrackerPipeline._bbox_submask`). Callers that edit a quad must keep the
+    bbox in sync — `calibration.sync_bbox_to_quad` does it.
+
+    ``quad=None`` means "no polygon" and behaves EXACTLY as before quads existed, which is what
+    keeps calibration bundles written by older versions valid.
+    """
     id: int                    # local id within the face, 1..16 (row-major, top row 1..8, bottom 9..16)
     row: int                   # 0 = upper, 1 = lower
     col: int                   # 0..7, left to right
@@ -39,6 +54,24 @@ class VialROI:
     w: int
     h: int
     present: bool = True       # False = empty/missing tube slot, skip in activity
+    quad: Optional[list] = None  # [[x,y]] * 4, clockwise from top-left; None = plain bbox
+
+    def __post_init__(self) -> None:
+        """Normalise `quad` to ``list[list[int]]`` so JSON round-trips are byte-identical.
+
+        Accepts anything 4-point-shaped (tuples, numpy rows, floats) and stores plain ints, so a
+        quad built by the editor, loaded from JSON or produced by `transfer_quads` all compare
+        equal.
+        """
+        if self.quad is None:
+            return
+        pts = [[int(round(float(p[0]))), int(round(float(p[1])))] for p in self.quad]
+        if len(pts) != 4:
+            raise ValueError(
+                "VialROI.quad must have exactly 4 corners (clockwise from top-left), got %d"
+                % len(pts)
+            )
+        self.quad = pts
 
 
 @dataclass
