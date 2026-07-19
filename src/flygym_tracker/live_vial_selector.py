@@ -79,6 +79,12 @@ POLL_MS = 33
 #: How many iterations a status/nag line stays on screen (~1.5 s at POLL_MS).
 MESSAGE_TTL = 45
 
+#: Width of the instruction panel drawn BESIDE the frame, never on top of it. The camera image
+#: must stay completely unobscured -- a vial whose top is hidden under a status band cannot be
+#: outlined correctly, and the drum's upper tube row sits right where an overlay band would be.
+#: The panel is dead space next to the image, which a 4:3 frame on a 16:9 screen has in plenty.
+PANEL_WIDTH = 380
+
 COLOR_DONE = (80, 220, 80)        # completed vials
 COLOR_CURRENT = (0, 235, 255)     # the vial being drawn
 COLOR_FIRST = (0, 140, 255)       # its first vertex (the one ENTER closes back to)
@@ -86,9 +92,22 @@ COLOR_TEXT = (255, 255, 255)
 COLOR_LIVE = (120, 255, 120)
 COLOR_FROZEN = (60, 200, 255)
 COLOR_SOURCE = (200, 200, 200)
+COLOR_PANEL = (26, 22, 20)        # panel background
+COLOR_RULE = (70, 64, 60)         # separators
+COLOR_LABEL = (150, 150, 150)     # dim captions
 
-KEY_HINT = ("click=point   ENTER=next vial   BACKSPACE=undo point   "
-            "u=undo vial   c=clear   SPACE=freeze   q=finish")
+#: ``(key, what it does)`` -- one row per line in the panel, in the order they are learnt.
+KEY_ROWS = [
+    ("click", "add a corner"),
+    ("ENTER", "vial done, next"),
+    ("BACKSPACE", "undo a corner"),
+    ("u", "redo previous vial"),
+    ("c", "clear this vial"),
+    ("SPACE", "freeze picture"),
+    ("q / ESC", "finish early"),
+]
+#: Single-line form, kept for the terminal banner and for anything that wants it compact.
+KEY_HINT = "   ".join("%s=%s" % (k, v) for k, v in KEY_ROWS)
 
 
 # ==========================================================================================
@@ -313,13 +332,17 @@ def view_scale(image_size: Tuple[int, int], max_view: Optional[Tuple[int, int]] 
     `max_view` defaults to whatever actually fits this desktop (`screen_view_limit`), so the
     whole frame is always reachable by the mouse. Capping at 1.0 keeps a frame that already fits
     at an exact 1:1 mapping between screen pixels and image pixels.
+
+    The instruction panel's width is taken off the available WIDTH first: the panel sits beside
+    the frame rather than over it, so it is the frame's competitor for horizontal room.
     """
     if max_view is None:
         max_view = screen_view_limit()
     w, h = int(image_size[0]), int(image_size[1])
     if w <= 0 or h <= 0:
         return 1.0
-    return float(min(max_view[0] / float(w), max_view[1] / float(h), 1.0))
+    usable_w = max(160, int(max_view[0]) - PANEL_WIDTH)
+    return float(min(usable_w / float(w), max_view[1] / float(h), 1.0))
 
 
 def _text(vis: np.ndarray, text: str, org: Tuple[int, int], color=COLOR_TEXT,
@@ -333,8 +356,17 @@ def _scaled(points: Sequence[Sequence[float]], scale: float) -> np.ndarray:
     return np.round(np.asarray(points, dtype=np.float64).reshape(-1, 2) * scale).astype(np.int32)
 
 
-def render_frame(image: np.ndarray, state: SelectorState, scale: float = 1.0) -> np.ndarray:
-    """Build the BGR canvas: live frame + completed vials + the polygon in progress + HUD.
+def render_frame(image: np.ndarray, state: SelectorState, scale: float = 1.0,
+                 panel_width: int = PANEL_WIDTH) -> np.ndarray:
+    """Build the BGR canvas: instruction panel on the LEFT, camera frame on the right.
+
+    NOTHING IS DRAWN OVER THE CAMERA IMAGE except the operator's own polygons. Text used to sit
+    in a translucent band across the top of the frame, which covered the upper tube row -- the
+    very thing being outlined. Everything textual now lives in a panel beside the picture, so the
+    picture the vials are drawn on is the picture the camera sent.
+
+    The frame starts at ``x = panel_width`` in the returned canvas; a click at canvas x must have
+    `panel_width` subtracted before it is divided by `scale` (the driver does this).
 
     Pure: takes a frame, returns an image. Nothing here touches a window, which is what lets the
     driver loop be tested with a stubbed highgui.
@@ -368,38 +400,98 @@ def render_frame(image: np.ndarray, state: SelectorState, scale: float = 1.0) ->
                        COLOR_FIRST if j == 0 else COLOR_CURRENT, -1, cv2.LINE_AA)
 
     # --- frozen: a border the operator cannot fail to notice --------------------------------
+    # Drawn just INSIDE the frame edge, so it marks the picture without hiding any of it.
     if state.frozen:
-        cv2.rectangle(vis, (0, 0), (vis.shape[1] - 1, vis.shape[0] - 1), COLOR_FROZEN, 6)
+        cv2.rectangle(vis, (1, 1), (vis.shape[1] - 2, vis.shape[0] - 2), COLOR_FROZEN, 3)
 
-    _draw_hud(vis, state)
-    return vis
+    panel_width = max(0, int(panel_width))
+    if panel_width == 0:
+        return vis
+    canvas = np.empty((vis.shape[0], panel_width + vis.shape[1], 3), np.uint8)
+    canvas[:, :panel_width] = COLOR_PANEL
+    canvas[:, panel_width:] = vis
+    _draw_panel(canvas[:, :panel_width], state)
+    return canvas
 
 
-def _draw_hud(vis: np.ndarray, state: SelectorState) -> None:
-    """Status band: which vial, how many points, where the picture comes from, the keys, status."""
-    band_h = 114
-    band = vis.copy()
-    cv2.rectangle(band, (0, 0), (vis.shape[1], band_h), (0, 0, 0), -1)
-    cv2.addWeighted(band, 0.55, vis, 0.45, 0, dst=vis)
+def _wrap(text: str, width_px: int, scale: float) -> List[str]:
+    """Break `text` into lines that each measure under `width_px` at font `scale`."""
+    lines, line = [], ""
+    for word in str(text).split():
+        trial = (line + " " + word).strip()
+        if line and cv2.getTextSize(trial, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] > width_px:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        lines.append(line)
+    return lines
 
-    n_done = len(state.polygons)
-    head = "face %s   vial %d of %d   points: %d   done: %d" % (
-        state.face, min(state.vial_number, state.n_vials), state.n_vials,
-        len(state.current), n_done)
-    _text(vis, head, (12, 26), COLOR_TEXT, 0.7)
 
+def _draw_panel(panel: np.ndarray, state: SelectorState) -> None:
+    """Everything textual, drawn BESIDE the camera image rather than over it.
+
+    Ordered by what must survive if the panel is taller than the window: PROVENANCE FIRST. On a
+    short canvas the bottom of this panel is simply not drawn, and the one thing that must never
+    be the casualty is what the operator is looking at -- drawing vial positions against a
+    recorded clip while believing it is the camera would silently miscalibrate the whole run.
+    The keys are the most expendable line here (they are also printed in the terminal), so they
+    go last.
+    """
+    h, w = panel.shape[:2]
+    pad, inner = 16, w - 32
+    y = 40
+
+    _text(panel, "SELECT VIALS", (pad, y), COLOR_TEXT, 0.72)
+    y += 14
+    cv2.line(panel, (pad, y), (w - pad, y), COLOR_RULE, 1)
+    y += 34
+
+    # -- what is on screen (FIRST: see the docstring) ----------------------------------------
     # "PLAYING"/"FROZEN" is only about the picture being updated. It deliberately does NOT say
     # "LIVE": that word was read as "this is the camera" when the window was in fact showing a
-    # recorded file, which is the one confusion this HUD must never cause. What the frames come
-    # from is stated separately, in full, on its own line.
-    live = "FROZEN" if state.frozen else "PLAYING"
-    _text(vis, live, (vis.shape[1] - 150, 26), COLOR_FROZEN if state.frozen else COLOR_LIVE, 0.8)
+    # recorded file, which is the one confusion this UI must never cause. What the frames come
+    # from is stated separately, in full, right underneath.
+    _text(panel, "FROZEN" if state.frozen else "PLAYING", (pad, y),
+          COLOR_FROZEN if state.frozen else COLOR_LIVE, 0.7)
+    y += 26
+    for line in _wrap(state.source_label, inner, 0.5):
+        _text(panel, line, (pad, y), COLOR_SOURCE, 0.5)
+        y += 20
+    y += 6
+    cv2.line(panel, (pad, y), (w - pad, y), COLOR_RULE, 1)
+    y += 34
 
-    if state.source_label:
-        _text(vis, state.source_label, (12, 52), COLOR_SOURCE, 0.55)
-    _text(vis, KEY_HINT, (12, 76), COLOR_TEXT, 0.5)
+    # -- where we are ------------------------------------------------------------------------
+    _text(panel, "face %s" % state.face, (pad, y), COLOR_LABEL, 0.58)
+    y += 32
+    _text(panel, "vial %d of %d" % (min(state.vial_number, state.n_vials), state.n_vials),
+          (pad, y), COLOR_CURRENT, 0.78)
+    y += 30
+    _text(panel, "corners placed: %d" % len(state.current), (pad, y), COLOR_TEXT, 0.55)
+    y += 26
+    _text(panel, "vials finished: %d of %d" % (len(state.polygons), state.n_vials),
+          (pad, y), COLOR_DONE, 0.55)
+    y += 20
+    cv2.line(panel, (pad, y), (w - pad, y), COLOR_RULE, 1)
+    y += 30
+
+    # -- the keys, one per line so they can be read at a glance ------------------------------
+    for key, what in KEY_ROWS:
+        if y > h - 30:            # out of room; the terminal banner still lists them all
+            break
+        _text(panel, key, (pad, y), COLOR_TEXT, 0.5)
+        _text(panel, what, (pad + 140, y), COLOR_LABEL, 0.5)
+        y += 26
+
+    # -- the transient status line, pinned to the bottom so it never shifts the layout -------
     if state.message:
-        _text(vis, state.message, (12, 100), COLOR_CURRENT, 0.55)
+        msg_lines = _wrap(state.message, inner, 0.5)
+        y = max(y + 20, panel.shape[0] - 24 - 20 * len(msg_lines))
+        for line in msg_lines:
+            _text(panel, line, (pad, y), COLOR_CURRENT, 0.5)
+            y += 20
 
 
 def startup_banner(state: SelectorState) -> str:
@@ -436,6 +528,24 @@ def source_label(source: FrameSource) -> str:
         return "FILE  %s  (recorded - not the camera)" % os.path.basename(str(path))
     serial = getattr(source, "serial", None)
     return "CAMERA  %s (live)" % serial if serial else "CAMERA (live)"
+
+
+def place_window_on_screen(window: str, limit: Optional[Tuple[int, int]] = None) -> None:
+    """Move `window` so the whole of it is on the desktop. Never raises.
+
+    Sizing it to fit is not enough: OpenCV picks its own position (measured: x=164 on the rig
+    laptop), so a canvas 66 px narrower than the screen still hung off the right edge, and the
+    clipped-off strip is unclickable exactly like the truncated rows were. Called after the first
+    `imshow`, which is when the window finally has its real size.
+    """
+    try:
+        limit = limit or screen_view_limit()
+        _, _, win_w, win_h = cv2.getWindowImageRect(window)
+        if win_w <= 0 or win_h <= 0:
+            return
+        cv2.moveWindow(window, max(0, (limit[0] - win_w) // 2), max(0, (limit[1] - win_h) // 4))
+    except Exception:
+        pass          # placement is a nicety; never let it stop the operator drawing
 
 
 def _window_is_gone(window: str) -> bool:
@@ -492,9 +602,17 @@ def select_vials_live(
     scale = [1.0]   # boxed: the mouse callback needs the value the driver computes
 
     def on_mouse(event, sx, sy, _flags, _param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            s = scale[0] or 1.0
-            state.add_vertex(sx / s, sy / s)
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        # Canvas x = PANEL_WIDTH + image_x * scale. Undo BOTH, in that order.
+        image_x = sx - PANEL_WIDTH
+        if image_x < 0:
+            # A click on the instruction panel is not a click on a tube. Silently dropping it
+            # would look like the UI had missed the click, so say why nothing happened.
+            state.note("that click was on the instructions - click on the picture")
+            return
+        s = scale[0] or 1.0
+        state.add_vertex(image_x / s, sy / s)
 
     cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(window, on_mouse)
@@ -502,6 +620,7 @@ def select_vials_live(
 
     image: Optional[np.ndarray] = None
     at_eof = False
+    placed = False
     try:
         while not state.done:
             if image is None or (not state.frozen and not at_eof):
@@ -520,6 +639,10 @@ def select_vials_live(
                         on_frame(image)
 
             cv2.imshow(window, render_frame(image, state, scale[0]))
+            if not placed:
+                # Only now does the window have its real size, so only now can it be positioned.
+                place_window_on_screen(window, max_view)
+                placed = True
             command = handle_key(state, decode_key(cv2.waitKeyEx(poll_ms)))
             state.tick()
             if command == "done":

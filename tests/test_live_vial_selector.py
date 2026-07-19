@@ -296,15 +296,51 @@ def test_handle_key_ignores_idle_frames_and_unknown_keys():
 # =========================================================================================
 # 6. Rendering (no window)
 # =========================================================================================
-def test_render_frame_returns_a_bgr_canvas_the_size_of_the_frame():
+def _image_region(canvas):
+    """The part of the canvas that is the CAMERA PICTURE -- everything right of the panel."""
+    return canvas[:, LVS.PANEL_WIDTH:]
+
+
+def test_render_frame_puts_the_panel_beside_the_frame_not_over_it():
     canvas = render_frame(np.full((H, W), 90, np.uint8), _state(polygons=[TRI]))
-    assert canvas.shape == (H, W, 3) and canvas.dtype == np.uint8
+    assert canvas.shape == (H, LVS.PANEL_WIDTH + W, 3) and canvas.dtype == np.uint8
+
+
+def test_no_ui_text_is_ever_drawn_on_the_camera_image():
+    """The requirement, asserted directly: nothing occludes the picture except the operator's
+    own polygons. Text used to sit in a band across the top of the frame, hiding the upper tube
+    row -- the very thing being outlined."""
+    frame = np.full((H, W), 90, np.uint8)
+    state = SelectorState(n_vials=16, face="A", source_label="CAMERA DA4282883 (live)")
+    state.note("a status message that must not land on the picture")
+
+    picture = _image_region(render_frame(frame, state))       # nothing drawn yet
+    assert np.array_equal(picture, cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
+
+    # ...and with vials drawn, the ONLY changed pixels are the polygon's own ink.
+    drawn = _image_region(render_frame(frame, _state(polygons=[PENTAGON])))
+    changed = np.argwhere(cv2.absdiff(drawn, cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)).max(axis=2) > 8)
+    xs, ys = changed[:, 1], changed[:, 0]
+    poly = np.array(PENTAGON)
+    assert xs.min() >= poly[:, 0].min() - 12 and xs.max() <= poly[:, 0].max() + 12
+    assert ys.min() >= poly[:, 1].min() - 12 and ys.max() <= poly[:, 1].max() + 12
+
+
+def test_the_panel_carries_the_things_the_operator_needs():
+    """Ink in the panel column must actually change when the state does."""
+    frame = np.full((H, W), 90, np.uint8)
+    bare = SelectorState(n_vials=16, face="A")
+    busy = _state(n_vials=16, polygons=[TRI, SQUARE])
+    panel = lambda st: render_frame(frame, st)[:, :LVS.PANEL_WIDTH]
+    assert not np.array_equal(panel(bare), panel(busy))       # progress is shown
+    frozen = SelectorState(n_vials=16, face="A")
+    frozen.toggle_freeze()
+    assert not np.array_equal(panel(bare), panel(frozen))     # PLAYING/FROZEN is shown
 
 
 def test_render_frame_draws_something_for_finished_and_in_progress_vials():
-    """PENTAGON sits well below the HUD band, so this counts vial ink and nothing else."""
     blank = np.zeros((H, W), np.uint8)
-    ink = lambda img: int(np.count_nonzero(img[100:, :]))       # below the HUD
+    ink = lambda img: int(np.count_nonzero(_image_region(img)))
 
     empty = render_frame(blank, SelectorState(n_vials=4))
     done = render_frame(blank, _state(n_vials=4, polygons=[PENTAGON]))
@@ -325,22 +361,23 @@ def test_render_frame_marks_the_frozen_state_visibly():
     s.toggle_freeze()
     frozen = render_frame(blank, s)
     assert not np.array_equal(live, frozen)
-    assert frozen[H - 2, W // 2].tolist() == list(LVS.COLOR_FROZEN)   # the border
+    # the border sits just inside the picture's own edge, not over the panel
+    assert _image_region(frozen)[H - 2, W // 2].tolist() == list(LVS.COLOR_FROZEN)
 
 
 def test_render_frame_accepts_a_colour_frame_too():
     canvas = render_frame(np.zeros((H, W, 3), np.uint8), _state(polygons=[TRI]))
-    assert canvas.shape == (H, W, 3)
+    assert canvas.shape == (H, LVS.PANEL_WIDTH + W, 3)
 
 
 def test_view_scale_never_enlarges_and_shrinks_to_fit():
-    assert view_scale((640, 480), (1280, 960)) == 1.0
-    assert view_scale((2560, 1920), (1280, 960)) == pytest.approx(0.5)
+    assert view_scale((640, 480), (1280 + LVS.PANEL_WIDTH, 960)) == 1.0
+    assert view_scale((2560, 1920), (1280 + LVS.PANEL_WIDTH, 960)) == pytest.approx(0.5)
 
 
 def test_render_frame_scales_the_canvas_and_the_polygons_together():
     canvas = render_frame(np.zeros((400, 400), np.uint8), _state(polygons=[TRI]), scale=0.5)
-    assert canvas.shape == (200, 200, 3)
+    assert canvas.shape == (200, LVS.PANEL_WIDTH + 200, 3)
 
 
 # =========================================================================================
@@ -416,8 +453,14 @@ class _FakeWindow:
         return event[1]
 
 
-def _clicks(polygon):
-    return [("click", x, y) for x, y in polygon]
+def _clicks(polygon, scale=1.0):
+    """Image coords -> the CANVAS coords a real click carries.
+
+    A real mouse event arrives in canvas space: the instruction panel occupies the left
+    `PANEL_WIDTH` columns and the frame is drawn at `scale` to its right. Modelling that here is
+    what makes these tests prove the driver undoes BOTH transforms.
+    """
+    return [("click", LVS.PANEL_WIDTH + x * scale, y * scale) for x, y in polygon]
 
 
 def _draw(polygon):
@@ -447,7 +490,7 @@ def test_driver_keeps_the_feed_live_while_clicks_are_collected(monkeypatch):
     assert source.n_read >= len(TRI) + len(SQUARE)      # a fresh frame per iteration
     assert len(win.shown) >= source.n_read             # every one of them re-shown
     # The frames really do differ, i.e. this is a video and not one frozen still.
-    backgrounds = {int(img[H - 1, 0, 0]) for img in win.shown}
+    backgrounds = {int(img[H - 1, LVS.PANEL_WIDTH, 0]) for img in win.shown}
     assert len(backgrounds) > 1
 
 
@@ -481,7 +524,7 @@ def test_driver_undo_vial_and_backspace_reach_the_state_through_the_loop(monkeyp
     script = (_draw(TRI) + _draw(SQUARE)
               + [("key", ord("u"))]        # re-open the square
               + [("key", 8)]               # drop its last vertex
-              + [("click", 120, 60), ("key", 13)]
+              + _clicks([[120, 60]]) + [("key", 13)]
               + [("key", ord("q"))])       # 3 vials asked for, 2 drawn -> finish early
     _FakeWindow(monkeypatch, script)
     out = select_vials_live(_SyntheticSource(), n_vials=3)
@@ -489,17 +532,28 @@ def test_driver_undo_vial_and_backspace_reach_the_state_through_the_loop(monkeyp
 
 
 def test_driver_maps_clicks_back_through_the_display_scale(monkeypatch):
-    """On a frame too big for the screen the canvas is shrunk; the CLICKS must not be."""
-    _FakeWindow(monkeypatch, [("click", 100, 50), ("click", 300, 50), ("click", 200, 250),
-                              ("key", 13)])
+    """On a frame too big for the screen the canvas is shrunk; the CLICKS must not be.
+
+    Both transforms are exercised at once: the panel offset AND the display scale.
+    """
+    P = LVS.PANEL_WIDTH
+    _FakeWindow(monkeypatch, [("click", P + 100, 50), ("click", P + 300, 50),
+                              ("click", P + 200, 250), ("key", 13)])
     # Pinned, because the real limit is now measured from whatever desktop runs the suite -- the
     # expected coordinates below must not depend on the test machine's screen.
-    monkeypatch.setattr(LVS, "screen_view_limit", lambda *a, **k: (1280, 960))
+    monkeypatch.setattr(LVS, "screen_view_limit", lambda *a, **k: (1280 + P, 960))
     source = _SyntheticSource(size=(2560, 1920))          # -> scale 0.5
 
     out = select_vials_live(source, n_vials=1)
 
-    assert out == [[[200, 100], [600, 100], [400, 500]]]  # image px, not screen px
+    assert out == [[[200, 100], [600, 100], [400, 500]]]  # image px, not canvas px
+
+
+def test_a_click_on_the_instruction_panel_is_not_a_vertex(monkeypatch):
+    """The panel is not the picture: clicking it must not silently drop a corner on the frame."""
+    _FakeWindow(monkeypatch, [("click", 10, 40)] + _clicks(TRI) + [("key", 13)])
+    out = select_vials_live(_SyntheticSource(), n_vials=1)
+    assert out == [TRI]                                   # the panel click contributed nothing
 
 
 def test_driver_holds_the_last_frame_at_end_of_video(monkeypatch):
@@ -1379,3 +1433,23 @@ def test_every_clicked_point_of_a_scaled_view_maps_back_inside_the_frame(monkeyp
                    (round(w * scale) - 1, round(h * scale) - 1)]:
         x, y = state.add_vertex(sx / scale, sy / scale)
         assert 0 <= x < w and 0 <= y < h
+
+
+def test_the_window_is_moved_fully_onto_the_screen(monkeypatch):
+    """Regression: the canvas fitted (1342 px wide on a 1440 px desktop) but OpenCV placed the
+    window at x=164, so 66 px hung off the right edge - unclickable, same as the truncated rows."""
+    moved = {}
+    monkeypatch.setattr(cv2, "getWindowImageRect", lambda _w: (164, 25, 1342, 796))
+    monkeypatch.setattr(cv2, "moveWindow", lambda w, x, y: moved.update(w=w, x=x, y=y))
+
+    LVS.place_window_on_screen("Select vials", (1416, 813))
+
+    assert moved["x"] + 1342 <= 1416 and moved["x"] >= 0
+    assert moved["y"] + 796 <= 813 and moved["y"] >= 0
+
+
+def test_window_placement_never_breaks_the_session(monkeypatch):
+    """Placement is cosmetic; a highgui that cannot report its rect must not stop the drawing."""
+    monkeypatch.setattr(cv2, "getWindowImageRect",
+                        lambda _w: (_ for _ in ()).throw(cv2.error("no such window")))
+    LVS.place_window_on_screen("Select vials", (1416, 813))     # must not raise
