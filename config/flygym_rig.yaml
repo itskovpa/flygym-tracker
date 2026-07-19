@@ -7,10 +7,18 @@
 source:
   type: camera
   camera:
+    # null = NOT SENT to the camera, so it starts with whatever MVS last left it at. These five
+    # were forced to 1280x1024 @ 20 fps on every run, which meant a setting changed in MVS was
+    # silently reverted by the tracker. Adjust them in the software with `run.bat` [S] (or
+    # `flygym-tracker settings`), which writes explicit values back here; press d on a row there
+    # to return it to null. serial and pixel_format are NOT optional: the serial pins which
+    # physical camera this is, and the pipeline needs Mono8 frames.
     serial: "DA4282883"
-    width: 1280
-    height: 1024
-    frame_rate: 20            # the AcquisitionFrameRate limiter held at 20 fps in testing
+    width: null               # sensor ROI width  (start-only: applies when acquisition starts)
+    height: null              # sensor ROI height (start-only)
+    exposure_us: null         # microseconds; live-adjustable mid-run
+    gain_db: null             # dB; live-adjustable mid-run
+    frame_rate: null          # fps; live-adjustable mid-run
     pixel_format: "Mono8"
 
 calibration:

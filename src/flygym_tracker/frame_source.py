@@ -8,6 +8,14 @@ See DESIGN.md section 3 (architecture: "frame source") and section 4
 IMPORTANT: importing this module must never touch the camera or the HikRobot SDK.
 `HikCameraSource.__init__` only stores configuration; the vendored `MvImport` SDK
 is imported lazily inside `open()` (see `HikCameraSource._import_sdk`).
+
+UNSET MEANS UNSET. Every camera setting is `Optional`, and `None` means "send
+nothing for this node, so the camera keeps whatever MVS last left it at". That is
+not a convenience — it is the contract the rig owner asked for, and it only holds
+if `_configure` makes NO SDK call for a `None` field. A config that writes
+`width: 1280` because that happens to be the current value would silently take
+ownership of the sensor geometry, and the next operator who changed it in MVS
+would find their change reverted by a tracker they never told to touch it.
 """
 from __future__ import annotations
 
@@ -17,8 +25,9 @@ import os
 import sys
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -28,6 +37,133 @@ from flygym_tracker.types import Frame
 #: Default install location of the HikRobot MvImport Python SDK on this rig.
 #: Override with the MVS_PYTHON_SDK env var on a machine with a different install path.
 DEFAULT_MVS_SDK_PATH = r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport"
+
+#: GenICam node names for the five settings this software will ever impose, keyed by the
+#: `HikCameraSource` attribute (and, one level up, the `source.camera.*` config key) that carries
+#: them. Spelled out once here so the panel, the router and `_configure` cannot drift apart.
+CAMERA_NODES = {
+    "width": "Width",
+    "height": "Height",
+    "exposure_us": "ExposureTime",
+    "gain_db": "Gain",
+    "frame_rate": "AcquisitionFrameRate",
+}
+
+#: Settings that cannot be changed while the stream is running: the sensor's region of interest is
+#: fixed at StartGrabbing time, so honouring a mid-run change would mean stopping and restarting
+#: acquisition. This rig records continuously for hours to days, and a restart costs both a gap in
+#: the series AND a reset of the frame-diff baseline (DESIGN.md §5.3) — i.e. it silently splits one
+#: experiment into two incomparable measurement regimes. Never worth it for a geometry tweak.
+START_ONLY_ATTRS = ("width", "height")
+
+#: Fallback limits for the MV-CA013-A0UM, used ONLY when no camera is open (every test machine,
+#: and the tune-between-runs case). MEASURED on the rig's own sensor (serial DA4282883) on
+#: 2026-07-19 by reading these five GenICam nodes over `--probe-camera`, replacing the documented
+#: guesses that were here before. They are still flagged `live=False` when shown — see
+#: `CameraRange.live` and the "not live" note the settings panel prints under its Camera group —
+#: because they describe THE rig's camera rather than whatever camera is actually attached to the
+#: machine drawing the panel.
+#:
+#: The two ints carry the sensor's real increment of 4 (it was a conservative 8 before). The old
+#: Width/Height floor of 8 was not merely conservative but WRONG in the unsafe direction: the
+#: sensor's true minimum is 32, so the panel was offering an operator sizes the SDK would reject.
+#: Nothing shipped a bad Width because `_configure` re-snaps against the live range at send time,
+#: but the number on screen was not a real one.
+#:
+#: The float maxima are the nodes' absolute bounds, not what the rig can achieve: ExposureTime's
+#: ~10 s ceiling and AcquisitionFrameRate's 100 kfps are both cut down in practice by each other
+#: and by the ROI (this sensor delivers ~88 fps at full frame). Floats advertise no increment, so
+#: the third entry for those three is the panel's display granularity, NOT a measurement and not a
+#: legality constraint — `_query_float_range` reads the live min/max and keeps the step from here.
+#: AcquisitionFrameRate's step is 0.1 rather than 0.5 for a reason worth keeping: the panel snaps a
+#: row onto `lo + n*step`, so a 0.5 step over the measured floor of 0.1 would put the grid at
+#: 0.1/0.6/1.1... and quietly redisplay an operator's configured 42.0 fps as 42.1. A step that
+#: divides the floor keeps whole numbers reachable.
+#:
+#: The SDK hands these back as float32, so two entries are the readable rounding of what it said:
+#: Gain's max read 16.370399475097656 and the frame-rate floor 0.10000000149011612. Rounding the
+#: gain ceiling UP by 5e-7 dB is safe in a way rounding a Width would not be — floats are clamped
+#: by the camera, never rejected, and `_configure` clamps against the live range whenever one is
+#: actually attached.
+FALLBACK_RANGES = {
+    "Width": (32.0, 1280.0, 4.0),
+    "Height": (32.0, 1024.0, 4.0),
+    "ExposureTime": (9.0, 9999640.0, 1.0),
+    "Gain": (0.0, 16.3704, 0.1),
+    "AcquisitionFrameRate": (0.1, 100000.0, 0.1),
+}
+
+
+@dataclass(frozen=True)
+class CameraRange:
+    """The legal values for one camera node, and whether they came from the camera itself.
+
+    `live=False` means these are `FALLBACK_RANGES` entries: measured on the rig's camera, but not
+    read from whatever camera this machine has (if any). The distinction is shown to the operator
+    rather than smoothed over — a limit that is merely inherited must not look like one this
+    sensor just reported, because the two disagree the moment a different camera is plugged in.
+    """
+
+    name: str
+    lo: float
+    hi: float
+    inc: float
+    live: bool = False
+
+    def clamp(self, value) -> float:
+        """`value` held inside ``[lo, hi]``, with no quantisation.
+
+        This is what the FLOAT nodes get. Their `inc` here is a slider granularity, not a legality
+        constraint, so snapping an explicitly-chosen 29.7 fps to 29.5 would be this code quietly
+        overruling the operator for no reason the camera cares about.
+        """
+        return min(self.hi, max(self.lo, float(value)))
+
+    def snap(self, value) -> float:
+        """Clamp `value` into ``[lo, hi]`` and snap it onto the node's increment grid.
+
+        This is what the INTEGER nodes get, and it is not cosmetic: an off-grid Width is REJECTED
+        by the SDK, not rounded, so an unsnapped value is a failed open rather than a slightly
+        wrong picture.
+
+        Snapping is measured FROM `lo`, not from zero, because that is the grid the SDK accepts:
+        a Width node advertising ``min=8, inc=8`` rejects 12 but accepts 16, and a node advertising
+        ``min=2, inc=4`` accepts 6 — which counting from zero would never produce.
+        """
+        v = self.clamp(value)
+        if v in (self.lo, self.hi):
+            return v
+        inc = float(self.inc)
+        if inc <= 0:
+            return v
+        snapped = self.lo + round((v - self.lo) / inc) * inc
+        return min(self.hi, max(self.lo, snapped))
+
+
+def fallback_camera_ranges() -> Dict[str, CameraRange]:
+    """`FALLBACK_RANGES` as `CameraRange`s, every one flagged ``live=False``."""
+    return {
+        name: CameraRange(name=name, lo=lo, hi=hi, inc=inc, live=False)
+        for name, (lo, hi, inc) in FALLBACK_RANGES.items()
+    }
+
+
+def camera_ranges(source=None) -> Dict[str, CameraRange]:
+    """The limits to offer for each camera node, from `source` if it can supply them.
+
+    Deliberately duck-typed and total: anything without a usable `ranges()` (no source at all, a
+    `VideoFileSource`, a camera that is not open) yields the documented fallbacks rather than an
+    error. The settings panel has to render SOMETHING on a machine with no camera attached, and
+    "no numbers at all" would make the whole Camera group unusable exactly where it is most
+    needed — tuning between runs.
+    """
+    probe = getattr(source, "ranges", None)
+    if callable(probe):
+        try:
+            return probe()
+        except Exception:
+            pass
+    return fallback_camera_ranges()
 
 
 class FrameSource(ABC):
@@ -140,6 +276,18 @@ class HikCameraSource(FrameSource):
     reports that serial, open() raises rather than silently falling back to
     `index` — the whole point of pinning a serial is to avoid ever talking to
     the wrong physical camera.
+
+    EVERY SETTING IS OPTIONAL, AND `None` IS A REAL STATE. A `None` field means
+    "leave this node alone", so the camera starts with whatever MVS left it at;
+    `_configure` makes no SDK call for it at all (see the module docstring).
+    Setting a field back to `None` while the stream is running only stops this
+    software from re-imposing the value — it cannot un-send what was already
+    sent, and `set_*` says so rather than pretending a restart happened.
+
+    Frame rate, exposure and gain are LIVE (`set_frame_rate`/`set_exposure_us`/
+    `set_gain_db` push straight to the running stream). Width and height are
+    START-ONLY (`START_ONLY_ATTRS`): their setters refuse while acquiring rather
+    than restarting the stream under a recording experiment.
     """
 
     def __init__(
@@ -167,6 +315,8 @@ class HikCameraSource(FrameSource):
         self._is_open = False
         self._next_index = 0
         self._frame_size = (0, 0)
+        #: `ranges()` cache, filled at open() and dropped at close(). None = "not read yet".
+        self._ranges: Optional[Dict[str, CameraRange]] = None
 
     # -- SDK import (lazy) -----------------------------------------------------
 
@@ -264,6 +414,13 @@ class HikCameraSource(FrameSource):
                 "by another application (e.g. the MVS Viewer - USB3 Vision access is exclusive)"
             )
 
+        # The handle is published BEFORE `_configure` runs, because `_configure` has to be able to
+        # ASK the camera for its Width/Height increments in order to snap to them (`_snapped`).
+        # `_is_open` deliberately stays False until grabbing actually starts: it means "the stream
+        # is running", which is what the start-only rule keys off, and flipping it early would make
+        # `_configure`'s own writes look like mid-run changes.
+        self._cam = cam
+        self._ranges = None          # re-read from THIS camera on the next `ranges()` call
         try:
             self._configure(cam)
             ret = cam.MV_CC_StartGrabbing()
@@ -272,16 +429,26 @@ class HikCameraSource(FrameSource):
         except Exception:
             cam.MV_CC_CloseDevice()
             cam.MV_CC_DestroyHandle()
+            self._cam = None
+            self._ranges = None
             raise
 
-        self._cam = cam
         self._is_open = True
         self._next_index = 0
+        self._ranges = None          # re-read now that the stream is live
 
     def _configure(self, cam) -> None:
         """Apply PixelFormat/TriggerMode (required) and Width/Height/Exposure/Gain/
         AcquisitionFrameRate (only when explicitly provided). Every SDK call from
         the spec'd field list has its return code checked and raises on failure.
+
+        THE `is not None` GUARDS ARE THE FEATURE, not defensive noise. With all five fields null
+        this method issues exactly two set-calls — PixelFormat and TriggerMode, both of which the
+        pipeline genuinely requires (Mono8 frames, free-run acquisition) — and touches no geometry,
+        no exposure, no gain and no frame rate, so the camera runs on the MVS defaults. Adding a
+        "harmless" read-back-and-write-it-back to any of these would break that guarantee while
+        looking like a no-op; `tests/test_frame_source.py` asserts on the mock that the setters are
+        never called.
         """
         mv = self._mv
 
@@ -293,11 +460,19 @@ class HikCameraSource(FrameSource):
         if ret != 0:
             raise RuntimeError(f"failed to set TriggerMode=off (ret=0x{ret:x})")
 
+        # Geometry is snapped to the SENSOR'S OWN increment here, not just wherever the number came
+        # from. The settings panel snaps too, but only against the limits it could see -- on a
+        # machine with no camera attached those are the documented fallbacks (an 8-px grid), and a
+        # sensor whose real increment is 16 would REJECT the resulting 648 outright. Snapping at
+        # the point of sending is the only place that always knows the real grid, because by now
+        # the camera is open. Hand-edited configs come through here too.
         if self.width is not None:
+            self.width = int(self._snapped("width", self.width))
             ret = cam.MV_CC_SetIntValueEx("Width", int(self.width))
             if ret != 0:
                 raise RuntimeError(f"failed to set Width={self.width} (ret=0x{ret:x})")
         if self.height is not None:
+            self.height = int(self._snapped("height", self.height))
             ret = cam.MV_CC_SetIntValueEx("Height", int(self.height))
             if ret != 0:
                 raise RuntimeError(f"failed to set Height={self.height} (ret=0x{ret:x})")
@@ -306,16 +481,23 @@ class HikCameraSource(FrameSource):
         height = int(self.height) if self.height is not None else self._query_int(cam, "Height")
         self._frame_size = (width, height)
 
+        # The float settings are CLAMPED to what the camera accepts (not snapped -- see
+        # `CameraRange.clamp`), and the clamped value is written back to the attribute so `fps`,
+        # the settings panel and run_meta.json all report what was actually sent. Clamping rather
+        # than raising: a hand-edited 500 fps on a 163 fps sensor should give the fastest the rig
+        # can do, not a failed start half an hour into setting up an experiment.
         if self.exposure_us is not None:
             # Best-effort: disengage auto-exposure so the explicit value sticks.
             # Not every GenICam node map exposes this node, so it isn't ret-checked.
             cam.MV_CC_SetEnumValueByString("ExposureAuto", "Off")
+            self.exposure_us = self._snapped("exposure_us", self.exposure_us)
             ret = cam.MV_CC_SetFloatValue("ExposureTime", float(self.exposure_us))
             if ret != 0:
                 raise RuntimeError(f"failed to set ExposureTime={self.exposure_us} (ret=0x{ret:x})")
 
         if self.gain_db is not None:
             cam.MV_CC_SetEnumValueByString("GainAuto", "Off")  # best-effort, see above
+            self.gain_db = self._snapped("gain_db", self.gain_db)
             ret = cam.MV_CC_SetFloatValue("Gain", float(self.gain_db))
             if ret != 0:
                 raise RuntimeError(f"failed to set Gain={self.gain_db} (ret=0x{ret:x})")
@@ -323,11 +505,19 @@ class HikCameraSource(FrameSource):
         if self.frame_rate is not None:
             # AcquisitionFrameRate is gated by this Enable node on Hik cameras.
             cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)  # best-effort gate
+            self.frame_rate = self._snapped("frame_rate", self.frame_rate)
             ret = cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(self.frame_rate))
             if ret != 0:
                 raise RuntimeError(
                     f"failed to set AcquisitionFrameRate={self.frame_rate} (ret=0x{ret:x})"
                 )
+
+    def _snapped(self, attr: str, value):
+        """`value` put onto the node's legal grid: snapped for the int nodes, clamped for floats."""
+        rng = self.ranges().get(CAMERA_NODES[attr])
+        if rng is None:
+            return float(value)
+        return rng.snap(value) if attr in START_ONLY_ATTRS else rng.clamp(value)
 
     def _query_int(self, cam, key: str) -> int:
         """Best-effort read-back of an integer node; 0 if unavailable."""
@@ -339,6 +529,193 @@ class HikCameraSource(FrameSource):
         except Exception:
             pass
         return 0
+
+    # -- live limits + live adjustment ------------------------------------------------------
+
+    @property
+    def is_acquiring(self) -> bool:
+        """True between a successful `open()` and `close()`, i.e. while frames are being grabbed.
+
+        Public because the whole start-only rule hangs off it: `pipeline.setting_block_reason` and
+        the settings panel both ask THIS, rather than each keeping their own idea of whether the
+        stream is live and eventually disagreeing.
+        """
+        return bool(self._is_open)
+
+    def ranges(self) -> Dict[str, CameraRange]:
+        """Legal min/max/increment per camera node, read from the SDK when the camera is open.
+
+        WHY THIS IS READ AND NOT HARD-CODED. Width/Height increments and the exposure floor are
+        properties of the sensor and of the current pixel format, and a value off the increment
+        grid is not clamped by the SDK — it is REJECTED, so a guessed constant turns into a failed
+        run rather than a slightly-wrong picture. Whatever cannot be read falls back to
+        `FALLBACK_RANGES` for that node alone, flagged ``live=False`` so the panel can say the
+        limits came from the rig rather than from the attached camera. Never raises: a settings
+        panel that cannot be drawn because a GenICam node was missing would be worse than one
+        drawn from the fallbacks.
+        """
+        if self._ranges is None:
+            self._ranges = self._read_ranges()
+        return dict(self._ranges)
+
+    def refresh_ranges(self) -> Dict[str, CameraRange]:
+        """Re-read the limits from the camera (they are otherwise cached from `open()`)."""
+        self._ranges = self._read_ranges()
+        return dict(self._ranges)
+
+    def _read_ranges(self) -> Dict[str, CameraRange]:
+        """The actual SDK sweep behind `ranges()`. Cached because a slider drag asks for the
+        limits on every step, and five GenICam round-trips per mouse-step would be a self-inflicted
+        stall in the middle of a live acquisition."""
+        out = fallback_camera_ranges()
+        # Keyed on the HANDLE, not on `_is_open`: the limits are readable as soon as the device is
+        # open, and `_configure` needs them before grabbing has started.
+        if self._cam is None:
+            return out
+        for attr, node in CAMERA_NODES.items():
+            probe = self._query_int_range if attr in START_ONLY_ATTRS else self._query_float_range
+            live = probe(node)
+            if live is not None:
+                out[node] = live
+        return out
+
+    def _query_int_range(self, node: str) -> Optional[CameraRange]:
+        """``(min, max, inc)`` of an integer node, or None if it cannot be read.
+
+        `MV_CC_GetIntValueEx` (64-bit) is tried first and `MV_CC_GetIntValue` second: both carry
+        nMin/nMax/nInc, but the Ex form is the one current MVS builds document, and older ones
+        ship only the other. A node readable through neither falls back to the datasheet.
+        """
+        for struct_name, getter_name in (("MVCC_INTVALUE_EX", "MV_CC_GetIntValueEx"),
+                                         ("MVCC_INTVALUE", "MV_CC_GetIntValue")):
+            try:
+                value = getattr(self._mv, struct_name)()
+                ret = getattr(self._cam, getter_name)(node, value)
+                if ret != 0:
+                    continue
+                inc = float(getattr(value, "nInc", 1) or 1)
+                lo, hi = float(value.nMin), float(value.nMax)
+                if hi <= lo:
+                    continue
+                return CameraRange(name=node, lo=lo, hi=hi, inc=inc, live=True)
+            except Exception:
+                continue
+        return None
+
+    def _query_float_range(self, node: str) -> Optional[CameraRange]:
+        """``(min, max)`` of a float node, or None. Float nodes advertise no increment, so the
+        documented step is kept — it is a display granularity here, not a legality constraint."""
+        try:
+            value = self._mv.MVCC_FLOATVALUE()
+            ret = self._cam.MV_CC_GetFloatValue(node, value)
+            if ret != 0:
+                return None
+            lo, hi = float(value.fMin), float(value.fMax)
+            if not (hi > lo):
+                return None
+            inc = FALLBACK_RANGES.get(node, (0.0, 0.0, 0.1))[2]
+            return CameraRange(name=node, lo=lo, hi=hi, inc=float(inc), live=True)
+        except Exception:
+            return None
+
+    def current_values(self) -> Dict[str, float]:
+        """What the camera reports it is ACTUALLY doing, per `CAMERA_NODES` attribute name.
+
+        This is what makes an unset row informative: "camera default (camera: 88.5 fps)" tells the
+        operator what they are choosing to leave alone, where a bare "camera default" leaves them
+        guessing. It is a READ-BACK, never a source of config values -- writing these numbers into
+        the config would be exactly the "impose whatever it happens to be doing" behaviour the
+        whole tri-state exists to avoid.
+
+        Empty when the camera is not open. Frame rate comes from ResultingFrameRate rather than
+        AcquisitionFrameRate: the latter is the requested cap and can differ from what the sensor
+        actually delivers (exposure alone can hold the rate below the cap).
+        """
+        if self._cam is None:
+            return {}
+        out: Dict[str, float] = {}
+        for attr, node in (("exposure_us", "ExposureTime"), ("gain_db", "Gain"),
+                           ("frame_rate", "ResultingFrameRate")):
+            try:
+                value = self._mv.MVCC_FLOATVALUE()
+                if self._cam.MV_CC_GetFloatValue(node, value) == 0:
+                    out[attr] = float(value.fCurValue)
+            except Exception:
+                pass
+        for attr, node in (("width", "Width"), ("height", "Height")):
+            got = self._query_int(self._cam, node)
+            if got:
+                out[attr] = float(got)
+        return out
+
+    def set_frame_rate(self, value: Optional[float]) -> None:
+        """Set (or unset) AcquisitionFrameRate, live if the stream is running."""
+        self._set_live_float("frame_rate", value)
+
+    def set_exposure_us(self, value: Optional[float]) -> None:
+        """Set (or unset) ExposureTime in microseconds, live if the stream is running."""
+        self._set_live_float("exposure_us", value)
+
+    def set_gain_db(self, value: Optional[float]) -> None:
+        """Set (or unset) Gain in dB, live if the stream is running."""
+        self._set_live_float("gain_db", value)
+
+    def _set_live_float(self, attr: str, value: Optional[float]) -> None:
+        """Store `attr` and, when the camera is open, push it to the node in `CAMERA_NODES`.
+
+        `None` CLEARS THE FIELD BUT SENDS NOTHING. A camera cannot be told "go back to what you
+        were before I asked" — the value it is running at IS the value that was sent. So clearing
+        mid-run means only "stop imposing this from now on (and do not send it at the next open)",
+        which is exactly what the config file will then say. Pretending otherwise would put a
+        number on screen that the sensor is not using.
+        """
+        if value is None:
+            setattr(self, attr, None)
+            return
+        node = CAMERA_NODES[attr]
+        value = float(self._snapped(attr, value))
+        setattr(self, attr, value)
+        if not self._is_open or self._cam is None:
+            return
+        if attr == "frame_rate":
+            # Same gate as `_configure`: on Hik cameras AcquisitionFrameRate is ignored unless
+            # AcquisitionFrameRateEnable is on, and a live change must not silently land in a
+            # register the camera is not reading.
+            self._cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
+        elif attr == "exposure_us":
+            self._cam.MV_CC_SetEnumValueByString("ExposureAuto", "Off")
+        elif attr == "gain_db":
+            self._cam.MV_CC_SetEnumValueByString("GainAuto", "Off")
+        ret = self._cam.MV_CC_SetFloatValue(node, value)
+        if ret != 0:
+            raise RuntimeError(f"failed to set {node}={value} (ret=0x{ret:x})")
+
+    def set_width(self, value: Optional[int]) -> None:
+        """Set (or unset) Width. Refused while acquiring — see `set_height`."""
+        self._set_start_only("width", value)
+
+    def set_height(self, value: Optional[int]) -> None:
+        """Set (or unset) Height. Refused while acquiring.
+
+        Raises RuntimeError rather than restarting the stream. The tempting implementation —
+        StopGrabbing, set, StartGrabbing — costs a gap in a recording that may be days long AND
+        resets the frame-diff baseline every activity number depends on (DESIGN.md §5.3), so an
+        experiment would carry two regimes with nothing in the output saying where the seam is.
+        The value is settable before the run and from the standalone `settings` command; that is
+        the whole reason those exist.
+        """
+        self._set_start_only("height", value)
+
+    def _set_start_only(self, attr: str, value) -> None:
+        if self._is_open:
+            raise RuntimeError(
+                f"{CAMERA_NODES[attr]} can only be changed while the stream is stopped; it "
+                "applies at the next start (the run keeps going, untouched)"
+            )
+        if value is None:
+            setattr(self, attr, None)
+            return
+        setattr(self, attr, int(round(self._snapped(attr, value))))
 
     def read(self) -> Optional[Frame]:
         if not self._is_open or self._cam is None:
@@ -399,6 +776,7 @@ class HikCameraSource(FrameSource):
                 pass
         self._cam = None
         self._is_open = False
+        self._ranges = None
         if errors:
             raise RuntimeError("HikCameraSource.close() encountered errors: " + "; ".join(errors))
 

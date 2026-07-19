@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from flygym_tracker import monitor as MON
 from flygym_tracker import settings_panel as SP
@@ -817,7 +818,11 @@ def test_every_built_setting_has_a_help_line_a_group_and_a_unit_scale_that_makes
     for s in model.settings:
         assert s.help and not s.help.startswith(s.label), "%s: help restates the label" % s.key
         assert s.group
-        assert s.lo <= s.value <= s.hi
+        # A camera row may legitimately hold None ("impose nothing"); a number must be in range.
+        if s.value is not None:
+            assert s.lo <= s.value <= s.hi
+        else:
+            assert s.nullable, "%s holds None but is not nullable" % s.key
         assert "." in s.key, "%s is not a config path" % s.key
 
 
@@ -1433,7 +1438,17 @@ def test_the_banner_advertises_the_settings_key(tmp_path):
     assert banner.shape == (mon.banner_h, mon.canvas_w, 3)
     # The hint text is drawn, not returned, so assert on the source of truth for it instead.
     import inspect
-    assert "t settings" in inspect.getsource(MON.LiveMonitor._render_banner)
+    assert "t settings" in MON.SETTINGS_HINT
+    assert MON.SETTINGS_HINT in inspect.getsource(MON.LiveMonitor._render_banner) or \
+        "SETTINGS_HINT" in inspect.getsource(MON.LiveMonitor._render_banner)
+
+
+def test_the_banner_says_the_settings_key_covers_the_camera_too():
+    """The operator reported not finding the tracking/camera settings at all, even though `t` was
+    already listed -- last of six keys, in the same grey as the rest. It now leads the line, in the
+    accent colour, and names what it opens."""
+    assert "camera" in MON.SETTINGS_HINT.lower()
+    assert "t settings" not in MON.OTHER_KEYS_HINT, "the settings key must not be listed twice"
 
 
 # =========================================================================================
@@ -1447,3 +1462,696 @@ def test_run_and_replay_both_accept_the_settings_flag():
                  ["replay", "--video", "v.avi", "--config", "c.yaml", "--calib", "d"]):
         assert parser.parse_args(argv).settings is False
         assert parser.parse_args(argv + ["--settings"]).settings is True
+
+
+# =========================================================================================
+# 12. The camera group is TRI-STATE: an explicit value, or the camera's own default
+# =========================================================================================
+#
+# The rig owner's requirement, in their words: "if no settings are touched inside the software the
+# camera needs to start with the default settings from the mvs". A slider cannot express that --
+# every position on a track is a number -- so `None` is a first-class value here, it renders
+# differently from any number, and returning to it writes `null` to the config rather than
+# whatever the camera happens to be sitting at.
+
+
+def _nullable_setting(**kw):
+    base = dict(key="source.camera.frame_rate", label="frame rate", value=None, lo=1.0, hi=120.0,
+                step=0.5, kind="float", group="Camera", help="h", nullable=True, unit="fps")
+    base.update(kw)
+    return Setting(**base)
+
+
+def test_a_nullable_setting_keeps_none_instead_of_clamping_it_into_range():
+    """`None` means "impose nothing". Clamping it to `lo` would silently turn "whatever the camera
+    is doing" into "1.0 fps, chosen by this software" -- the exact bug this state exists to stop."""
+    s = _nullable_setting()
+    assert s.value is None
+    assert SP.coerce(s, None) is None
+
+
+def test_a_setting_that_is_not_nullable_refuses_none_rather_than_guessing():
+    with pytest.raises(ValueError):
+        _float_setting(value=None)
+
+
+def test_the_default_state_reads_as_words_not_as_a_number():
+    assert format_value(_nullable_setting()) == SP.DEFAULT_TEXT
+    assert "camera" in SP.DEFAULT_TEXT.lower()
+
+
+def test_setting_a_number_leaves_the_default_state_and_setting_none_returns_to_it():
+    model = SettingsModel([_nullable_setting()])
+    assert model.set("source.camera.frame_rate", 30.0) == pytest.approx(30.0)
+    assert model.to_default("source.camera.frame_rate") is None
+    assert model.value("source.camera.frame_rate") is None
+
+
+def test_a_row_with_no_camera_default_refuses_to_invent_one():
+    """`pixel_threshold` has no device to fall back to; `r` (back to the config file) is what that
+    row actually wants, and saying so beats silently doing nothing."""
+    model = _model()
+    with pytest.raises(ValueError):
+        model.to_default("a.f")
+
+
+def test_nudging_a_defaulted_row_lands_on_what_the_camera_is_doing():
+    """"One step away from nothing" has no meaning. Falling back to `lo` would send an operator who
+    tapped an arrow on the exposure row from the camera's 5000 us straight down to 20."""
+    model = SettingsModel([_nullable_setting(key="source.camera.exposure_us", lo=20.0, hi=50000.0,
+                                             step=1.0, default_hint=4990.0)])
+    assert model.nudge("source.camera.exposure_us", +1) == pytest.approx(4990.0)
+
+
+def test_nudging_a_defaulted_row_with_no_hint_falls_back_to_the_low_end():
+    model = SettingsModel([_nullable_setting()])
+    assert model.nudge("source.camera.frame_rate", +1) == pytest.approx(1.0)
+
+
+def test_a_defaulted_row_counts_as_changed_only_against_a_file_that_held_a_number():
+    model = SettingsModel([_nullable_setting(value=20.0)])
+    assert model.changed() == []
+    model.to_default("source.camera.frame_rate")
+    assert [s.key for s in model.changed()] == ["source.camera.frame_rate"]
+    model.set("source.camera.frame_rate", 20.0)
+    assert model.changed() == [], "back to the file's value is not a change"
+
+
+# ---- saving: back to default writes null, never a number --------------------------------
+CAMERA_CONFIG_TEXT = """\
+source:
+  type: camera
+  camera:
+    serial: "DA4282883"
+    width: 1280               # forced on every run until 2026-07-19
+    height: 1024
+    frame_rate: 20            # the AcquisitionFrameRate limiter held at 20 fps in testing
+    pixel_format: "Mono8"
+"""
+
+
+def test_returning_a_camera_row_to_default_writes_null_and_never_a_number():
+    """THE save-side half of the requirement. Writing the camera's current 1280 back would look
+    identical in the file to a deliberate choice of 1280, and would keep forcing it forever."""
+    out, notes = apply_overrides_to_yaml_text(
+        CAMERA_CONFIG_TEXT, {"source": {"camera": {"width": None, "frame_rate": None}}})
+    data = yaml.safe_load(out)["source"]["camera"]
+    assert data["width"] is None and data["frame_rate"] is None
+    assert "width: 1280" not in out and "frame_rate: 20" not in out
+    assert notes == ["source.camera.width: 1280 -> null",
+                     "source.camera.frame_rate: 20 -> null"]
+
+
+def test_a_config_saved_back_to_default_makes_the_next_run_send_nothing():
+    """End to end, through the real loader: null in the file -> None on the source -> (per
+    tests/test_frame_source.py) no SDK set-call at all."""
+    out, _notes = apply_overrides_to_yaml_text(
+        CAMERA_CONFIG_TEXT, {"source": {"camera": {"width": None, "frame_rate": None}}})
+    camera = yaml.safe_load(out)["source"]["camera"]
+    assert camera["width"] is None
+    assert camera["serial"] == "DA4282883", "clearing a tunable must not disturb the serial"
+
+
+def test_clearing_a_value_keeps_the_measurement_note_that_explains_it():
+    """This module hand-edits YAML precisely so the notes justifying the numbers survive. Deleting
+    the line -- the other way to say "unset" -- would take its comment with it, AND would let the
+    packaged default_config.yaml merge its own value back in underneath."""
+    out, _notes = apply_overrides_to_yaml_text(
+        CAMERA_CONFIG_TEXT, {"source": {"camera": {"frame_rate": None}}})
+    assert "the AcquisitionFrameRate limiter held at 20 fps in testing" in out
+    assert "frame_rate:" in out, "the key itself must stay, or the packaged default takes over"
+
+
+def test_none_is_written_as_yaml_null_not_python_none():
+    assert SP.format_yaml_value(None) == "null"
+
+
+def test_saving_a_defaulted_row_through_the_model_writes_null(tmp_path):
+    path = tmp_path / "rig.yaml"
+    path.write_text(CAMERA_CONFIG_TEXT, encoding="utf-8")
+    model = SettingsModel([_nullable_setting(key="source.camera.width", value=1280, lo=8.0,
+                                             hi=1280.0, step=8.0, kind="int")])
+    model.to_default("source.camera.width")
+    save_settings_to_yaml(str(path), model)
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["source"]["camera"]["width"] is None
+
+
+# ---- rendering: the three states must be tellable apart at a glance ----------------------
+def _camera_model(**kw):
+    return SettingsModel([_nullable_setting(**kw)])
+
+
+def _render(model, **kw):
+    rects = layout(model, 560, panel_size(model)[1])
+    return render(model, rects, 560, panel_size(model)[1], **kw)
+
+
+def test_a_defaulted_row_and_a_row_set_to_a_number_do_not_look_the_same():
+    """The operator has to see at a glance which settings the software is imposing."""
+    unset = _render(_camera_model(value=None))
+    chosen = _render(_camera_model(value=30.0))
+    assert not np.array_equal(unset, chosen)
+
+
+def test_a_defaulted_row_draws_no_handle_because_there_is_no_value_to_point_at():
+    """A handle parked at the camera's current reading would be indistinguishable from a row
+    deliberately set to that same number."""
+    model = _camera_model(value=None)
+    rects = layout(model, 560, panel_size(model)[1])
+    canvas = _render(model)
+    rect = rects[0]
+    band = canvas[rect.track_y - SP.HANDLE_R:rect.track_y + SP.HANDLE_R + 1,
+                  rect.track_x0:rect.track_x1]
+    assert not np.any(np.all(band == np.array(SP.COLOR_HANDLE, np.uint8), axis=-1))
+
+
+def test_a_defaulted_row_says_what_the_camera_is_actually_doing_when_that_is_known():
+    with_hint = _render(_camera_model(value=None, default_hint=88.5))
+    without = _render(_camera_model(value=None))
+    assert not np.array_equal(with_hint, without)
+    assert "88.5" in SP.format_hint(_nullable_setting(default_hint=88.5))
+    assert SP.format_hint(_nullable_setting()) == ""
+
+
+def test_a_blocked_row_is_greyed_and_shows_the_reason_where_its_value_would_be():
+    model = _camera_model(key="source.camera.width", value=640, kind="int", lo=8.0, hi=1280.0,
+                          step=8.0, start_only=True)
+    normal = _render(model)
+    blocked = _render(model, blocked={"source.camera.width": "applies at next start"})
+    assert not np.array_equal(normal, blocked)
+
+
+def test_the_group_note_says_whether_the_limits_are_live():
+    """A datasheet range presented like a measured one is the kind of thing that gets believed."""
+    plain = SettingsModel([_nullable_setting()])
+    noted = SettingsModel([_nullable_setting()], group_notes={"Camera": "camera not open"})
+    assert not np.array_equal(_render(plain), _render(noted))
+
+
+def test_a_nullable_row_gives_up_track_width_so_its_badge_is_not_under_the_handle():
+    """A click on the [d] button must mean "back to default", never "drag to the far right"."""
+    plain = layout(SettingsModel([_float_setting()]), 560, 400)[0]
+    nullable = layout(SettingsModel([_nullable_setting()]), 560, 400)[0]
+    assert nullable.track_x1 < plain.track_x1
+    assert nullable.track_x1 < nullable.default_x0
+    assert plain.on_default_badge(plain.default_x0 + 2, plain.track_y) is False
+
+
+def test_the_key_hints_wrap_to_the_panel_instead_of_running_off_it():
+    """REGRESSION: the single-line hint measured 626 px at the size it is drawn, on a 560 px panel,
+    so `q / ESC = close` was rendered past the right edge -- the operator could not see how to
+    close the window."""
+    for line in SP.key_hint_lines(560):
+        (w, _), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, SP.HINT_SCALE, 1)
+        assert w <= 560 - 2 * SP.PAD
+    joined = " ".join(SP.key_hint_lines(560))
+    for key, _what in SP.KEY_ROWS:
+        assert key in joined
+
+
+def test_the_panel_is_still_tall_enough_for_the_wrapped_footer():
+    model = build_settings(load_config())
+    width, height = panel_size(model)
+    rects = layout(model, width, height)
+    assert rects[-1].y + rects[-1].h <= height - SP.FOOTER_H
+
+
+# ---- the driver: d key, badge click, blocked rows ---------------------------------------
+def _camera_window(monkeypatch, keys, **kw):
+    panel = _FakePanel(monkeypatch, keys)
+    model = SettingsModel([
+        _nullable_setting(value=20.0),
+        _nullable_setting(key="source.camera.width", value=640, kind="int", lo=8.0, hi=1280.0,
+                          step=8.0, start_only=True),
+    ])
+    return panel, model, SettingsWindow(model, **kw)
+
+
+def test_d_returns_the_selected_row_to_the_camera_default(monkeypatch):
+    seen = []
+    _panel, model, win = _camera_window(monkeypatch, [], on_change=lambda k, v: seen.append((k, v)))
+    win.select(0)
+    win.handle_key("d")
+    assert model.value("source.camera.frame_rate") is None
+    assert seen == [("source.camera.frame_rate", None)], \
+        "clearing a value is a change like any other and must reach the pipeline"
+
+
+def test_clicking_the_badge_on_a_row_returns_it_to_the_camera_default(monkeypatch):
+    _panel, model, win = _camera_window(monkeypatch, [])
+    rect = win.rects[0]
+    win.on_mouse(cv2.EVENT_LBUTTONDOWN, rect.default_x0 + 2, rect.track_y)
+    assert model.value("source.camera.frame_rate") is None
+
+
+def test_clicking_the_badge_does_not_also_drag_the_slider(monkeypatch):
+    """The badge sits past the end of the track for exactly this reason."""
+    _panel, model, win = _camera_window(monkeypatch, [])
+    rect = win.rects[0]
+    win.on_mouse(cv2.EVENT_LBUTTONDOWN, rect.default_x0 + 2, rect.track_y)
+    win.on_mouse(cv2.EVENT_MOUSEMOVE, rect.track_x0, rect.track_y)
+    assert model.value("source.camera.frame_rate") is None
+
+
+def test_d_on_a_row_with_no_camera_default_says_so_instead_of_doing_nothing(monkeypatch):
+    _FakePanel(monkeypatch, [])
+    model = _model()
+    win = SettingsWindow(model)
+    win.select(0)
+    assert win.handle_key("d") is None
+    assert "no camera default" in win.message
+
+
+def test_a_blocked_row_refuses_a_drag_and_names_the_reason(monkeypatch):
+    _panel, model, win = _camera_window(
+        monkeypatch, [], blocked=lambda key: "applies at next start" if "width" in key else None)
+    rect = win.rects[1]
+    win.on_mouse(cv2.EVENT_LBUTTONDOWN, rect.track_x0, rect.track_y)
+    assert model.value("source.camera.width") == 640, "a blocked row was changed anyway"
+    assert "applies at next start" in win.message
+
+
+def test_a_blocked_row_refuses_the_arrow_keys_and_the_d_key_too(monkeypatch):
+    _panel, model, win = _camera_window(
+        monkeypatch, [], blocked=lambda key: "applies at next start" if "width" in key else None)
+    win.select(1)
+    win.handle_key("right")
+    win.handle_key("d")
+    assert model.value("source.camera.width") == 640
+
+
+def test_blocking_one_row_leaves_the_others_editable(monkeypatch):
+    _panel, model, win = _camera_window(
+        monkeypatch, [], blocked=lambda key: "applies at next start" if "width" in key else None)
+    win.select(0)
+    win.handle_key("d")
+    assert model.value("source.camera.frame_rate") is None
+    assert win.blocked_map() == {"source.camera.width": "applies at next start"}
+
+
+def test_a_blocked_callback_that_raises_cannot_take_the_panel_down(monkeypatch):
+    def boom(_key):
+        raise RuntimeError("nope")
+
+    _panel, model, win = _camera_window(monkeypatch, [], blocked=boom)
+    assert win.blocked_map() == {}
+    win.select(0)
+    win.handle_key("d")
+    assert model.value("source.camera.frame_rate") is None
+
+
+# =========================================================================================
+# 13. build_settings -- the camera rows, and when they must NOT appear
+# =========================================================================================
+def test_the_camera_rows_are_built_from_the_config_with_null_meaning_default():
+    model = build_settings(load_config("config/flygym_rig.yaml"))
+    for key in ("frame_rate", "exposure_us", "gain_db", "width", "height"):
+        s = model.get("source.camera.%s" % key)
+        assert s.value is None, "%s is not at the camera default" % key
+        assert s.nullable and s.group == "Camera"
+
+
+def test_a_camera_value_in_the_config_shows_as_that_value_not_as_the_default(tmp_path):
+    path = tmp_path / "cfg.yaml"
+    path.write_text("source:\n  camera:\n    frame_rate: 42.0\n", encoding="utf-8")
+    model = build_settings(load_config(str(path)))
+    assert model.value("source.camera.frame_rate") == pytest.approx(42.0)
+
+
+def test_a_configured_value_outside_the_panels_usual_range_widens_the_slider(tmp_path):
+    """A panel that opened showing 120 fps because its track stopped there, on a run configured for
+    150, would be describing a rig that does not exist."""
+    path = tmp_path / "cfg.yaml"
+    path.write_text("source:\n  camera:\n    frame_rate: 150.0\n", encoding="utf-8")
+    s = build_settings(load_config(str(path))).get("source.camera.frame_rate")
+    assert s.hi >= 150.0
+    assert s.value == pytest.approx(150.0)
+
+
+def test_width_and_height_are_the_start_only_rows_and_the_rest_are_live():
+    model = build_settings(load_config())
+    assert model.get("source.camera.width").start_only is True
+    assert model.get("source.camera.height").start_only is True
+    for key in ("frame_rate", "exposure_us", "gain_db"):
+        assert model.get("source.camera.%s" % key).start_only is False
+
+
+def test_with_no_camera_attached_the_panel_says_the_limits_are_not_live():
+    model = build_settings(load_config())
+    note = model.group_notes["Camera"]
+    assert "not live" in note or "documented" in note
+    # The fallback grid: the rig sensor's real 4 px increment, measured 2026-07-19. Pinned in
+    # tests/test_frame_source.py; asserted here only to catch the panel dropping it on the floor.
+    assert model.get("source.camera.width").step == 4
+
+
+def test_a_replay_offers_no_camera_rows_at_all(tmp_path):
+    """The panel's standing rule: never show a slider the run cannot honour. A replay reads a video
+    file -- its config still has a camera block, but there is no sensor to send anything to."""
+    pipe = _mini_pipeline(tmp_path, [_bg(), _bg()], adaptive=True)
+    model = build_settings(pipe.config, pipeline=pipe)
+    assert not [k for k in model.keys() if k.startswith("source.camera.")]
+    assert set(model.keys()) <= set(pipe.settable_keys())
+
+
+def test_the_standalone_panel_offers_them_even_with_no_run_at_all():
+    """Editing the file for NEXT time is the entire job of the `settings` command."""
+    model = build_settings(load_config())
+    assert "source.camera.width" in model.keys()
+
+
+# =========================================================================================
+# 14. ROUTING -- a camera change goes through apply_setting like every other setting
+# =========================================================================================
+class _FakeCameraSource(_ListSource):
+    """A frame source that also answers the camera-setting protocol, recording what it is told.
+
+    Duck-typed exactly as `pipeline._camera_setting_routes` expects, so these tests exercise the
+    real routing table rather than a stand-in for it.
+    """
+
+    def __init__(self, frames, fps: float = 10.0):
+        super().__init__(frames, fps)
+        self.frame_rate = self.exposure_us = self.gain_db = None
+        self.width = self.height = None
+        self.sent: List[tuple] = []
+        self.is_acquiring = False
+
+    def open(self) -> None:
+        self.is_acquiring = True
+
+    def close(self) -> None:
+        self.is_acquiring = False
+
+    def set_frame_rate(self, value):
+        self._live("frame_rate", value)
+
+    def set_exposure_us(self, value):
+        self._live("exposure_us", value)
+
+    def set_gain_db(self, value):
+        self._live("gain_db", value)
+
+    def _live(self, attr, value):
+        setattr(self, attr, None if value is None else float(value))
+        if value is not None:
+            self.sent.append((attr, float(value)))
+
+    def set_width(self, value):
+        self._start_only("width", value)
+
+    def set_height(self, value):
+        self._start_only("height", value)
+
+    def _start_only(self, attr, value):
+        if self.is_acquiring:
+            raise RuntimeError("%s applies at the next start" % attr)
+        setattr(self, attr, None if value is None else int(value))
+
+
+def _camera_pipeline(tmp_path, frames, **kw):
+    source = _FakeCameraSource(frames)
+    pipe = TrackerPipeline(
+        load_config(overrides={
+            "rotation": {"detector": "adaptive", "enter_threshold": 40.0, "exit_threshold": 15.0,
+                         "debounce_frames": 1, "min_stationary_frames": 1},
+            "activity": {"pixel_threshold": 30.0},
+            "binning": {"bin_seconds": 1.0},
+        }),
+        _mini_calibration(tmp_path), source,
+        ActivityLogger(output_dir=tmp_path, run_id="t", fmt="csv"),
+        reference_frames={"A": _bg()}, clock="index", **kw)
+    return pipe, source
+
+
+@pytest.mark.parametrize("key,attr,value", [
+    ("source.camera.frame_rate", "frame_rate", 25.0),
+    ("source.camera.exposure_us", "exposure_us", 5000.0),
+    ("source.camera.gain_db", "gain_db", 2.0),
+])
+def test_a_live_camera_setting_reaches_the_camera_through_apply_setting(tmp_path, key, attr, value):
+    pipe, source = _camera_pipeline(tmp_path, [_bg(), _bg()])
+    assert pipe.apply_setting(key, value) is True
+    assert getattr(source, attr) == pytest.approx(value)
+    assert (attr, value) in source.sent
+
+
+def test_every_camera_row_the_panel_builds_is_routable_by_the_run_it_was_built_from(tmp_path):
+    pipe, source = _camera_pipeline(tmp_path, [_bg(), _bg()])
+    model = build_settings(pipe.config, pipeline=pipe, camera=source)
+    assert "source.camera.frame_rate" in model.keys()
+    assert set(model.keys()) <= set(pipe.settable_keys())
+
+
+def test_a_mid_run_camera_change_is_logged_like_any_other_regime_change(tmp_path):
+    """An experiment whose exposure moved at hour 12 holds two measurement conditions in one
+    activity.csv. The event is the only record that says where the seam is."""
+    pipe, _source = _camera_pipeline(tmp_path, _scene(6))
+
+    def watch(payload):
+        if payload["index"] == 2:
+            assert pipe.apply_setting("source.camera.exposure_us", 8000.0) is True
+
+    pipe.add_observer(watch)
+    pipe.run()
+    events = pd.read_csv(tmp_path / "events.csv")
+    rows = events[events["event"] == "setting_change"]
+    assert len(rows) == 1
+    assert "source.camera.exposure_us" in rows.iloc[0]["detail"]
+    assert "8000" in rows.iloc[0]["detail"]
+
+
+def test_clearing_a_camera_setting_mid_run_is_logged_as_going_back_to_the_default(tmp_path):
+    pipe, _source = _camera_pipeline(tmp_path, _scene(6))
+    pipe.apply_setting("source.camera.gain_db", 3.0)
+
+    def watch(payload):
+        if payload["index"] == 2:
+            assert pipe.apply_setting("source.camera.gain_db", None) is True
+
+    pipe.add_observer(watch)
+    pipe.run()
+    detail = pd.read_csv(tmp_path / "events.csv").query("event == 'setting_change'").iloc[-1]
+    assert "camera default" in detail["detail"], \
+        "None in an events.csv cell reads like a missing field, not like a deliberate unset"
+
+
+def test_a_camera_setting_chosen_before_the_first_frame_is_not_logged_as_a_change(tmp_path):
+    """Same split as every other setting: nothing was re-measured, only chosen, so a `setting_change`
+    row at elapsed 0 would describe measurements that do not exist. The CLI records the starting
+    state in run_meta.json instead."""
+    pipe, source = _camera_pipeline(tmp_path, _scene(4))
+    assert pipe.apply_setting("source.camera.frame_rate", 25.0) is True
+    pipe.run()
+    events = pd.read_csv(tmp_path / "events.csv")
+    assert events[events["event"] == "setting_change"].empty
+    assert source.frame_rate == pytest.approx(25.0)
+
+
+def test_the_start_only_rows_are_free_before_the_run_and_blocked_once_it_is_recording(tmp_path):
+    pipe, source = _camera_pipeline(tmp_path, _scene(6))
+    assert pipe.setting_block_reason("source.camera.width") is None
+    assert pipe.apply_setting("source.camera.width", 640) is True
+    assert source.width == 640
+
+    blocked = {}
+
+    def watch(payload):
+        if payload["index"] == 2:
+            blocked["reason"] = pipe.setting_block_reason("source.camera.width")
+            blocked["applied"] = pipe.apply_setting("source.camera.width", 320)
+
+    pipe.add_observer(watch)
+    pipe.run()
+    assert blocked["applied"] is False
+    assert "next start" in blocked["reason"]
+    assert source.width == 640, "the running stream's geometry was changed under it"
+
+
+def test_a_blocked_geometry_change_writes_no_event_because_nothing_changed(tmp_path):
+    pipe, _source = _camera_pipeline(tmp_path, _scene(6))
+
+    def watch(payload):
+        if payload["index"] == 2:
+            pipe.apply_setting("source.camera.height", 320)
+
+    pipe.add_observer(watch)
+    pipe.run()
+    events = pd.read_csv(tmp_path / "events.csv")
+    assert events[events["event"] == "setting_change"].empty
+
+
+def test_the_live_camera_rows_are_never_blocked_even_mid_run(tmp_path):
+    """Frame rate, exposure and gain are live-adjustable on this camera; blocking them would throw
+    away the whole point of a panel that can be opened during a run."""
+    pipe, _source = _camera_pipeline(tmp_path, [_bg(), _bg()])
+    pipe.source.is_acquiring = True
+    for key in ("source.camera.frame_rate", "source.camera.exposure_us", "source.camera.gain_db"):
+        assert pipe.setting_block_reason(key) is None
+
+
+def test_the_panel_greys_a_start_only_row_using_the_pipelines_own_answer(tmp_path, monkeypatch):
+    """One source of truth: the panel does not keep its own idea of whether the stream is live."""
+    _FakePanel(monkeypatch, [])
+    pipe, source = _camera_pipeline(tmp_path, [_bg(), _bg()])
+    model = build_settings(pipe.config, pipeline=pipe, camera=source)
+    win = SettingsWindow(model, on_change=pipe.apply_setting, blocked=pipe.setting_block_reason)
+    assert win.blocked_map() == {}
+    source.is_acquiring = True
+    assert set(win.blocked_map()) == {"source.camera.width", "source.camera.height"}
+
+
+def test_no_help_line_is_drawn_past_the_edge_of_the_panel_or_under_a_badge():
+    """REGRESSION: `cv2.putText` neither wraps nor clips -- it draws until it runs out of image.
+    The exposure row's help line, once its default-state prefix was added, measured 610 px on a
+    560 px panel, so the end of the sentence was painted off the canvas."""
+    model = build_settings(load_config("config/flygym_rig.yaml"))
+    for s in model.settings:
+        s.default_hint = 4990.0 if s.nullable else None
+    width, height = panel_size(model)
+    for rect, s in zip(layout(model, width, height), model.settings):
+        text = s.help
+        if s.value is None:
+            text = "nothing sent - %s  |  %s" % (SP.format_hint(s), s.help)
+        start = rect.x + 16
+        limit = (rect.default_x0 - 6) if rect.nullable else (rect.x + rect.w - 6)
+        drawn = SP.fit_text(text, limit - start)
+        (drawn_w, _), _ = cv2.getTextSize(drawn, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        assert start + drawn_w <= limit, "%s runs past its row" % s.key
+        assert start + drawn_w <= width, "%s runs off the panel" % s.key
+
+
+def test_a_camera_rows_help_line_still_fits_once_its_default_state_is_prefixed():
+    """Not merely ellipsized to fit -- the whole sentence has to survive, or the shortening was
+    just moved from the renderer into the reader's head."""
+    model = build_settings(load_config("config/flygym_rig.yaml"))
+    for s in model.settings:
+        s.default_hint = 4990.0 if s.nullable else None
+    width, height = panel_size(model)
+    for rect, s in zip(layout(model, width, height), model.settings):
+        if not s.nullable:
+            continue
+        text = "nothing sent - %s  |  %s" % (SP.format_hint(s), s.help)
+        assert SP.fit_text(text, rect.default_x0 - 6 - (rect.x + 16)) == text,             "%s: %r has to be ellipsized" % (s.key, text)
+
+
+def test_the_state_comes_before_the_description_so_ellipsis_never_eats_it():
+    """What the operator needs from a row they are LEAVING ALONE is what the camera is doing with
+    it, not a definition of exposure."""
+    model = build_settings(load_config())
+    s = model.get("source.camera.exposure_us")
+    s.default_hint = 4990.0
+    canvas = render(model, layout(model, 560, panel_size(model)[1]), 560, panel_size(model)[1])
+    assert canvas is not None
+    assert SP.fit_text("nothing sent - camera: 4990 us  |  tail", 120).startswith("nothing sent")
+
+
+def test_a_read_back_from_the_camera_is_never_clamped_into_the_sliders_range():
+    """The hint is the camera reporting a fact. Printing "camera: 120.0 fps" because the track
+    stops at 120 would be the display inventing a measurement."""
+    s = _nullable_setting(lo=1.0, hi=120.0, default_hint=163.0)
+    assert "163" in SP.format_hint(s)
+
+
+def test_fit_text_marks_what_it_removed():
+    long_text = "a" * 400
+    fitted = SP.fit_text(long_text, 100)
+    assert fitted.endswith("...") and len(fitted) < len(long_text)
+    assert SP.fit_text("short", 1000) == "short"
+
+
+def test_r_does_not_reset_a_row_that_is_blocked_from_changing(monkeypatch):
+    """A blocked row is greyed out and refuses a drag; `r` must not be the one way round the guard.
+    Otherwise the panel would show a geometry the running stream is not using."""
+    _panel, model, win = _camera_window(
+        monkeypatch, [], blocked=lambda key: "applies at next start" if "width" in key else None)
+    model.set("source.camera.frame_rate", 45.0)
+    model.set("source.camera.width", 320)
+    win.reset()
+    assert model.value("source.camera.frame_rate") == pytest.approx(20.0), "the live row reset"
+    assert model.value("source.camera.width") == 320, "a blocked row was reset anyway"
+    assert "cannot change right now" in win.message
+
+
+def test_r_still_resets_everything_when_nothing_is_blocked(monkeypatch):
+    _panel, model, win = _camera_window(monkeypatch, [])
+    model.set("source.camera.frame_rate", 45.0)
+    model.set("source.camera.width", 320)
+    win.reset()
+    assert model.value("source.camera.frame_rate") == pytest.approx(20.0)
+    assert model.value("source.camera.width") == 640
+    assert "reset 2 setting(s)" in win.message
+
+
+# =========================================================================================
+# A row at the camera default has NOTHING on its track to grab
+# =========================================================================================
+def _rig_camera_model():
+    from flygym_tracker.config import load_config
+    return build_settings(load_config(path="config/flygym_rig.yaml"))
+
+
+@pytest.mark.parametrize("key", [
+    "source.camera.frame_rate", "source.camera.exposure_us", "source.camera.gain_db",
+    "source.camera.width", "source.camera.height",
+])
+def test_clicking_the_help_line_of_a_default_row_imposes_nothing(key):
+    """Regression: one stray click took an 88 fps recording down to 2.6 fps.
+
+    `render` draws a row that is at its device default with NO fill and NO handle -- there is no
+    value to point at. `SliderRect.on_track` had no matching guard and accepted a press anywhere
+    in the 32 px band around the track, which contains the row's own help-text line: the obvious
+    thing to click to select a row. On a live camera `on_change` is `pipeline.apply_setting`, so
+    the click wrote AcquisitionFrameRate on the running sensor and armed a drag that kept
+    rewriting it -- a silent measurement-regime change on an irreplaceable multi-day series.
+    """
+    model = _rig_camera_model()
+    rects = SP.layout(model, 560, 980)
+    rect = next(r for r in rects if r.key == key)
+    assert model.get(key).value is None, "this test needs a row at the camera default"
+    assert rect.empty is True
+
+    # the help line, drawn at rect.y + 38, is inside the old grab band (track_y +/- 16)
+    assert abs((rect.y + 38) - rect.track_y) <= SP.TRACK_GRAB_PX
+    assert rect.on_track(rect.x + 16, rect.y + 38) is False
+    assert rect.on_track(rect.track_x0 + rect.track_w // 2, rect.track_y) is False
+
+
+def test_a_press_on_a_default_row_selects_it_and_says_how_to_set_a_value():
+    model = _rig_camera_model()
+    changes = []
+    win = SP.SettingsWindow(model, on_change=lambda k, v: changes.append((k, v)) or True)
+    rect = next(r for r in win.rects if r.key == "source.camera.frame_rate")
+
+    win.on_mouse(cv2.EVENT_LBUTTONDOWN, rect.x + 16, rect.y + 38, 0, None)
+
+    assert model.get("source.camera.frame_rate").value is None    # nothing imposed
+    assert changes == []                                          # nothing reached the camera
+    assert win._dragging is None                                  # and no drag was armed
+    assert "arrow" in win.message.lower()                          # but it says what to do
+
+
+def test_a_row_that_has_a_value_is_still_fully_draggable():
+    """The guard must not cost the ordinary case: once a camera row holds a value it drags."""
+    model = _rig_camera_model()
+    model.set("source.camera.frame_rate", 30.0)
+    rects = SP.layout(model, 560, 980)
+    rect = next(r for r in rects if r.key == "source.camera.frame_rate")
+
+    assert rect.empty is False
+    mid = rect.track_x0 + rect.track_w // 2
+    assert rect.on_track(mid, rect.track_y) is True
+    assert SP.value_at(rect, mid) == pytest.approx(60.1, abs=0.2)
+
+
+def test_returning_a_row_to_default_makes_its_track_unclickable_again():
+    """The two states must stay in step -- d, then a click, must not re-impose a value."""
+    model = _rig_camera_model()
+    model.set("source.camera.exposure_us", 5000.0)
+    assert next(r for r in SP.layout(model, 560, 980)
+                if r.key == "source.camera.exposure_us").empty is False
+
+    model.to_default("source.camera.exposure_us")
+    rect = next(r for r in SP.layout(model, 560, 980) if r.key == "source.camera.exposure_us")
+    assert rect.empty is True
+    assert rect.on_track(rect.x + 16, rect.y + 38) is False

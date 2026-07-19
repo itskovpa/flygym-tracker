@@ -69,7 +69,8 @@ Each module is one file under `src/flygym_tracker/`. Interfaces reference datacl
 | `registration.py` | Align current stationary frame to the calibration frame (translation/rotation) so ROIs stay locked under drift. |
 | `logger.py` | `ActivityLogger`: append `ActivityRecord`/`EventRecord` to CSV/XLSX; rolling files; resumable. |
 | `pipeline.py` | `TrackerPipeline`: wire source→rotation→(face/register)→activity→binner→logger; the run loop. |
-| `cli.py` | Entry points: `calibrate`, `run`, `replay`, `noise` (measure noise floor). |
+| `cli.py` | Entry points: `calibrate`, `select-vials`, `edit-rois`, `settings`, `run`, `replay`, `noise` (measure noise floor), `free-camera`. |
+| `settings_panel.py` | The tunable parameters as on-screen sliders (`--settings`, the monitor's `t`, and the standalone `settings` command). Camera rows are tri-state — an explicit value, or the camera's own default, in which case NOTHING is sent to the sensor. |
 
 ## 5. Algorithms
 
@@ -211,3 +212,19 @@ Two ways to produce a calibration bundle, both emitting the IDENTICAL `Calibrati
   face id; each face calibrated independently.
 - Fly shadows are clearly visible when flies are loaded (owner confirmed) — so SNR is not a concern;
   only the numeric activity threshold needs tuning on real flies (the deferred "last bit", §9).
+- **Camera settings default to MVS.** Owner's requirement, verbatim: *"expose the camera controls,
+  so that the framerate, exposure settings and image size can be adjusted from inside the software;
+  if no settings are touched inside the camera the camera needs to start with the default settings
+  from the mvs"*. So `source.camera.{width,height,exposure_us,gain_db,frame_rate}` are `null` in
+  both shipped configs, and a `null` field produces **no SDK set-call at all** — the camera keeps
+  whatever MVS left it at (`frame_source.HikCameraSource._configure`; asserted on a mocked SDK in
+  `tests/test_frame_source.py`). Only `PixelFormat` and `TriggerMode` are always sent, because the
+  pipeline requires Mono8 free-running frames.
+  - Adjustable from `settings_panel` and routed through `TrackerPipeline.apply_setting` like every
+    other setting, so a mid-run change is logged as a `setting_change` event (§5.3's regime rule).
+  - Frame rate / exposure / gain are **live**; **width and height are start-only** — they are fixed
+    at StartGrabbing time, and restarting the stream mid-experiment would cost a gap in the series
+    plus a frame-diff baseline reset. `TrackerPipeline.setting_block_reason` refuses them while the
+    camera is open, and the panel greys those rows out.
+  - Slider limits (min/max/increment) are READ from the sensor when a camera is open; with none
+    attached the panel falls back to documented ranges and says on screen that they are not live.

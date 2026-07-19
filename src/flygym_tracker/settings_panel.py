@@ -20,6 +20,28 @@ VALUES IN REAL UNITS and decides whether 12.0 grey levels is above the sensor no
 trackbar also cannot show a help line, a group heading, or a "this one only takes effect next
 run" marker. Roughly sixty lines of `cv2.line`/`cv2.putText` buy all of that, so they are drawn.
 
+THE CAMERA GROUP IS TRI-STATE, AND THAT IS NOT DECORATION. Frame rate, exposure, gain, width and
+height are each either an EXPLICIT VALUE this software sends to the sensor, or the DEVICE DEFAULT,
+in which case nothing is sent at all and the camera keeps whatever MVS left it at. A slider alone
+cannot say "unset" -- every position on a track is a number -- so those rows draw a distinct
+default state (muted green, empty track, no handle, a `[d]` badge) and returning to it writes
+`null` to the config rather than the number the camera happens to be sitting at. Before this, the
+config FORCED 1280x1024 at 20 fps on every run, so "start from the MVS settings" was not
+expressible at all; with it, the operator can see at a glance which settings the software is
+imposing and which it is leaving alone.
+
+Two further camera-specific rules, both learned from the rig rather than from taste:
+
+  * LIMITS ARE READ FROM THE SENSOR (`frame_source.HikCameraSource.ranges`) when a camera is open.
+    A width off the node's increment grid is REJECTED by the SDK, not clamped, so a guessed
+    constant is a failed run. With no camera attached -- every test machine, and the tuning-
+    between-runs case -- documented ranges are used and the panel SAYS SO next to the group
+    heading, because a datasheet number displayed like a measured one will be believed.
+  * WIDTH AND HEIGHT ARE START-ONLY. They are fixed at StartGrabbing time, so they are editable
+    before a run and greyed out with the reason during one (`SettingsWindow.blocked`, wired to
+    `pipeline.setting_block_reason`). Restarting the stream to apply them would cost a gap in a
+    days-long recording plus a frame-diff baseline reset -- two measurement regimes in one file.
+
 STRUCTURE (identical split to `live_vial_selector`, for the identical reason: no test may need a
 display). Everything that can be WRONG is pure:
 
@@ -68,6 +90,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from flygym_tracker.frame_source import (
+    START_ONLY_ATTRS as CAMERA_START_ONLY_ATTRS,
+    camera_ranges,
+    fallback_camera_ranges,
+)
 from flygym_tracker.gui_support import require_gui
 from flygym_tracker.live_vial_selector import place_window_on_screen, screen_view_limit
 
@@ -82,12 +109,25 @@ PAD = 18
 ROW_H = 76
 GROUP_HEADER_H = 34
 HEADER_H = 88
-FOOTER_H = 58
+#: Tall enough for the status line plus TWO wrapped lines of key hints. One line was not: the key
+#: list measured 626 px at the size it is drawn, on a 560 px panel, so `q / ESC = close` was
+#: rendered past the right edge and the operator never saw how to close the window. `key_hint_lines`
+#: now wraps it to the real canvas width instead of assuming it fits.
+FOOTER_H = 76
+#: Baseline pitch between the wrapped key-hint lines.
+HINT_LINE_H = 15
+HINT_SCALE = 0.4
 #: Vertical half-height of the band around a track that counts as "on the track" for a mouse
 #: press. Generous on purpose: a 6 px line is not a mouse target a human can hit reliably.
 TRACK_GRAB_PX = 16
 TRACK_THICKNESS = 6
 HANDLE_R = 8
+#: The ``[d]`` back-to-device-default badge, at the right end of a nullable row's track line. The
+#: track is SHORTENED by this much on those rows (see `layout`) rather than the badge being laid
+#: over it, so a drag can never end underneath the button that undoes it.
+DEFAULT_BADGE_W = 26
+DEFAULT_BADGE_H = 20
+DEFAULT_BADGE_GAP = 8
 
 #: `cv2.waitKey` timeout for the modal `run()` loop.
 POLL_MS = 30
@@ -112,12 +152,22 @@ COLOR_CHANGED = (0, 200, 255)
 COLOR_NEXTRUN = (0, 170, 255)
 COLOR_GROUP = (200, 200, 200)
 COLOR_ACCENT = (0, 235, 255)
+#: The "device default, nothing sent" state. Deliberately a MUTED GREEN rather than another shade
+#: of the value cyan: at a glance across the panel, green rows are ones the software is leaving
+#: alone and cyan rows are ones it is imposing, which is the reading the rig owner asked for.
+COLOR_DEFAULT = (120, 200, 120)
+#: A row that cannot be edited right now (start-only, mid-run). Dimmer than everything else.
+COLOR_BLOCKED = (95, 95, 95)
+
+#: What a nullable row shows instead of a number when nothing is being imposed.
+DEFAULT_TEXT = "camera default"
 
 #: ``(key, what it does)`` -- the footer, and the terminal banner.
 KEY_ROWS = [
     ("drag", "set a value"),
     ("up/down", "pick a row"),
     ("left/right", "nudge by one step"),
+    ("d", "back to the camera default"),
     ("r", "reset all"),
     ("s", "save to config"),
     ("q / ESC", "close"),
@@ -153,6 +203,22 @@ class Setting:
             it did something it did not do.
         odd: int only -- snap to odd values (an OpenCV kernel size must be odd).
         unit: appended to the displayed value, e.g. "grey levels", "frames".
+        nullable: True if ``None`` is a legal value meaning "the software imposes nothing here,
+            so the device keeps its own default". A slider alone cannot express that -- every
+            position on a track is a number -- so a nullable row draws a DEFAULT state instead of
+            a handle, and returning to it (the ``d`` key, or the ``[d]`` badge) writes ``null``
+            rather than the number the device happens to be sitting at. Without this the operator
+            could not tell "I chose 20 fps" from "the camera came up at 20 fps", which is exactly
+            the distinction the rig owner asked to see at a glance.
+        default_hint: what the device reports for this row right now, if known. Shown beside the
+            DEFAULT state ("camera: 88.5") so the operator can see what they are leaving alone,
+            and used as the landing value when a nudge takes the row OUT of the default state --
+            arriving at `lo` would be a wild jump on a range like 20..50000 microseconds.
+        start_only: True if the value cannot take effect until acquisition (re)starts. This is a
+            property of the SETTING; whether it is currently blocked is a property of the RUN, and
+            is asked of the pipeline per draw (`SettingsWindow.blocked`) rather than frozen here --
+            the same model object is used by the pre-run panel, where these rows are editable, and
+            by the mid-run ``t`` panel, where they must not be.
     """
 
     key: str
@@ -167,10 +233,15 @@ class Setting:
     live: bool = True
     odd: bool = False
     unit: str = ""
+    nullable: bool = False
+    default_hint: Optional[float] = None
+    start_only: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in ("float", "int", "bool"):
             raise ValueError("Setting.kind must be 'float'|'int'|'bool', got %r" % (self.kind,))
+        if self.value is None and not self.nullable:
+            raise ValueError("%s: value is None but the setting is not nullable" % (self.key,))
         if self.kind != "bool":
             if float(self.hi) < float(self.lo):
                 raise ValueError("%s: hi (%r) is below lo (%r)" % (self.key, self.hi, self.lo))
@@ -203,7 +274,13 @@ def coerce(setting: Setting, value: Any) -> Any:
     A non-finite value (a NaN out of some upstream division) falls back to `lo` rather than
     propagating: `lo` is the least destructive value a measurement knob can take, and NaN has no
     ordering to clamp with anyway.
+
+    `None` SURVIVES UNTOUCHED on a nullable setting -- it is the "impose nothing" state, not a
+    missing number, so it must not be clamped into the range (which would silently turn "the
+    camera's own frame rate" into "20.0 fps, chosen by this software").
     """
+    if value is None and setting.nullable:
+        return None
     if setting.kind == "bool":
         return bool(value)
 
@@ -245,7 +322,7 @@ class SettingsModel:
     actually altered.
     """
 
-    def __init__(self, settings: Sequence[Setting]):
+    def __init__(self, settings: Sequence[Setting], group_notes: Optional[Dict[str, str]] = None):
         self._settings: List[Setting] = list(settings)
         self._index: Dict[str, Setting] = {}
         for s in self._settings:
@@ -255,6 +332,11 @@ class SettingsModel:
         #: values as loaded from the config file -- the target of `reset()` and the reference
         #: `changed()` compares against.
         self._baseline: Dict[str, Any] = {s.key: s.value for s in self._settings}
+        #: ``group -> one line drawn beside that group's heading``. Currently carries the one thing
+        #: a Camera row cannot say for itself: whether its limits were read from the camera or
+        #: taken from the datasheet. A range that is merely documented must not be presented with
+        #: the same authority as one the sensor reported.
+        self.group_notes: Dict[str, str] = dict(group_notes or {})
 
     # -- queries ---------------------------------------------------------------------------
     @property
@@ -313,12 +395,34 @@ class SettingsModel:
 
         A bool is not nudged around a cycle: right/up is ON, left/down is OFF, so the same key
         always produces the same state regardless of where the toggle happens to be.
+
+        NUDGING A ROW THAT IS AT ITS DEFAULT lands on `default_hint` (what the device is actually
+        doing) rather than one step away from it, because "one step from nothing" has no meaning.
+        Falling back to `lo` instead would send an operator who tapped an arrow key on the exposure
+        row from the camera's 5000 microseconds straight down to 20 -- a 250x change from a
+        keystroke that was meant to nudge.
         """
         setting = self.get(key)
         if setting.kind == "bool":
             return self.set(key, direction > 0)
+        if setting.value is None:
+            hint = setting.default_hint
+            return self.set(key, float(hint) if hint is not None else float(setting.lo))
         delta = float(setting.step) * (1 if direction > 0 else -1)
         return self.set(key, float(setting.value) + delta)
+
+    def to_default(self, key: str) -> Any:
+        """Put a nullable setting back to "impose nothing". Returns the stored value.
+
+        Refuses on a non-nullable setting rather than inventing a default for it: `pixel_threshold`
+        has no "device default" to fall back to, and `reset()` (back to the config file) is the
+        operation that row actually wants.
+        """
+        setting = self.get(key)
+        if not setting.nullable:
+            raise ValueError("%s has no device default to return to" % (key,))
+        setting.value = None
+        return None
 
     def reset(self) -> List[str]:
         """Put every setting back to the file's value. Returns the keys that actually moved."""
@@ -364,6 +468,8 @@ def _decimals_for(step: float) -> int:
 
 def format_value(setting: Setting) -> str:
     """The value as the operator should read it -- real units, no scaling tricks."""
+    if setting.value is None:
+        return DEFAULT_TEXT
     if setting.kind == "bool":
         return "ON" if setting.value else "OFF"
     if setting.kind == "int":
@@ -378,6 +484,48 @@ def format_bound(setting: Setting, bound: float) -> str:
     if setting.kind == "int":
         return "%d" % int(round(float(bound)))
     return "%.*f" % (_decimals_for(setting.step), float(bound))
+
+
+def format_hint(setting: Setting) -> str:
+    """"what the camera is doing", for a row that is imposing nothing. Empty when unknown.
+
+    The bounds are widened around the hint before formatting so a read-back is NEVER clamped into
+    the slider's range. This is the camera reporting a fact; showing "camera: 120.0 fps" because
+    the track happens to stop at 120 would be the display inventing a measurement.
+    """
+    hint = setting.default_hint
+    if hint is None:
+        return ""
+    probe = Setting(key=setting.key, label="", value=hint,
+                    lo=min(float(setting.lo), float(hint)),
+                    hi=max(float(setting.hi), float(hint)),
+                    step=setting.step, kind=setting.kind, group=setting.group,
+                    help="", unit=setting.unit)
+    return "camera: %s" % format_value(probe)
+
+
+def key_hint_lines(width: int, scale: float = HINT_SCALE) -> List[str]:
+    """`KEY_ROWS` packed greedily into lines that FIT `width`, measured with the real font.
+
+    Written as a measurement rather than a fixed split so the list stays readable when a key is
+    added: the previous single-string hint was 626 px wide on this 560 px panel, which silently
+    cut off the last two entries -- including how to close the window.
+    """
+    budget = max(1, int(width) - 2 * PAD)
+    lines: List[str] = []
+    current = ""
+    for key, what in KEY_ROWS:
+        item = "%s = %s" % (key, what)
+        candidate = ("%s   %s" % (current, item)) if current else item
+        (tw, _), _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        if current and tw > budget:
+            lines.append(current)
+            current = item
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 # ==========================================================================================
@@ -409,18 +557,58 @@ class SliderRect:
     track_y: int
     #: y of this row's group heading, or None when the row is not the first of its group.
     group_header_y: Optional[int] = None
+    #: True if this row can be returned to its device default, i.e. it carries a ``[d]`` badge and
+    #: its track is shortened to make room for one.
+    nullable: bool = False
+    #: True when the row currently holds NO value -- a camera setting left at the device default.
+    #: `render` draws such a row with no fill and no handle, and `on_track` refuses it, so the two
+    #: sides agree that there is nothing on the track to grab.
+    empty: bool = False
 
     @property
     def track_w(self) -> int:
         return max(1, self.track_x1 - self.track_x0)
 
+    @property
+    def default_x1(self) -> int:
+        """Right edge of the ``[d]`` badge -- the row's right margin, where the track would end
+        on a non-nullable row."""
+        return self.x + self.w - 6
+
+    @property
+    def default_x0(self) -> int:
+        return self.default_x1 - DEFAULT_BADGE_W
+
+    @property
+    def default_y(self) -> int:
+        return self.track_y - DEFAULT_BADGE_H // 2
+
     def contains(self, x: float, y: float) -> bool:
         return (self.x <= x < self.x + self.w) and (self.y <= y < self.y + self.h)
 
     def on_track(self, x: float, y: float) -> bool:
-        """True for a press close enough to the track to count as grabbing the handle."""
+        """True for a press close enough to the track to count as grabbing the handle.
+
+        NEVER true on an `empty` row. `render` draws a row that is at its device default with no
+        fill and no handle -- deliberately, because there is no value to point at -- but this hit
+        test used to accept a press anywhere in the 32 px band around the track, which INCLUDES
+        the row's help-text line. Clicking that line to select the row therefore imposed a value
+        near the slider's minimum on a setting the operator had left alone, and on a live camera
+        `on_change` routes straight to the sensor: one stray click took an 88 fps multi-day
+        recording down to 2.6 fps, and armed a drag that kept rewriting it. Leaving the device
+        default has to be a deliberate act, so it is done with the arrow keys (which land on the
+        setting's own `default_hint`, not near `lo`).
+        """
+        if self.empty:
+            return False
         return (self.track_x0 - HANDLE_R <= x <= self.track_x1 + HANDLE_R
                 and abs(y - self.track_y) <= TRACK_GRAB_PX)
+
+    def on_default_badge(self, x: float, y: float) -> bool:
+        """True for a press on the ``[d]`` badge. Always False on a row that has no default."""
+        return (self.nullable
+                and self.default_x0 <= x <= self.default_x1
+                and self.default_y <= y <= self.default_y + DEFAULT_BADGE_H)
 
 
 def panel_size(model: SettingsModel, width: int = PANEL_WIDTH) -> Tuple[int, int]:
@@ -449,12 +637,19 @@ def layout(model: SettingsModel, width: int, height: int) -> List[SliderRect]:
             y += GROUP_HEADER_H
         track_x0 = PAD + 6
         track_x1 = max(track_x0 + 1, int(width) - PAD - 6)
+        if s.nullable:
+            # Give the badge its own space instead of overlapping the track: a click there must
+            # mean "back to default" unambiguously, never "drag the handle to the far right".
+            track_x1 = max(track_x0 + 1, track_x1 - DEFAULT_BADGE_W - DEFAULT_BADGE_GAP)
         rects.append(SliderRect(
             key=s.key, index=i, group=s.group, kind=s.kind,
             lo=float(s.lo), hi=float(s.hi), step=float(s.step), odd=bool(s.odd),
             x=PAD, y=y, w=max(1, int(width) - 2 * PAD), h=ROW_H,
             track_x0=track_x0, track_x1=track_x1, track_y=y + 48,
-            group_header_y=header_y,
+            group_header_y=header_y, nullable=bool(s.nullable),
+            # Same condition `render` uses to draw an empty track, read from the SAME setting, so
+            # the drawn row and the clickable row can never disagree about whether it has a value.
+            empty=bool(s.nullable and s.value is None),
         ))
         y += ROW_H
     return rects
@@ -481,7 +676,13 @@ def value_at(rect: SliderRect, x: float) -> Any:
 
 
 def value_fraction(rect: SliderRect, value: Any) -> float:
-    """Where `value` sits along the track, in ``[0, 1]`` -- the inverse of `value_at`."""
+    """Where `value` sits along the track, in ``[0, 1]`` -- the inverse of `value_at`.
+
+    A row at its device default has no position (`render` draws no handle for it); 0.0 is returned
+    so callers that ask anyway get a number rather than a TypeError from ``float(None)``.
+    """
+    if value is None:
+        return 0.0
     if rect.kind == "bool":
         return 1.0 if value else 0.0
     span = float(rect.hi) - float(rect.lo)
@@ -512,18 +713,60 @@ def _right_text(vis: np.ndarray, text: str, right_x: int, y: int, color=COLOR_TE
     _text(vis, text, (int(right_x - tw), y), color, scale, thickness)
 
 
+def fit_text(text: str, budget_px: int, scale: float = 0.38) -> str:
+    """`text`, ellipsized to fit `budget_px` at the font size it will be drawn at.
+
+    REGRESSION THIS CLOSES. `cv2.putText` does not wrap or clip to anything -- it draws until it
+    runs out of image and the rest is simply gone. The exposure row's help line, once its
+    "(nothing sent - camera: 4990 us)" suffix was appended, measured 610 px on a 560 px panel: the
+    end of the sentence was painted off the edge of the canvas, and on a nullable row it would
+    have run under the `[d]` badge first. An ellipsis says "there is more"; silent truncation at
+    the canvas edge looks like a sentence that just stops.
+    """
+    text = str(text)
+    budget = int(budget_px)
+    if budget <= 0:
+        return ""
+    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+    if tw <= budget:
+        return text
+    for cut in range(len(text) - 1, 0, -1):
+        candidate = text[:cut].rstrip() + "..."
+        (tw, _), _ = cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        if tw <= budget:
+            return candidate
+    return ""
+
+
 def render(model: SettingsModel, rects: Sequence[SliderRect], width: int, height: int,
-           selected: int = 0, message: str = "", subtitle: str = "") -> np.ndarray:
+           selected: int = 0, message: str = "", subtitle: str = "",
+           blocked: Optional[Dict[str, str]] = None) -> np.ndarray:
     """Draw the panel. Pure: a model plus a layout in, a BGR image out; no window is touched.
 
     Each row shows, top to bottom: the label and the CURRENT VALUE IN REAL UNITS, one line of help
     in rig terms, the track with its filled portion and handle, and the two endpoint values under
     the ends of the track. A row whose value differs from the file's is marked; a row that cannot
     take effect until the next run says "next run" beside its label rather than pretending.
+
+    THREE STATES ARE VISUALLY DISTINCT, which is the whole point of the Camera group:
+
+      * IMPOSED -- a cyan number and a filled track: this software is sending this value.
+      * DEFAULT -- muted green "camera default", an empty greyed track, no handle, and a ``[d]``
+        badge: nothing is sent, the camera keeps what MVS left it at. Drawing a handle here (say,
+        parked at the camera's current reading) would make an unset row indistinguishable from a
+        row deliberately set to that same number, which is exactly the confusion this state exists
+        to remove.
+      * BLOCKED -- everything dimmed and the reason printed where the value goes, for a start-only
+        row while acquisition is running (`blocked[key]`, from `pipeline.setting_block_reason`).
+
+    `blocked` is passed per draw rather than baked into the settings, because the SAME model is
+    shared by the pre-run panel (where geometry is editable) and the mid-run ``t`` panel (where it
+    is not).
     """
     canvas = np.full((int(height), int(width), 3), COLOR_BG, np.uint8)
     settings = model.settings
     n_changed = len(model.changed())
+    blocked = blocked or {}
 
     # -- header ---------------------------------------------------------------------------
     _text(canvas, "TRACKING SETTINGS", (PAD, 32), COLOR_TEXT, 0.72, 2)
@@ -539,7 +782,14 @@ def render(model: SettingsModel, rects: Sequence[SliderRect], width: int, height
         s = settings[rect.index]
         if rect.group_header_y is not None:
             _text(canvas, s.group.upper(), (PAD, rect.group_header_y + 24), COLOR_GROUP, 0.5)
+            note = model.group_notes.get(s.group)
+            if note:
+                (gw, _), _ = cv2.getTextSize(s.group.upper(), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                _text(canvas, note, (PAD + gw + 14, rect.group_header_y + 24), COLOR_LABEL, 0.38)
 
+        block_reason = blocked.get(s.key)
+        is_blocked = block_reason is not None
+        is_default = s.value is None
         is_sel = rect.index == selected
         cv2.rectangle(canvas, (rect.x, rect.y + 2), (rect.x + rect.w, rect.y + rect.h - 4),
                       COLOR_ROW_SEL if is_sel else COLOR_ROW, -1)
@@ -551,44 +801,96 @@ def render(model: SettingsModel, rects: Sequence[SliderRect], width: int, height
         changed = s.value != model.baseline(s.key)
         if changed:
             cv2.circle(canvas, (label_x - 5, rect.y + 17), 3, COLOR_CHANGED, -1, cv2.LINE_AA)
-        _text(canvas, s.label, (label_x + 4, rect.y + 22), COLOR_TEXT, 0.5)
-        if not s.live:
+        _text(canvas, s.label, (label_x + 4, rect.y + 22),
+              COLOR_BLOCKED if is_blocked else COLOR_TEXT, 0.5)
+        badge = "next run" if not s.live else ("at next start" if s.start_only else "")
+        if badge:
             (lw, _), _ = cv2.getTextSize(s.label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            _text(canvas, "next run", (label_x + 12 + lw, rect.y + 22), COLOR_NEXTRUN, 0.4)
-        _right_text(canvas, format_value(s), rect.x + rect.w - 12, rect.y + 22, COLOR_VALUE, 0.6, 2)
+            _text(canvas, badge, (label_x + 12 + lw, rect.y + 22),
+                  COLOR_BLOCKED if is_blocked else COLOR_NEXTRUN, 0.4)
+
+        if is_blocked:
+            value_text, value_color = block_reason, COLOR_BLOCKED
+        elif is_default:
+            value_text, value_color = format_value(s), COLOR_DEFAULT
+        else:
+            value_text, value_color = format_value(s), COLOR_VALUE
+        _right_text(canvas, value_text, rect.x + rect.w - 12, rect.y + 22, value_color, 0.6,
+                    1 if is_blocked else 2)
 
         help_text = s.help
         if not s.live:
             help_text = "%s  (applies to the NEXT run, not this one)" % help_text
-        _text(canvas, help_text, (label_x + 4, rect.y + 38), COLOR_LABEL, 0.38)
+        elif is_default:
+            # STATE FIRST, DESCRIPTION SECOND, on a defaulted row. The line is one line and the
+            # camera rows are the longest on the panel, so something has to give when it is
+            # ellipsized -- and what the operator needs from a row they are LEAVING ALONE is what
+            # the camera is doing with it, not a definition of exposure.
+            hint = format_hint(s)
+            help_text = "nothing sent - %s  |  %s" % (
+                hint if hint else "the camera keeps what MVS left it at", help_text)
+        help_x = label_x + 4
+        help_limit = (rect.default_x0 - 6) if rect.nullable else (rect.x + rect.w - 6)
+        _text(canvas, fit_text(help_text, help_limit - help_x), (help_x, rect.y + 38),
+              COLOR_BLOCKED if is_blocked else COLOR_LABEL, 0.38)
 
         if s.kind == "bool":
             _draw_toggle(canvas, rect, bool(s.value))
         else:
-            _draw_track(canvas, rect, value_fraction(rect, s.value))
+            _draw_track(canvas, rect, value_fraction(rect, s.value),
+                        empty=is_default, dimmed=is_blocked)
+            bound_color = COLOR_BLOCKED if is_blocked else COLOR_LABEL
             _text(canvas, format_bound(s, s.lo), (rect.track_x0, rect.track_y + 22),
-                  COLOR_LABEL, 0.38)
+                  bound_color, 0.38)
             _right_text(canvas, format_bound(s, s.hi), rect.track_x1, rect.track_y + 22,
-                        COLOR_LABEL, 0.38)
+                        bound_color, 0.38)
+        if s.nullable and not is_blocked:
+            _draw_default_badge(canvas, rect, active=is_default)
 
     # -- footer ---------------------------------------------------------------------------
     foot_y = int(height) - FOOTER_H
     cv2.line(canvas, (PAD, foot_y), (int(width) - PAD, foot_y), COLOR_RULE, 1)
     if message:
         _text(canvas, message, (PAD, foot_y + 22), COLOR_VALUE, 0.44)
-    _text(canvas, KEY_HINT, (PAD, int(height) - 16), COLOR_LABEL, 0.4)
+    lines = key_hint_lines(int(width))
+    base_y = int(height) - 10 - HINT_LINE_H * (len(lines) - 1)
+    for i, line in enumerate(lines):
+        _text(canvas, line, (PAD, base_y + i * HINT_LINE_H), COLOR_LABEL, HINT_SCALE)
     return canvas
 
 
-def _draw_track(canvas: np.ndarray, rect: SliderRect, frac: float) -> None:
+def _draw_track(canvas: np.ndarray, rect: SliderRect, frac: float, *, empty: bool = False,
+                dimmed: bool = False) -> None:
+    """The track. `empty` (a row at its device default) draws NO handle and NO fill -- there is no
+    value to point at, and a handle parked anywhere would read as one."""
     y = rect.track_y
-    cv2.line(canvas, (rect.track_x0, y), (rect.track_x1, y), COLOR_TRACK, TRACK_THICKNESS,
-             cv2.LINE_AA)
+    base = COLOR_BLOCKED if dimmed else COLOR_TRACK
+    cv2.line(canvas, (rect.track_x0, y), (rect.track_x1, y), base, TRACK_THICKNESS, cv2.LINE_AA)
+    if empty:
+        return
     hx = int(round(rect.track_x0 + frac * rect.track_w))
     if hx > rect.track_x0:
-        cv2.line(canvas, (rect.track_x0, y), (hx, y), COLOR_FILL, TRACK_THICKNESS, cv2.LINE_AA)
-    cv2.circle(canvas, (hx, y), HANDLE_R, COLOR_HANDLE, -1, cv2.LINE_AA)
+        cv2.line(canvas, (rect.track_x0, y), (hx, y), COLOR_BLOCKED if dimmed else COLOR_FILL,
+                 TRACK_THICKNESS, cv2.LINE_AA)
+    cv2.circle(canvas, (hx, y), HANDLE_R, COLOR_BLOCKED if dimmed else COLOR_HANDLE, -1,
+               cv2.LINE_AA)
     cv2.circle(canvas, (hx, y), HANDLE_R, (40, 40, 40), 1, cv2.LINE_AA)
+
+
+def _draw_default_badge(canvas: np.ndarray, rect: SliderRect, active: bool) -> None:
+    """The ``[d]`` affordance on a nullable row: filled while the row IS at its default.
+
+    On the row rather than only in the footer, because "there is a way back to the camera's own
+    setting" is not something an operator will go looking for in a key list -- and clickable,
+    because every other control on this panel is worked with the mouse.
+    """
+    x0, x1 = rect.default_x0, rect.default_x1
+    y0, y1 = rect.default_y, rect.default_y + DEFAULT_BADGE_H
+    color = COLOR_DEFAULT if active else COLOR_RULE
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), color, -1 if active else 1)
+    (tw, th), _ = cv2.getTextSize("d", cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+    _text(canvas, "d", ((x0 + x1) // 2 - tw // 2, (y0 + y1) // 2 + th // 2),
+          (20, 20, 20) if active else COLOR_DEFAULT, 0.4)
 
 
 def _draw_toggle(canvas: np.ndarray, rect: SliderRect, value: bool) -> None:
@@ -612,10 +914,16 @@ def startup_banner(model: SettingsModel) -> str:
     for s in model.settings:
         if s.group != group:
             group = s.group
-            lines.append("  -- %s --" % group)
-        flag = "" if s.live else "   [takes effect NEXT RUN]"
+            note = model.group_notes.get(group)
+            lines.append("  -- %s --%s" % (group, ("   " + note) if note else ""))
+        if not s.live:
+            flag = "   [takes effect NEXT RUN]"
+        elif s.start_only:
+            flag = "   [takes effect at the NEXT START]"
+        else:
+            flag = ""
         lines.append("    %-34s %s%s" % (s.key, format_value(s), flag))
-    lines += ["", "  " + KEY_HINT, ""]
+    lines += [""] + ["  " + line for line in key_hint_lines(PANEL_WIDTH)] + [""]
     return "\n".join(lines)
 
 
@@ -663,7 +971,130 @@ def _cfg(config, path: str, default=None):
     return default if node is None else node
 
 
-def build_settings(config, pipeline=None) -> SettingsModel:
+def _cfg_optional(config, path: str):
+    """``config.a.b``, where a NULL value stays None instead of becoming a default.
+
+    `_cfg` cannot be reused for the camera rows: it folds "the key is null" into "the key is
+    missing" and hands back the caller's default, which is precisely the distinction the camera
+    tri-state is built on. A null `frame_rate` means "impose nothing"; silently substituting 20.0
+    would put the old forced value back on screen and, on save, back into the file.
+    """
+    node = config
+    for part in path.split("."):
+        try:
+            node = getattr(node, part)
+        except Exception:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+#: Upper end of each camera slider, where the sensor's own maximum is uselessly large. The
+#: MV-CA013 advertises exposure up to ~10 s; a 500 px track across 15 us..10 s is ~20 ms per pixel,
+#: so the ~5 ms this rig runs at would be literally unselectable by dragging. The camera's real
+#: limit still wins when it is LOWER than the cap, and the cap is never allowed to clip a value the
+#: config already holds (see `_camera_setting`) -- a slider must always be able to show the number
+#: the run is actually using.
+CAMERA_PANEL_CAPS = {
+    "ExposureTime": 50000.0,
+    "AcquisitionFrameRate": 120.0,
+    "Gain": 20.0,
+}
+
+#: The camera rows, in display order: ``(config key, node, label, unit, kind, help)``.
+#: Help lines are kept SHORT here, unlike the tracking rows: a camera row at its default prefixes
+#: its state to this text on the same single line, and anything longer gets ellipsized away.
+CAMERA_ROWS = [
+    ("frame_rate", "AcquisitionFrameRate", "frame rate", "fps", "float",
+     "frames per second delivered"),
+    ("exposure_us", "ExposureTime", "exposure", "us", "float",
+     "light collected per frame; more = brighter, blurrier"),
+    ("gain_db", "Gain", "gain", "dB", "float",
+     "electronic brightening; lifts noise too"),
+    ("width", "Width", "width", "px", "int",
+     "sensor width read out"),
+    ("height", "Height", "height", "px", "int",
+     "sensor height read out"),
+]
+
+
+def _camera_setting(key_attr, node, label, unit, kind, help_text, *, value, rng, hint):
+    """One camera row, with the panel's range derived from `rng` (the camera's or the datasheet's).
+
+    A value already in the config is never clipped away by `CAMERA_PANEL_CAPS`: the bounds are
+    widened to include it instead. A panel that opened showing 30 fps because its slider stopped
+    at 30, on a run configured for 88, would be describing a rig that does not exist.
+    """
+    lo, hi = float(rng.lo), float(rng.hi)
+    cap = CAMERA_PANEL_CAPS.get(node)
+    if cap is not None:
+        hi = min(hi, cap)
+    if value is not None:
+        lo, hi = min(lo, float(value)), max(hi, float(value))
+    if hint is not None:
+        hi = max(hi, float(hint))
+    step = float(rng.inc) if rng.inc > 0 else 1.0
+    if kind == "int":
+        step = max(1.0, round(step))
+    return Setting(
+        key="source.camera.%s" % key_attr, label=label, value=value,
+        lo=lo, hi=max(hi, lo + step), step=step, kind=kind, group="Camera", unit=unit,
+        help=help_text, nullable=True, default_hint=hint,
+        start_only=key_attr in CAMERA_START_ONLY_ATTRS,
+    )
+
+
+def build_camera_settings(config, camera=None, *, for_run: bool = False):
+    """The Camera rows plus the group note, or ``([], {})`` when there is nothing to offer.
+
+    Values come from the live `camera` when there is one (it may have been adjusted mid-run) and
+    from the config otherwise, with `None` preserved end to end in both cases. Limits come from
+    `frame_source.camera_ranges`, which reads the sensor when a camera is open and falls back to
+    documented values when it is not -- and the group note says WHICH, because a datasheet range
+    presented like a measured one is the kind of thing that gets believed.
+
+    `for_run=True` means "this panel belongs to a pipeline that is about to measure", and then the
+    rows are built ONLY if that pipeline's source is really a camera. A replay reads from a video
+    file: its config still carries a `source.camera` block (every config does), but there is no
+    sensor to send anything to, and the panel's standing rule is that it must never show a slider
+    the run cannot honour -- a knob that moves and changes nothing invites tuning against noise.
+    The standalone `settings` command has no run at all, so it always builds them: editing the
+    file for NEXT time is the entire job there.
+    """
+    if _cfg(config, "source.camera") is None:
+        return [], {}
+
+    ranges = camera_ranges(camera)
+    live_camera = camera if callable(getattr(camera, "set_frame_rate", None)) else None
+    if for_run and live_camera is None:
+        return [], {}
+    hints = {}
+    if live_camera is not None:
+        try:
+            hints = live_camera.current_values() or {}
+        except Exception:
+            hints = {}
+
+    settings = []
+    for key_attr, node, label, unit, kind, help_text in CAMERA_ROWS:
+        if live_camera is not None:
+            value = getattr(live_camera, key_attr, None)
+        else:
+            value = _cfg_optional(config, "source.camera.%s" % key_attr)
+        rng = ranges.get(node) or fallback_camera_ranges()[node]
+        settings.append(_camera_setting(
+            key_attr, node, label, unit, kind, help_text,
+            value=None if value is None else (int(value) if kind == "int" else float(value)),
+            rng=rng, hint=hints.get(key_attr),
+        ))
+
+    note = ("limits read from the camera" if any(r.live for r in ranges.values())
+            else "camera not open - limits are the rig camera's, not live")
+    return settings, {"Camera": note}
+
+
+def build_settings(config, pipeline=None, camera=None) -> SettingsModel:
     """The settings this build can actually route, seeded from `config` (and the live `pipeline`).
 
     Current values come from the PIPELINE when one is given, because that is what is measuring:
@@ -675,7 +1106,14 @@ def build_settings(config, pipeline=None) -> SettingsModel:
 
     Only routable parameters are built -- see the module docstring for the two families that were
     checked and left out.
+
+    `camera` is the `frame_source.HikCameraSource` to read limits and current values from; it
+    defaults to the pipeline's own source, so a `run` gets live sensor limits for free and a
+    `replay` (whose source is a video file) simply gets the documented ones.
     """
+    if camera is None:
+        camera = getattr(pipeline, "source", None)
+
     live_thr = getattr(pipeline, "pixel_threshold", None)
     thr = float(live_thr) if live_thr is not None else float(_cfg(config, "activity.pixel_threshold", 12.0))
 
@@ -717,7 +1155,9 @@ def build_settings(config, pipeline=None) -> SettingsModel:
             help="how straight motion must be to be the drum turning, not flies milling about",
         ),
     ]
-    return SettingsModel(settings)
+    camera_settings, group_notes = build_camera_settings(
+        config, camera, for_run=pipeline is not None)
+    return SettingsModel(settings + camera_settings, group_notes=group_notes)
 
 
 # ==========================================================================================
@@ -727,7 +1167,19 @@ _KEY_LINE = re.compile(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z_][A-Za-z0-9_\-]*)[ \
 
 
 def format_yaml_value(value: Any) -> str:
-    """A Python value as the scalar this config file would have written by hand."""
+    """A Python value as the scalar this config file would have written by hand.
+
+    `None` BECOMES `null`, AND THE LINE STAYS. Deleting the key would have been the other way to
+    say "impose nothing", and it is wrong twice over here. First, `config.load_config` deep-merges
+    the packaged `default_config.yaml` UNDER the run config, so a key that is absent is not an
+    absent value -- it is whatever the packaged default says, which is the opposite of what the
+    operator asked for. Second, this module's entire reason for hand-editing YAML instead of
+    round-tripping it through PyYAML is to preserve the comments that justify the numbers; a
+    deleted line takes its comment with it. `null` is what both shipped configs already use for an
+    unset camera field, so it is also what the file's own conventions expect.
+    """
+    if value is None:
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -940,6 +1392,12 @@ class SettingsWindow:
             than one per pixel. May return False to mean "not applied", which the panel shows.
         on_save: called with the model on ``s``; returns operator-readable notes to print/show.
         subtitle: one line under the title, e.g. which config file this panel will save to.
+        blocked: optional ``key -> reason | None``, asked AT EVERY DRAW. A key with a reason is
+            drawn greyed with the reason in place of its value, and refuses edits. Wired to
+            `pipeline.TrackerPipeline.setting_block_reason`, which blocks the start-only camera
+            geometry while acquisition is running -- the same model object is also used by the
+            pre-run panel, where those rows must stay editable, so this cannot be a property of
+            the settings themselves.
     """
 
     def __init__(
@@ -952,12 +1410,14 @@ class SettingsWindow:
         width: int = PANEL_WIDTH,
         max_view: Optional[Tuple[int, int]] = None,
         subtitle: str = "",
+        blocked: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         self.model = model
         self.on_change = on_change
         self.on_save = on_save
         self.window = window
         self.subtitle = subtitle
+        self._blocked = blocked
         self._max_view = max_view
 
         self.width, self.height = panel_size(model, width)
@@ -991,8 +1451,39 @@ class SettingsWindow:
         self.selected = min(len(self.rects) - 1, max(0, int(index)))
         return self.selected
 
+    def blocked_reason(self, key: str) -> Optional[str]:
+        """Why `key` cannot be edited right now, or None. Never raises -- a diagnostic that throws
+        would take down the panel it is meant to annotate."""
+        if self._blocked is None:
+            return None
+        try:
+            return self._blocked(key)
+        except Exception:
+            return None
+
+    def blocked_map(self) -> Dict[str, str]:
+        """``{key: reason}`` for every currently un-editable row, rebuilt per draw."""
+        if self._blocked is None:
+            return {}
+        out = {}
+        for s in self.model.settings:
+            reason = self.blocked_reason(s.key)
+            if reason:
+                out[s.key] = reason
+        return out
+
+    def _refuse_if_blocked(self, key: str) -> bool:
+        """True (and a status line) if `key` is blocked. The row is left exactly as it was."""
+        reason = self.blocked_reason(key)
+        if reason is None:
+            return False
+        self.note("%s: %s" % (self.model.get(key).label, reason))
+        return True
+
     def apply(self, key: str, value: Any) -> bool:
         """Set `key` and, only if the stored value actually moved, tell `on_change`."""
+        if self._refuse_if_blocked(key):
+            return False
         before = self.model.value(key)
         after = self.model.set(key, value)
         return self._changed(key, before, after)
@@ -1000,8 +1491,31 @@ class SettingsWindow:
     def nudge_selected(self, direction: int) -> bool:
         """One step on the selected row, through the same notification funnel as a drag."""
         key = self.rects[self.selected].key
+        if self._refuse_if_blocked(key):
+            return False
         before = self.model.value(key)
         after = self.model.nudge(key, direction)
+        return self._changed(key, before, after)
+
+    def default_selected(self) -> bool:
+        """``d``: return the selected row to its device default (impose nothing).
+
+        Goes out through the SAME `_changed` funnel as a drag, so the pipeline is told and the
+        change is logged like any other -- clearing a value mid-run is a regime change too.
+        """
+        key = self.rects[self.selected].key
+        return self.set_default(key)
+
+    def set_default(self, key: str) -> bool:
+        """Return one row to its device default. False (with a status line) if it has none."""
+        if self._refuse_if_blocked(key):
+            return False
+        setting = self.model.get(key)
+        if not setting.nullable:
+            self.note("%s has no camera default - r resets it to the config file" % setting.label)
+            return False
+        before = self.model.value(key)
+        after = self.model.to_default(key)
         return self._changed(key, before, after)
 
     def _changed(self, key: str, before: Any, after: Any) -> bool:
@@ -1031,15 +1545,31 @@ class SettingsWindow:
         return True
 
     def reset(self) -> None:
+        """``r``: every row back to the config file's value -- except the ones that are blocked.
+
+        A blocked row is greyed out and refuses a drag; letting ``r`` move it anyway would be the
+        one way round the guard, and would leave the panel showing a value the run is not using.
+        Blocked rows are restored to what they were and named, so nothing changes silently.
+        """
+        held = {s.key: s.value for s in self.model.settings if self.blocked_reason(s.key)}
         moved = self.model.reset()
+        for key, value in held.items():
+            self.model.set(key, value)
+        moved = [key for key in moved if key not in held]
         for key in moved:
             if self.on_change is not None:
                 try:
                     self.on_change(key, self.model.value(key))
                 except Exception:
                     pass
-        self.note(("reset %d setting(s) to the config file" % len(moved)) if moved
-                  else "nothing to reset")
+        if held and not moved:
+            self.note("nothing to reset (%d row(s) cannot change right now)" % len(held))
+        elif held:
+            self.note("reset %d setting(s); %d left alone (cannot change right now)"
+                      % (len(moved), len(held)))
+        else:
+            self.note(("reset %d setting(s) to the config file" % len(moved)) if moved
+                      else "nothing to reset")
 
     def save(self) -> None:
         if self.on_save is None:
@@ -1079,6 +1609,8 @@ class SettingsWindow:
             rect = self.rects[self.selected]
             if rect.kind == "bool":
                 self.apply(rect.key, not self.model.value(rect.key))
+        elif key == "d":
+            self.default_selected()
         elif key == "r":
             self.reset()
         elif key == "s":
@@ -1095,9 +1627,17 @@ class SettingsWindow:
             if rect is None:
                 return
             self.select(rect.index)
-            if rect.on_track(px, py):
+            if rect.on_default_badge(px, py):
+                self.set_default(rect.key)
+            elif rect.on_track(px, py):
                 self._dragging = rect
                 self.apply(rect.key, value_at(rect, px))
+            elif rect.empty:
+                # The row IS selected now, but nothing was imposed. Say how to leave the default,
+                # rather than let a click that visibly did nothing read as an unresponsive UI --
+                # which is what would push an operator into clicking harder, repeatedly.
+                self.note("%s is at the camera default - press the LEFT/RIGHT arrow keys to set "
+                          "a value" % self.model.get(rect.key).label)
         elif event == cv2.EVENT_MOUSEMOVE:
             if self._dragging is not None:
                 # Deliberately NOT re-hit-tested: once the handle is grabbed the drag follows the
@@ -1111,7 +1651,8 @@ class SettingsWindow:
     def canvas(self) -> np.ndarray:
         """The panel as it would appear right now (scaled to fit the desktop if need be)."""
         img = render(self.model, self.rects, self.width, self.height,
-                     selected=self.selected, message=self.message, subtitle=self.subtitle)
+                     selected=self.selected, message=self.message, subtitle=self.subtitle,
+                     blocked=self.blocked_map())
         if self._scale != 1.0:
             img = cv2.resize(img, (max(1, int(round(self.width * self._scale))),
                                    max(1, int(round(self.height * self._scale)))),

@@ -54,7 +54,7 @@ import numpy as np
 
 from flygym_tracker.activity import ActivityAccumulator, per_frame_activity
 from flygym_tracker.calibration import bbox_from_quad, quad_polygon_mask, shift_quad, vial_shape
-from flygym_tracker.frame_source import FrameSource, VideoFileSource
+from flygym_tracker.frame_source import START_ONLY_ATTRS, FrameSource, VideoFileSource
 from flygym_tracker.registration import apply_shift, estimate_shift
 from flygym_tracker.adaptive_rotation import AdaptiveRotationDetector
 from flygym_tracker.rotation import RotationDetector
@@ -76,6 +76,10 @@ DEFAULT_ENTER_K = 8.0
 DEFAULT_EXIT_K = 4.0
 #: Rolling window (frame count) for the observer-facing `fps_est` estimate (see `add_observer`).
 DEFAULT_FPS_WINDOW = 30
+#: Setting keys that cannot take effect until acquisition (re)starts -- derived from
+#: `frame_source.START_ONLY_ATTRS` rather than spelled again, so the two can never disagree about
+#: which knobs are safe to turn under a running experiment. See `setting_block_reason`.
+CAMERA_START_ONLY_KEYS = tuple("source.camera.%s" % a for a in START_ONLY_ATTRS)
 
 Bbox = Tuple[int, int, int, int]
 
@@ -93,6 +97,11 @@ def _fmt_setting(value) -> str:
     without decoding it, so a float keeps a visible decimal point (``12.0``, not ``12``) and never
     turns into ``1.2e+01``.
     """
+    if value is None:
+        # A camera setting cleared back to "unset". `None` in an events.csv cell reads like a
+        # missing field; "camera default" reads like what it is -- this software stopped imposing
+        # a value, so the sensor keeps whatever MVS gave it.
+        return "camera default"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
@@ -428,7 +437,63 @@ class TrackerPipeline:
         if hasattr(detector, "min_consistency"):
             routes["rotation.min_consistency"] = (
                 lambda: self.rotation.min_consistency, self._set_rotation_min_consistency)
+        routes.update(self._camera_setting_routes())
         return routes
+
+    def _camera_setting_routes(self):
+        """Camera routes for THIS run, or nothing at all when the source is not a camera.
+
+        Duck-typed on the setters rather than on `isinstance(source, HikCameraSource)`, matching
+        how `marker_detector` is treated: a replay from a video file has no `set_frame_rate`, so it
+        offers no camera rows and the panel says "not applied to this run" if one arrives anyway,
+        instead of a slider that appears to control a camera that is not there.
+
+        The setters live on the SOURCE, not here, because that is where the SDK handle is; this
+        table only decides which keys exist and routes them, so a camera change is logged by the
+        same `apply_setting` that logs a threshold change (see `apply_setting`). A mid-run camera
+        change IS a regime change -- an experiment whose exposure moved at hour 12 has two
+        different measurement conditions in one activity.csv, which is precisely what the
+        `setting_change` event exists to make visible.
+        """
+        source = self.source
+        routes = {}
+        for attr in ("width", "height", "exposure_us", "gain_db", "frame_rate"):
+            setter = getattr(source, "set_%s" % attr, None)
+            if not callable(setter):
+                continue
+            routes["source.camera.%s" % attr] = (
+                # Default arguments, not closure capture: a loop-captured `attr` would leave every
+                # getter reading the LAST attribute of the loop.
+                lambda a=attr: getattr(source, a, None),
+                lambda value, s=setter: s(value),
+            )
+        return routes
+
+    def setting_block_reason(self, key: str) -> Optional[str]:
+        """Why `key` cannot be changed right now, or None if it can be. Operator-readable.
+
+        Only the start-only camera geometry (`CAMERA_START_ONLY_KEYS`) is ever blocked, and only
+        while the camera is actually open. Width/Height are fixed at StartGrabbing time, so
+        applying one would mean stopping and restarting acquisition -- under an experiment that may
+        have been recording for days, that is a gap in the series PLUS a frame-diff baseline reset
+        (DESIGN.md §5.3), i.e. two incomparable regimes in one file with nothing marking the seam.
+        Not worth it for a geometry tweak, ever.
+
+        TWO DIFFERENT SITUATIONS, TWO DIFFERENT MESSAGES, because "the stream is running" would be
+        a baffling thing to read in a panel opened BEFORE the run. On this rig `run` opens the
+        camera during vial selection and hands it to the pipeline still open, so a `--settings`
+        panel can meet an already-open camera with zero frames processed. Geometry then belongs in
+        the standalone `settings` command, which never touches the camera at all -- and the message
+        says so instead of leaving the operator to guess.
+
+        The settings panel asks this to grey a row out; `apply_setting` asks it again as the
+        backstop, so a caller that never looked still cannot get a geometry change through.
+        """
+        if key in CAMERA_START_ONLY_KEYS and getattr(self.source, "is_acquiring", False):
+            if self._frames_seen > 0:
+                return "applies at next start - this run is recording"
+            return "the camera is already open - set this with the `settings` command"
+        return None
 
     # Each setter is spelled out rather than generated, so the set of attributes reachable from a
     # GUI is visible in one screenful. They also clamp: the detectors validate these in their
@@ -486,6 +551,8 @@ class TrackerPipeline:
         """
         route = self._setting_routes.get(str(key))
         if route is None:
+            return False
+        if self.setting_block_reason(str(key)) is not None:
             return False
         getter, setter = route
         try:

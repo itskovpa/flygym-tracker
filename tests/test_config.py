@@ -21,7 +21,27 @@ def test_defaults_load():
     assert cfg.output.format == "both"
     # dict-style access, nested
     assert cfg["binning"]["bin_seconds"] == 60
-    assert cfg["source"]["camera"]["width"] == 1280
+    assert cfg["source"]["camera"]["pixel_format"] == "Mono8"
+
+
+def test_every_adjustable_camera_setting_defaults_to_unset():
+    """The packaged defaults are the BASE layer every config merges onto, so a number here is a
+    value imposed on every rig that did not explicitly override it back to null. These five used to
+    hold 1280x1024 @ 20 fps, which meant a change made in MVS was silently reverted on the next
+    run and "start from the MVS settings" was not expressible at all."""
+    camera = load_config().source.camera
+    for key in ("width", "height", "exposure_us", "gain_db", "frame_rate"):
+        assert camera.get(key) is None, "%s is forced by the packaged default config" % key
+    # serial and pixel_format are NOT optional: one pins which physical camera this is, the other
+    # is the format the pipeline decodes.
+    assert camera.serial == "DA4282883"
+    assert camera.pixel_format == "Mono8"
+
+
+def test_the_rig_config_leaves_the_camera_alone_too():
+    camera = load_config("config/flygym_rig.yaml").source.camera
+    for key in ("width", "height", "exposure_us", "gain_db", "frame_rate"):
+        assert camera.get(key) is None, "%s is forced by the rig config" % key
 
 
 def test_defaults_to_dict_roundtrip():

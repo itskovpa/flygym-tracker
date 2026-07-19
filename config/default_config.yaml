@@ -3,14 +3,16 @@
 source:
   type: camera            # camera | video
   video_path: null        # used when type == video
-  # camera settings (HikRobot MvImport)
+  # camera settings (HikRobot MvImport). null = the tracker sends NOTHING for that node, so the
+  # camera keeps whatever MVS left it at. This is the base layer every config merges onto, so a
+  # number here would be imposed on every rig that did not explicitly override it back to null.
   camera:
     serial: "DA4282883"
-    width: 1280
-    height: 1024
-    exposure_us: null     # null = auto; pin (e.g. 20000) for a hard frame-rate cap
-    gain_db: null         # null = auto
-    frame_rate: 20        # target fps for acquisition
+    width: null           # sensor ROI width; start-only (needs the stream stopped)
+    height: null          # sensor ROI height; start-only
+    exposure_us: null     # microseconds; pin (e.g. 20000) for a hard frame-rate cap
+    gain_db: null         # dB
+    frame_rate: null      # fps
     pixel_format: "Mono8"
 
 calibration:

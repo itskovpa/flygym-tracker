@@ -88,6 +88,13 @@ logger = logging.getLogger(__name__)
 #: being routed the day the other was renamed.
 PIXEL_THRESHOLD_KEY = "activity.pixel_threshold"
 
+#: The banner's key hints, split so the settings one can be drawn in the accent colour. Kept as
+#: module constants (rather than inline strings) so a test can assert on the text that is actually
+#: drawn -- `cv2.putText` renders into pixels and returns nothing, so the string is the only
+#: checkable source of truth for what the operator sees.
+SETTINGS_HINT = "t settings (tracking + camera)"
+OTHER_KEYS_HINT = "q quit  p pause  +/- threshold  o roi  s snapshot"
+
 #: BGR (OpenCV convention) colours for the state banner + bar chart accents.
 _STATE_COLORS = {
     TrackState.STATIONARY: (0, 200, 0),
@@ -149,6 +156,7 @@ class LiveMonitor:
         on_setting_change: Optional[Callable[[str, object], object]] = None,
         settings_model=None,
         settings_on_save: Optional[Callable[[object], object]] = None,
+        settings_blocked: Optional[Callable[[str], Optional[str]]] = None,
         settings_window: str = "Tracking settings",
     ) -> None:
         self.calibration = calibration
@@ -175,6 +183,10 @@ class LiveMonitor:
         #: show and says so, rather than opening an empty window.
         self.settings_model = settings_model
         self._settings_on_save = settings_on_save
+        #: ``key -> reason | None``, asked per draw by the panel. Wired to
+        #: `pipeline.setting_block_reason` so the start-only camera geometry greys out while the
+        #: run is recording, instead of offering a slider that would need the stream restarted.
+        self._settings_blocked = settings_blocked
         self._settings_window_name = settings_window
         self._settings_window = None
 
@@ -339,8 +351,15 @@ class LiveMonitor:
             cv2.putText(img, "PAUSED", (w - 110, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 220, 255), 2, cv2.LINE_AA)
 
-        hint = "q quit  p pause  +/- threshold  t settings  o roi  s snapshot"
-        cv2.putText(img, hint, (12, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1, cv2.LINE_AA)
+        # THE SETTINGS KEY GOES FIRST, AND IN THE ACCENT COLOUR. It was already in this line, last
+        # of six, in the same grey as "o roi" -- and the rig owner still reported not finding the
+        # tracking/camera settings at all. A key nobody notices is a feature nobody has. The rest
+        # of the line stays grey so the emphasis means something.
+        cv2.putText(img, SETTINGS_HINT, (12, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (0, 235, 255), 1, cv2.LINE_AA)
+        (hw, _), _ = cv2.getTextSize(SETTINGS_HINT, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        cv2.putText(img, OTHER_KEYS_HINT, (12 + hw + 10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (150, 150, 150), 1, cv2.LINE_AA)
         return img
 
     def _render_live_view(self, w: int, h: int) -> np.ndarray:
@@ -589,6 +608,7 @@ class LiveMonitor:
                 self.settings_model,
                 on_change=self._notify_setting_change,
                 on_save=self._settings_on_save,
+                blocked=self._settings_blocked,
                 window=self._settings_window_name,
                 subtitle="live - changes take effect on the next frame",
             )

@@ -70,6 +70,7 @@ echo    calib  : %CALIB%
 echo    output : %OUTDIR%     bin: %BIN_SECONDS%s
 echo.
 echo    [1]  Start experiment      (asks about vial positions, then tracks)
+echo    [S]  Settings              (tracking + camera: frame rate, exposure, image size)
 echo    [2]  Draw vial positions   (16 polygons on the live feed; both faces)
 echo    [3]  Replay a recorded video
 echo    [4]  Measure noise floor
@@ -81,12 +82,27 @@ set /p CH="   Choose [1]: "
 if not defined CH set "CH=1"
 
 if /I "%CH%"=="1" goto run
+if /I "%CH%"=="S" goto settings
 if /I "%CH%"=="2" goto selectvials
 if /I "%CH%"=="3" goto replay
 if /I "%CH%"=="4" goto noise
 if /I "%CH%"=="5" goto freecam
 if /I "%CH%"=="Q" exit /b 0
 goto menu
+
+:settings
+echo.
+echo   Adjust tracking and camera settings, then press s to save them to "%CONFIG%".
+echo   Drag a slider, or use the arrow keys; q closes the window.
+echo   Camera rows are either an explicit value this software sends, or "camera default",
+echo   which means NOTHING is sent and the camera keeps whatever MVS was set to.
+echo   Press d (or click the [d] button on the row) to put a row back to the camera default.
+echo   Image width/height only take effect when a run starts - this is where to set them.
+echo   No camera is needed here. Add --probe-camera below to read the camera's real limits
+echo   (only when no experiment is running - the camera allows one program at a time).
+echo.
+%PY% -m flygym_tracker.cli settings --config "%CONFIG%"
+goto done
 
 :freecam
 echo.
@@ -101,8 +117,10 @@ goto done
 echo.
 echo   The round starts by offering the vial positions saved in "%CALIB%".
 echo   Press ENTER to reuse them, or answer n to draw them again on the live feed.
-echo   In the monitor window, press t for the tracking-settings sliders (drag them
+echo   In the monitor window, press t for the tracking + camera sliders (drag them
 echo   while the run continues; s in that window saves them to "%CONFIG%").
+echo   To set them BEFORE starting - including the image size, which cannot change
+echo   mid-run - quit here and choose [S] Settings from the menu instead.
 echo   Then: close the monitor window, or press Ctrl+C here, to stop the experiment.
 echo   IMPORTANT: make sure MVS is CLOSED - the camera allows only one program at a time.
 echo.

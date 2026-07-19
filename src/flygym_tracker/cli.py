@@ -65,7 +65,12 @@ from flygym_tracker.marker_band import MarkerBandDetector
 from flygym_tracker.markers import MarkerDetector
 from flygym_tracker.monitor import LiveMonitor
 from flygym_tracker.pipeline import TrackerPipeline, measure_noise
-from flygym_tracker.settings_panel import SettingsWindow, build_settings, save_settings_to_yaml
+from flygym_tracker.settings_panel import (
+    SettingsWindow,
+    build_settings,
+    save_settings_to_yaml,
+    startup_banner,
+)
 
 #: Shared "thresholds are missing" remediation, appended to the pipeline's own ValueError text.
 _THRESHOLD_HINT = (
@@ -272,6 +277,7 @@ def _run_pipeline_or_report(
     if settings and _settings_gui_available("--settings"):
         SettingsWindow(
             settings_model, on_change=pipe.apply_setting, on_save=save_hook,
+            blocked=pipe.setting_block_reason,
             subtitle="applies from the first frame - close this window to start",
         ).run()
         # The snapshot written when the logger was built records the config as LOADED. Anything
@@ -308,6 +314,7 @@ def _run_pipeline_or_report(
             on_setting_change=pipe.apply_setting,
             settings_model=settings_model,
             settings_on_save=save_hook,
+            settings_blocked=pipe.setting_block_reason,
         )
         pipe.add_observer(live_monitor.on_frame)
         pipe.add_bin_observer(live_monitor.on_bin)
@@ -888,6 +895,95 @@ def _cmd_replay(args) -> int:
 
 
 # =============================================================================================
+# settings (edit + save the tuning values, between runs)
+# =============================================================================================
+def _probe_camera_for_limits(config):
+    """Open the camera JUST to read its real min/max/increment, or explain why we did not.
+
+    Returns ``(camera_or_None, note_lines)``. Opt-in (``--probe-camera``) and never fatal.
+
+    WHY OPT-IN. USB3 Vision access is EXCLUSIVE -- one process at a time. If this command grabbed
+    the camera by default, then editing a value while an experiment was running would either fail,
+    or (worse, on a rig where the run had not started yet) hold the camera so the RUN could not
+    have it. Reading limits is a convenience; blocking an experiment for it is not a trade anyone
+    would take, so the default is to use the documented ranges and say so on screen.
+
+    When it IS asked for and the camera is busy, `camera_lock` names the holder rather than
+    printing the SDK's culprit-free "0x80000203" -- but nothing is stopped. This is a read-only
+    tuning command; ending someone's acquisition to draw a slider would be absurd.
+    """
+    source = _camera_source_from_config(config)
+    try:
+        source.open()
+    except Exception as exc:
+        lines = ["could not open the camera, so the limits shown are the rig camera's, not live:",
+                 "  %s" % exc]
+        if _looks_like_camera_busy(exc):
+            try:
+                from flygym_tracker import camera_lock
+                lines.append(camera_lock.report(camera_lock.find_camera_holders()))
+            except Exception:
+                pass
+        return None, lines
+    return source, ["camera open: the limits shown are this sensor's own"]
+
+
+def _cmd_settings(args) -> int:
+    """Open the settings panel against the config, adjust, save with ``s``, close.
+
+    THE POINT OF THIS COMMAND is that the panel existed but could not be found: it was reachable
+    only from `run`/`replay --settings` or the monitor's ``t`` key, i.e. only while something was
+    already running, and `run.bat` never passed the flag. Between-runs tuning had no entry point at
+    all. So this one needs NO camera and NO calibration bundle -- it edits a YAML file, and
+    demanding a rig be present to do that is what made the feature invisible in the first place.
+    """
+    try:
+        config = load_config(path=args.config)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    camera, notes = (None, [])
+    if args.probe_camera:
+        camera, notes = _probe_camera_for_limits(config)
+    for line in notes:
+        print(line)
+
+    try:
+        model = build_settings(config, camera=camera)
+        if args.list:
+            print(startup_banner(model))
+            return 0
+        if not has_gui_support():
+            print("\nERROR: " + gui_diagnosis("The settings panel")
+                  + "\n(`settings --list` prints the same values without a window.)",
+                  file=sys.stderr)
+            return 2
+        SettingsWindow(
+            model, on_save=_settings_saver(args.config),
+            subtitle="editing %s - press s to save, q to close" % (args.config or "the defaults"),
+        ).run()
+    finally:
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception as e:
+                print(f"warning: closing the camera failed: {e}", file=sys.stderr)
+
+    changed = model.changed()
+    if changed:
+        # `s` already saved anything the operator meant to keep; this is the "you closed without
+        # saving" case, and staying silent about it would lose work with no trace.
+        print("\n%d setting(s) were changed but NOT saved (press s in the panel to save):"
+              % len(changed))
+        for s in changed:
+            print("  %s: %s -> %s" % (s.key, model.baseline(s.key), s.value))
+    else:
+        print("\nsettings closed; %s is unchanged" % (args.config or "the config"))
+    return 0
+
+
+# =============================================================================================
 # argument parser
 # =============================================================================================
 def _cmd_free_camera(args) -> int:
@@ -1053,6 +1149,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_noise.add_argument("--frames", type=int, default=100, help="Number of frames to sample (default: 100).")
     p_noise.add_argument("--out", default=None, help="Write suggested thresholds as a config-override YAML.")
     p_noise.set_defaults(handler=_cmd_noise)
+
+    # -- settings -----------------------------------------------------------------------------
+    p_settings = subparsers.add_parser(
+        "settings",
+        help="Open the tracking + camera settings panel, adjust, save, close (no camera needed).",
+        description=(
+            "Adjust the tracking and camera settings BETWEEN runs and save them back to the "
+            "config file. Drag a slider (or use the arrow keys), press 's' to save and 'q' to "
+            "close. Camera rows are tri-state: each is either an explicit value this software "
+            "sends, or the camera's own default, in which case NOTHING is sent and the camera "
+            "keeps whatever MVS left it at -- press 'd' (or click the [d] badge) to put a row "
+            "back to that. Width and height only take effect when acquisition starts, which is "
+            "why they belong here rather than in a panel opened during a run. Needs no camera "
+            "and no calibration bundle; without --probe-camera the limits shown are documented "
+            "values and the panel says so."
+        ),
+    )
+    p_settings.add_argument("--config", default=None,
+                            help="Config YAML to edit (default: the packaged defaults only).")
+    p_settings.add_argument(
+        "--probe-camera", action="store_true",
+        help="Briefly open the camera to read its REAL limits. Off by default: USB3 Vision "
+             "access is exclusive, so grabbing the camera here could block a run.",
+    )
+    p_settings.add_argument("--list", action="store_true",
+                            help="Print the settings and exit, without opening a window.")
+    p_settings.set_defaults(handler=_cmd_settings)
 
     # -- free-camera --------------------------------------------------------------------------
     p_free = subparsers.add_parser(

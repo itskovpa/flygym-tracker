@@ -37,9 +37,24 @@ docs/                         reference frames
 pip install -r requirements.txt
 python -m flygym_tracker.cli noise      --config config/default_config.yaml   # measure noise floor
 python -m flygym_tracker.cli calibrate  --frame docs/frame_full.png           # build ROI calibration
+python -m flygym_tracker.cli settings   --config config/flygym_rig.yaml       # tracking + camera knobs
 python -m flygym_tracker.cli run        --config config/default_config.yaml   # live tracking
 python -m flygym_tracker.cli replay     --video path/to/clip.avi              # offline on a recording
 ```
+
+On the rig, `run.bat` wraps all of these in a menu; `[S] Settings` is the same panel as the
+`settings` command above, and the live monitor reopens it with `t` during a run.
+
+### Camera settings start from MVS
+
+Every camera setting in the config (`width`, `height`, `exposure_us`, `gain_db`, `frame_rate`) is
+`null` by default, which means the tracker sends **nothing** for it and the camera starts with
+whatever the MVS Viewer last left it at. Set one to a number to have the software impose it; press
+`d` on that row in the settings panel (or click its `[d]` badge) to go back to `null`. Frame rate,
+exposure and gain can be changed while a run is in progress; **width and height only take effect
+when acquisition starts**, so they are editable in `settings` but greyed out during a run — this
+rig records for days, and restarting the stream would put a gap and a diff-baseline reset in the
+middle of an experiment.
 
 Requires the HikRobot **MVS** runtime installed (for live capture); the `MvImport` Python SDK is
 loaded from the MVS install directory at runtime.
