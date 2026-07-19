@@ -219,14 +219,23 @@ def _calibration_for_round(args, source):
 
     reuse = True if getattr(args, "reuse", False) else (
         False if getattr(args, "redraw", False) else None)
+    n_vials = getattr(args, "n_vials", VIALS_PER_FACE)
     try:
-        result = load_or_select_vials(
-            source, args.calib, n_vials=getattr(args, "n_vials", VIALS_PER_FACE), reuse=reuse)
+        result = load_or_select_vials(source, args.calib, n_vials=n_vials, reuse=reuse)
     except (RuntimeError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
-        if _looks_like_camera_busy(e):
+        if not _looks_like_camera_busy(e) or not _offer_to_free_the_camera():
+            if _looks_like_camera_busy(e):
+                print(_CAMERA_BUSY_HINT, file=sys.stderr)
+            return None
+        # Something WAS holding it and has been stopped, so the thing that just failed is now
+        # possible. Retrying here saves re-running the whole menu with all its answers again.
+        try:
+            result = load_or_select_vials(source, args.calib, n_vials=n_vials, reuse=reuse)
+        except (RuntimeError, ValueError) as e2:
+            print(f"error: {e2}", file=sys.stderr)
             print(_CAMERA_BUSY_HINT, file=sys.stderr)
-        return None
+            return None
 
     if not result.polygons:
         print("no vials were selected; nothing to track", file=sys.stderr)
@@ -399,6 +408,23 @@ def _looks_like_camera_busy(exc: Exception) -> bool:
     return "already in use" in text or "may already be in use" in text or "openDevice".lower() in text
 
 
+def _offer_to_free_the_camera() -> bool:
+    """On a busy camera, name what is holding it and offer to stop it. True if something was.
+
+    Telling the operator to "close any other session" is useless when the holder is a headless
+    `Bonsai.exe --start --no-editor`: it has no window, no taskbar entry, and nothing on screen
+    to close, so the rig looks idle while staying locked. This finds it by name and PID.
+    """
+    from flygym_tracker import camera_lock          # imported lazily: shells out to PowerShell
+
+    print("\nlooking for what is holding the camera...", file=sys.stderr)
+    try:
+        return camera_lock.prompt_and_release() > 0
+    except Exception as e:                          # a diagnostic must never mask the real error
+        print(f"(could not check which program holds the camera: {e})", file=sys.stderr)
+        return False
+
+
 def _requested_faces(args) -> list:
     """Faces the drawn polygons apply to: ``--faces A,B`` (default), or ``--face X`` for one."""
     if getattr(args, "face", None):
@@ -434,7 +460,10 @@ def _cmd_select_vials(args) -> int:
     except (RuntimeError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         if _looks_like_camera_busy(e):
-            print(_CAMERA_BUSY_HINT, file=sys.stderr)
+            if not _offer_to_free_the_camera():
+                print(_CAMERA_BUSY_HINT, file=sys.stderr)
+            else:
+                print("\nthe camera is free now - run this again", file=sys.stderr)
         return 1
     finally:
         # Closed HERE, not with `with source:`: a close() failure must never throw away polygons
@@ -726,6 +755,24 @@ def _cmd_replay(args) -> int:
 # =============================================================================================
 # argument parser
 # =============================================================================================
+def _cmd_free_camera(args) -> int:
+    """Name whatever is holding the camera and offer to stop it (`camera_lock`)."""
+    from flygym_tracker import camera_lock
+
+    holders = camera_lock.find_camera_holders()
+    if args.list:
+        print(camera_lock.report(holders))
+        return 0
+    if args.yes:
+        # Unattended: still print everything first, so the log says exactly what was ended.
+        print(camera_lock.report(holders))
+        stopped = camera_lock.release_camera(holders, confirm=lambda _h: True)
+        for holder in stopped:
+            print("stopped PID %d  %s" % (holder.pid, holder.what or holder.name))
+        return 0 if stopped or not holders else 1
+    return 0 if camera_lock.prompt_and_release() or not holders else 1
+
+
 def _add_selection_flags(parser) -> None:
     """The vial-position flags shared by `run` and `replay`.
 
@@ -871,6 +918,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_noise.add_argument("--frames", type=int, default=100, help="Number of frames to sample (default: 100).")
     p_noise.add_argument("--out", default=None, help="Write suggested thresholds as a config-override YAML.")
     p_noise.set_defaults(handler=_cmd_noise)
+
+    # -- free-camera --------------------------------------------------------------------------
+    p_free = subparsers.add_parser(
+        "free-camera",
+        help="Find what is holding the camera (often an invisible headless Bonsai) and stop it.",
+    )
+    p_free.add_argument("--list", action="store_true",
+                        help="Only show what holds the camera; stop nothing.")
+    p_free.add_argument("--yes", action="store_true",
+                        help="Stop them without asking (for unattended restarts).")
+    p_free.set_defaults(handler=_cmd_free_camera)
 
     # -- run ----------------------------------------------------------------------------------
     p_run = subparsers.add_parser("run", help="Live tracking against the HikRobot camera.")

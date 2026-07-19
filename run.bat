@@ -73,6 +73,7 @@ echo    [1]  Start experiment      (asks about vial positions, then tracks)
 echo    [2]  Draw vial positions   (16 polygons on the live feed; both faces)
 echo    [3]  Replay a recorded video
 echo    [4]  Measure noise floor
+echo    [5]  Free the camera        (find what is holding it and stop it)
 echo    [Q]  Quit
 echo.
 set "CH="
@@ -83,8 +84,18 @@ if /I "%CH%"=="1" goto run
 if /I "%CH%"=="2" goto selectvials
 if /I "%CH%"=="3" goto replay
 if /I "%CH%"=="4" goto noise
+if /I "%CH%"=="5" goto freecam
 if /I "%CH%"=="Q" exit /b 0
 goto menu
+
+:freecam
+echo.
+echo   Only one program at a time may use the camera. The usual culprit is a
+echo   leftover Bonsai started with --no-editor: it has NO WINDOW, so the rig
+echo   looks idle while the camera is still locked.
+echo.
+%PY% -m flygym_tracker.cli free-camera
+goto done
 
 :run
 echo.
