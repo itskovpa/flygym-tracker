@@ -54,10 +54,14 @@ import numpy as np
 
 from flygym_tracker.activity import ActivityAccumulator, per_frame_activity
 from flygym_tracker.calibration import bbox_from_quad, quad_polygon_mask, shift_quad, vial_shape
-from flygym_tracker.frame_source import START_ONLY_ATTRS, FrameSource, VideoFileSource
+from flygym_tracker.frame_source import FrameSource, VideoFileSource
 from flygym_tracker.registration import apply_shift, estimate_shift
 from flygym_tracker.adaptive_rotation import AdaptiveRotationDetector
 from flygym_tracker.rotation import RotationDetector
+from flygym_tracker.settings_model import (
+    CAMERA_START_ONLY_KEYS,
+    start_only_block_reason,
+)
 from flygym_tracker.types import ActivityRecord, EventRecord, TrackState
 
 #: Default registration residual (0=perfect, ~1=uncorrelated) above which a shift is rejected.
@@ -76,10 +80,11 @@ DEFAULT_ENTER_K = 8.0
 DEFAULT_EXIT_K = 4.0
 #: Rolling window (frame count) for the observer-facing `fps_est` estimate (see `add_observer`).
 DEFAULT_FPS_WINDOW = 30
-#: Setting keys that cannot take effect until acquisition (re)starts -- derived from
-#: `frame_source.START_ONLY_ATTRS` rather than spelled again, so the two can never disagree about
-#: which knobs are safe to turn under a running experiment. See `setting_block_reason`.
-CAMERA_START_ONLY_KEYS = tuple("source.camera.%s" % a for a in START_ONLY_ATTRS)
+#: `CAMERA_START_ONLY_KEYS` is re-exported from `settings_model`, which is where the start-only
+#: RULE now lives too (`start_only_block_reason`). It used to be spelled here, which meant the Qt
+#: settings app -- which cannot import this module, since this module pulls cv2, calibration and
+#: the rotation detectors behind it -- would have needed a second copy of "is Width blocked right
+#: now". Two copies of a safety rule is one copy plus a future disagreement.
 
 Bbox = Tuple[int, int, int, int]
 
@@ -488,12 +493,15 @@ class TrackerPipeline:
 
         The settings panel asks this to grey a row out; `apply_setting` asks it again as the
         backstop, so a caller that never looked still cannot get a geometry change through.
+
+        THE RULE ITSELF IS `settings_model.start_only_block_reason`, not a reimplementation of it.
+        The Qt settings app asks that same function; if this method spelled the rule out again,
+        the two would answer the same question from two pieces of code, which is how a guard ends
+        up enforced in one surface and not the other. `closable=False` because a pipeline cannot
+        offer to close the camera -- it is measuring through it.
         """
-        if key in CAMERA_START_ONLY_KEYS and getattr(self.source, "is_acquiring", False):
-            if self._frames_seen > 0:
-                return "applies at next start - this run is recording"
-            return "the camera is already open - set this with the `settings` command"
-        return None
+        return start_only_block_reason(
+            key, self.source, recording=self._frames_seen > 0, closable=False)
 
     # Each setter is spelled out rather than generated, so the set of attributes reachable from a
     # GUI is visible in one screenful. They also clamp: the detectors validate these in their

@@ -18,6 +18,18 @@ dependencies = [
 [project.scripts]
 flygym-tracker = "flygym_tracker.cli:main"
 
+[project.gui-scripts]
+# A GUI entry point, not a console one: on Windows this builds `flygym-tracker-gui.exe` against
+# pythonw, so double-clicking it does not leave a black console window behind the app for the rest
+# of the session. The CLI stays a console script -- it has output to show.
+flygym-tracker-gui = "flygym_tracker.gui:main"
+
+[project.optional-dependencies]
+# The desktop app. Deliberately OPTIONAL: the rig runs unattended experiments from the CLI, and a
+# missing GUI toolkit must never be a reason for an overnight run to fail to start. LGPL, so it can
+# ship in a commercial product without licensing the product itself.
+gui = ["PySide6>=6.6"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

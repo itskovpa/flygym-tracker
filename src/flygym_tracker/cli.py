@@ -986,6 +986,51 @@ def _cmd_settings(args) -> int:
 # =============================================================================================
 # argument parser
 # =============================================================================================
+def _cmd_gui(args) -> int:
+    """Open the desktop app (settings + camera in one window).
+
+    THE APP IS THE CANONICAL SETTINGS SURFACE, and this is how it is reached from the terminal or
+    from `run.bat`. `flygym_tracker.gui.main` is imported INSIDE the function on purpose: importing
+    it at module scope would make every other subcommand -- including an unattended overnight
+    `run` -- depend on PySide6 being installed, which it must not.
+
+    The cv2 tools stay in their own processes rather than being called from the app. Measured: a
+    `QApplication` flips this process from DPI-UNAWARE to PER_MONITOR_AWARE, and
+    `live_vial_selector.screen_view_limit` depends on staying unaware -- its docstring documents
+    the regression that caused, where the bottom rows of every frame fell below the screen edge and
+    could not be clicked. See `flygym_tracker/gui/app.py`.
+    """
+    if args.print_paths:
+        return _print_gui_paths()
+
+    from flygym_tracker.gui import main as gui_main
+
+    argv = []
+    if args.config:
+        argv += ["--config", args.config]
+    return gui_main(argv)
+
+
+def _print_gui_paths() -> int:
+    """Print the app's remembered paths as ``NAME=value`` lines. Needs no Qt.
+
+    THIS IS WHAT STOPS `run.bat` AND THE APP DISAGREEING. The batch file used to carry CONFIG,
+    CALIB and OUTDIR in a header block the operator edited by hand; the app now owns them. If the
+    batch file kept its own copies, choosing an output folder in the app would silently not apply
+    to the menu's "Start experiment", and the results would appear somewhere the operator had just
+    told the program not to use. So the menu READS the app's state instead of duplicating it, and
+    falls back to the shipped defaults when the app has never run.
+    """
+    from flygym_tracker.gui import gui_state
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    state = gui_state.load_state(root)
+    print("CONFIG=%s" % (state.get("config_path") or "config\\flygym_rig.yaml"))
+    print("CALIB=%s" % (state.get("calib_dir") or "calib_faces"))
+    print("OUTDIR=%s" % (state.get("output_dir") or "output"))
+    return 0
+
+
 def _cmd_free_camera(args) -> int:
     """Name whatever is holding the camera and offer to stop it (`camera_lock`)."""
     from flygym_tracker import camera_lock
@@ -1150,10 +1195,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_noise.add_argument("--out", default=None, help="Write suggested thresholds as a config-override YAML.")
     p_noise.set_defaults(handler=_cmd_noise)
 
+    # -- gui ----------------------------------------------------------------------------------
+    p_gui = subparsers.add_parser(
+        "gui",
+        help="Open the desktop app: settings and a live camera preview in one window.",
+        description=(
+            "The settings app. Everything the `settings` command offers, plus a live preview to "
+            "tune exposure and gain against, the config/calibration/output folders that used to "
+            "live in run.bat, and a readiness check before a run. Needs PySide6; needs no camera "
+            "until you press Open camera, because USB3 Vision allows one program at a time."
+        ),
+    )
+    p_gui.add_argument("--config", default=None,
+                       help="Config YAML to edit (default: whichever was open last time).")
+    p_gui.add_argument("--print-paths", action="store_true",
+                       help="Print the app's remembered config/calibration/output paths and exit "
+                            "(this is how run.bat's menu stays in step with the app). No Qt needed.")
+    p_gui.set_defaults(handler=_cmd_gui)
+
     # -- settings -----------------------------------------------------------------------------
     p_settings = subparsers.add_parser(
         "settings",
-        help="Open the tracking + camera settings panel, adjust, save, close (no camera needed).",
+        help="The OLD cv2 settings panel. Prefer `gui`; this one needs an OpenCV GUI build.",
         description=(
             "Adjust the tracking and camera settings BETWEEN runs and save them back to the "
             "config file. Drag a slider (or use the arrow keys), press 's' to save and 'q' to "

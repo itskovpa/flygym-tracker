@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from flygym_tracker.types import Frame
@@ -206,16 +205,28 @@ class FrameSource(ABC):
 
 
 class VideoFileSource(FrameSource):
-    """Offline replay from a recorded video file (dev/replay path per DESIGN.md S3)."""
+    """Offline replay from a recorded video file (dev/replay path per DESIGN.md S3).
+
+    cv2 IS IMPORTED INSIDE THE METHODS, not at module scope, and that is not style. This module is
+    what the settings layer reads camera limits from (`camera_ranges`, `START_ONLY_ATTRS`), so a
+    module-level `import cv2` would put OpenCV -- the flakiest dependency in this stack, with a
+    headless build that silently shadows the GUI one -- underneath a Qt settings window that draws
+    nothing with it. `tests/test_frame_source.py` asserts that importing this module with cv2
+    blocked still works, so a settings app can open on a machine whose OpenCV install is broken,
+    which is exactly the machine whose operator most needs to look at their settings. Only VIDEO
+    REPLAY needs cv2, and only when it actually runs.
+    """
 
     def __init__(self, path: str):
         self.path = path
-        self._cap: Optional[cv2.VideoCapture] = None
+        self._cap = None
         self._next_index = 0
         self._fps = 0.0
         self._frame_size = (0, 0)
 
     def open(self) -> None:
+        import cv2
+
         if self._cap is not None:
             return
         cap = cv2.VideoCapture(self.path)
@@ -229,6 +240,8 @@ class VideoFileSource(FrameSource):
         self._next_index = 0
 
     def read(self) -> Optional[Frame]:
+        import cv2
+
         if self._cap is None:
             raise RuntimeError("VideoFileSource is not open; call open() first")
         ok, image = self._cap.read()

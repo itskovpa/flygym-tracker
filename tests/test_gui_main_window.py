@@ -1,0 +1,276 @@
+"""The whole window: the bands, the initial focus, the two things that confirm, and the shutdown.
+
+The confirmations are all driven through an INJECTED callable rather than a real `QMessageBox`, the
+same shape `camera_lock.release_camera(holders, confirm=...)` already established. Nothing in this
+file can block, and nothing can reach a real modal -- which is what lets a rig that runs unattended
+experiments also run its own test suite.
+"""
+from __future__ import annotations
+
+import os
+
+import pytest
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QAbstractSpinBox
+
+from flygym_tracker.config import load_config
+from flygym_tracker.gui import gui_state
+from flygym_tracker.gui.camera_session import CLOSED, STREAMING
+from flygym_tracker.gui.main_window import MainWindow
+from flygym_tracker.readiness import BAD
+
+from test_gui_camera_session import FakeSource
+
+
+@pytest.fixture
+def rig_config(tmp_path):
+    path = tmp_path / "rig.yaml"
+    path.write_text(
+        "binning:\n  bin_seconds: 60      # one row per minute\n"
+        "activity:\n  pixel_threshold: 12.0  # above the sensor noise floor\n"
+        "source:\n  camera:\n    frame_rate: null   # fps\n    exposure_us: null\n",
+        encoding="utf-8")
+    return str(path)
+
+
+@pytest.fixture
+def window(qapp, tmp_path, rig_config):
+    answers = []
+    state = gui_state.default_state()
+    state["config_path"] = rig_config
+    state["calib_dir"] = str(tmp_path / "calib")
+    state["output_dir"] = str(tmp_path / "out")
+    sources = []
+
+    def factory():
+        source = FakeSource()
+        sources.append(source)
+        return source
+
+    w = MainWindow(config=load_config(path=rig_config), config_path=rig_config, state=state,
+                   root=str(tmp_path), camera_factory=factory,
+                   confirm=lambda text: answers.append(text) or True)
+    w.answers = answers
+    w.sources = sources
+    w.show()
+    w.take_initial_focus()
+    yield w
+    w.session.shutdown()
+
+
+# =============================================================================================
+# The bands
+# =============================================================================================
+def test_the_window_has_all_five_bands(qapp, window):
+    """One window, no navigation: a nav rail for two things is ceremony."""
+    assert window.status_bar is not None
+    assert window.session_bar is not None
+    assert window.settings_view is not None and window.preview is not None
+    assert window.readiness_strip is not None
+    assert window.settings_view.save_button is not None
+
+
+def test_the_session_bar_shows_the_three_paths_run_bat_kept_in_a_batch_file(qapp, window,
+                                                                           rig_config, tmp_path):
+    assert window.session_bar.config_path() == rig_config
+    assert window.session_bar.calib_field.value() == str(tmp_path / "calib")
+    assert window.session_bar.output_field.value() == str(tmp_path / "out")
+
+
+def test_bin_seconds_is_a_settings_row_not_an_app_path(qapp, window):
+    """It decides what a row of the results MEANS, so it belongs in the experiment's YAML -- and
+    therefore in run_meta.json -- rather than in the app's own state file."""
+    assert "binning.bin_seconds" in window.settings_view.rows
+    assert "bin_seconds" not in window.state
+
+
+def test_the_camera_identity_names_whichever_selector_is_load_bearing(qapp, window):
+    """Serial wins in `_find_device`, and index is only consulted when no serial is pinned, so the
+    line names the one that decides -- rather than printing an undocumented `index` key the app
+    would otherwise inherit in silence."""
+    window.session_bar.set_camera_identity("DA4282883", 0)
+    assert "DA4282883" in window.session_bar.camera_label.text()
+    assert "index is ignored" in window.session_bar.camera_label.text()
+
+    window.session_bar.set_camera_identity(None, 2)
+    assert "index 2" in window.session_bar.camera_label.text()
+
+
+def test_the_missing_features_are_one_line_of_text_not_four_dead_buttons(qapp, window):
+    """Four disabled buttons are four things to try before reading the small print, and they make
+    the app look like it LOST features rather than not having grown them yet."""
+    from PySide6.QtWidgets import QPushButton
+
+    labels = [b.text() for b in window.findChildren(QPushButton)]
+    assert not any("Start experiment" in t for t in labels)
+    assert "run.bat" in window.elsewhere.text()
+
+
+# =============================================================================================
+# Initial focus
+# =============================================================================================
+def test_no_spinbox_holds_focus_when_the_window_opens(qapp, window):
+    """MEASURED: Qt auto-focuses the first focusable widget of a shown window, and here that would
+    be a settings spinbox -- so a stray keypress at 2 am would edit a camera setting before the
+    operator had looked at anything."""
+    qapp.processEvents()
+    focused = qapp.focusWidget()
+    assert not isinstance(focused, QAbstractSpinBox), type(focused).__name__
+    assert focused is window.filter_box
+
+
+def test_the_widget_that_takes_the_focus_edits_nothing(qapp, window):
+    """The worst a stray keystroke can do is hide some rows."""
+    before = {k: window.controller.model.value(k) for k in window.controller.model.keys()}
+    window.filter_box.setText("expo")
+    qapp.processEvents()
+    assert {k: window.controller.model.value(k) for k in window.controller.model.keys()} == before
+    assert window.settings_view.rows["source.camera.exposure_us"].isVisible()
+    assert not window.settings_view.rows["rotation.sensitivity"].isVisible()
+
+
+def test_filtering_hides_rows_without_excluding_them_from_the_file(qapp, window):
+    window.controller.commit("rotation.sensitivity", 2.0)
+    window.filter_box.setText("exposure")
+    qapp.processEvents()
+    assert any(s.key == "rotation.sensitivity" for s in window.controller.changed())
+
+
+# =============================================================================================
+# The camera, end to end through the window
+# =============================================================================================
+def test_the_window_does_not_touch_the_camera_until_asked(qapp, window):
+    assert window.session.state == CLOSED
+    assert window.sources == []
+
+
+def test_opening_the_camera_turns_the_status_bar_green_and_names_the_serial(qapp, window, pump):
+    window.open_camera()
+    assert pump(lambda: window.session.state == STREAMING, timeout=5.0)
+    qapp.processEvents()
+    assert "DA4282883" in window.status_bar.sentence.text()
+    assert window.status_bar.close_button.isEnabled() is True
+    assert window.status_bar.open_button.isEnabled() is False
+
+
+def test_free_the_camera_is_never_offered_while_this_app_is_the_holder(qapp, window, pump):
+    """Otherwise the app would be offering to kill itself, and the operator would have no way to
+    know that is what the button meant."""
+    assert window.status_bar.free_button.isEnabled() is True
+    window.open_camera()
+    assert pump(lambda: window.session.state == STREAMING, timeout=5.0)
+    qapp.processEvents()
+    assert window.status_bar.free_button.isEnabled() is False
+
+
+def test_a_live_setting_change_reaches_the_camera_once_it_is_open(qapp, window, pump):
+    window.open_camera()
+    assert pump(lambda: window.session.state == STREAMING, timeout=5.0)
+    window.settings_view.rows["source.camera.exposure_us"].arm_button.click()
+    qapp.processEvents()
+    assert pump(lambda: window.sources[0].sent != [], timeout=5.0)
+    assert window.sources[0].sent[0][0] == "exposure_us"
+
+
+def test_with_no_camera_open_a_camera_edit_is_stored_but_sent_nowhere(qapp, window):
+    """It is a config edit at that point, and it belongs in the file for the next run."""
+    window.settings_view.rows["source.camera.gain_db"].arm_button.click()
+    qapp.processEvents()
+    assert window.controller.model.value("source.camera.gain_db") is not None
+    assert window.sources == []
+
+
+def test_the_status_bar_never_says_measured_before_a_frame_has_been_timed(qapp, window):
+    """INVARIANT 6: a rate of zero next to the word "measured" is a claim nobody made."""
+    window.status_bar.set_state(STREAMING, "DA4282883 is yours", measured_fps=0.0)
+    assert "measured" not in window.status_bar.sentence.text()
+    window.status_bar.set_state(STREAMING, "DA4282883 is yours", measured_fps=88.5)
+    assert "88.5 fps delivered (measured)" in window.status_bar.sentence.text()
+
+
+# =============================================================================================
+# The readiness strip
+# =============================================================================================
+def test_a_missing_calibration_bundle_is_a_cross_on_the_strip(qapp, window):
+    window.refresh_readiness()
+    from flygym_tracker import readiness
+
+    result = readiness.evaluate(config_path=window.controller.config_path,
+                                calib_dir=window.state["calib_dir"],
+                                output_dir=window.state["output_dir"],
+                                camera_state=window.session.state)
+    assert any(c.key == "calibration" and c.state == BAD for c in result.checks)
+
+
+def test_a_row_armed_with_no_camera_shows_up_on_the_strip(qapp, window):
+    """The one experiment-ruining hazard in this surface, surfaced where it will be met before
+    saving rather than after."""
+    window.settings_view.rows["source.camera.frame_rate"].arm_button.click()
+    qapp.processEvents()
+    assert window.controller.never_checked() == ["source.camera.frame_rate"]
+    from flygym_tracker import readiness
+
+    check = readiness.check_unverified(window.controller.never_checked(),
+                                       {"source.camera.frame_rate": "frame rate"})
+    assert check.state == BAD
+
+
+# =============================================================================================
+# Saving and closing -- the only two things that confirm
+# =============================================================================================
+def test_saving_writes_the_yaml_and_keeps_its_comments(qapp, window, rig_config):
+    window.settings_view.rows["activity.pixel_threshold"].value_widget.setValue(20.0)
+    qapp.processEvents()
+    window.save_settings()
+    text = open(rig_config, encoding="utf-8").read()
+    assert "pixel_threshold: 20.0" in text
+    assert "# above the sensor noise floor" in text
+    assert "# one row per minute" in text
+
+
+def test_an_ordinary_save_asks_nothing(qapp, window):
+    window.settings_view.rows["activity.pixel_threshold"].value_widget.setValue(20.0)
+    qapp.processEvents()
+    window.save_settings()
+    assert window.answers == []
+
+
+def test_saving_a_value_no_camera_confirmed_asks_first(qapp, window):
+    window.settings_view.rows["source.camera.frame_rate"].arm_button.click()
+    qapp.processEvents()
+    window.save_settings()
+    assert len(window.answers) == 1
+    assert "0.1 fps" in window.answers[0]
+
+
+def test_closing_with_unsaved_changes_asks_and_can_be_cancelled(qapp, tmp_path, rig_config):
+    state = gui_state.default_state()
+    w = MainWindow(config=load_config(path=rig_config), config_path=rig_config, state=state,
+                   root=str(tmp_path), camera_factory=lambda: FakeSource(),
+                   confirm=lambda text: False)          # "cancel"
+    try:
+        w.show()
+        w.controller.commit("activity.pixel_threshold", 30.0)
+        event = QCloseEvent()
+        w.closeEvent(event)
+        assert event.isAccepted() is False, "the window closed over unsaved changes"
+    finally:
+        w.session.shutdown()
+
+
+def test_closing_releases_the_camera_before_the_window_goes_away(qapp, window, pump):
+    """LEAKING AN EXCLUSIVE USB3 HANDLE IS WHAT CREATES THE NEXT SESSION'S "camera is busy", with
+    nothing on screen to explain it."""
+    window.open_camera()
+    assert pump(lambda: window.session.state == STREAMING, timeout=5.0)
+    source = window.sources[0]
+    window.closeEvent(QCloseEvent())
+    assert source.closed >= 1
+    assert source.is_acquiring is False
+
+
+def test_closing_remembers_the_session_paths(qapp, window, tmp_path):
+    window.closeEvent(QCloseEvent())
+    assert os.path.isfile(tmp_path / "gui_state.json")
+    reloaded = gui_state.load_state(str(tmp_path))
+    assert reloaded["output_dir"] == window.state["output_dir"]
