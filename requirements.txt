@@ -1,4 +1,9 @@
 numpy>=1.24
+# MUST be the GUI build. Do NOT install `opencv-python-headless` alongside this: it provides the
+# same `cv2` module built with GUI:NONE, shadows this one, and makes every interactive feature
+# (calibration wizard, ROI editor, live monitor) fail with an obscure "function is not implemented"
+# error from cv2.imshow. If it ever gets pulled in as someone else's dependency:
+#     python -m pip uninstall -y opencv-python-headless && python -m pip install opencv-python
 opencv-python>=4.8
 pandas>=2.0
 pyyaml>=6.0

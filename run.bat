@@ -45,6 +45,20 @@ if errorlevel 1 (
   )
 )
 
+REM ---- OpenCV must be the GUI build or the editor/monitor cannot open a window ----
+%PY% -c "from flygym_tracker.gui_support import has_gui_support; raise SystemExit(0 if has_gui_support() else 3)" >nul 2>&1
+if errorlevel 3 (
+  echo.
+  echo   WARNING: this OpenCV build has no GUI support ^(opencv-python-headless^).
+  echo   The ROI editor and the live monitor cannot open a window.
+  set "FIXCV="
+  set /p FIXCV="  Fix it now? [Y/n]: "
+  if /I not "!FIXCV!"=="n" (
+    %PY% -m pip uninstall -y opencv-python-headless
+    %PY% -m pip install opencv-python
+  )
+)
+
 :menu
 cls
 echo ============================================

@@ -51,6 +51,7 @@ from flygym_tracker.calibration import (
     vial_quad,
 )
 from flygym_tracker.config import load_config
+from flygym_tracker.gui_support import gui_diagnosis, has_gui_support, require_gui
 from flygym_tracker.frame_source import HikCameraSource, VideoFileSource
 from flygym_tracker.logger import ActivityLogger
 from flygym_tracker.marker_band import MarkerBandDetector
@@ -160,6 +161,14 @@ def _run_pipeline_or_report(
 
     live_monitor = None
     if monitor:
+        if not has_gui_support():
+            # Not fatal: the run itself is headless-safe, so warn and keep acquiring.
+            print("\nWARNING: --monitor requested but this OpenCV build cannot open a window.\n"
+                  + gui_diagnosis("The live monitor")
+                  + "\nContinuing WITHOUT the monitor; measurement and logging are unaffected.\n",
+                  file=sys.stderr)
+            monitor = False
+    if monitor:
         live_monitor = LiveMonitor(
             calib, config, on_threshold_change=lambda v: setattr(pipe, "pixel_threshold", v),
         )
@@ -230,6 +239,7 @@ def _cmd_calibrate(args) -> int:
         calib, mask, overlay = None, None, None
 
     if args.wizard:
+        require_gui("The calibration wizard")
         calib, mask, overlay = run_wizard(gray, face=args.face, seed_boxes=seed_boxes, seed_present=seed_present)
 
     save_calibration(calib, mask, args.out, overlay=overlay)
@@ -411,6 +421,7 @@ def _cmd_edit_rois(args) -> int:
         print(f"error: {source}", file=sys.stderr)
         return 1
 
+    require_gui("The ROI editor")
     before = _lit_report(calib.faces[face], illum)
     print(f"editing face {face!r} from {source}")
     edited = run_roi_editor(gray, calib.faces[face], illum)
