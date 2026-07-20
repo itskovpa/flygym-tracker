@@ -96,14 +96,43 @@ def test_the_camera_identity_names_whichever_selector_is_load_bearing(qapp, wind
     assert "index 2" in window.session_bar.camera_label.text()
 
 
-def test_the_missing_features_are_one_line_of_text_not_four_dead_buttons(qapp, window):
-    """Four disabled buttons are four things to try before reading the small print, and they make
-    the app look like it LOST features rather than not having grown them yet."""
+def test_every_job_run_bat_used_to_offer_is_a_live_button_in_this_window(qapp, window):
+    """THIS TEST WAS INVERTED, AND ON PURPose.
+
+    It used to assert the opposite -- that starting a run, drawing vial positions, replaying a
+    recording and measuring the noise floor were NOT here, and that one line of text said they
+    were still in `run.bat`. That was right while they genuinely lived elsewhere: four disabled
+    buttons are four things to try before reading the small print.
+
+    They live here now. `run.bat` is a one-line launcher, so a line of text pointing at its menu
+    would point at a menu that no longer exists, and the assertion that guarded against dead
+    buttons has to become the assertion that they are alive instead.
+    """
     from PySide6.QtWidgets import QPushButton
 
     labels = [b.text() for b in window.findChildren(QPushButton)]
-    assert not any("Start experiment" in t for t in labels)
-    assert "run.bat" in window.elsewhere.text()
+    for expected in ("Start experiment", "Draw vial positions", "Replay a recording",
+                     "Measure noise floor"):
+        assert any(expected in text for text in labels), "%r is not in this window" % expected
+
+    # ALIVE, not merely present. A dead control is the thing the old test was written against.
+    assert window.run_panel.start_button.isEnabled() is True
+    assert window.run_panel.tool_draw_vials_button.isEnabled() is True
+    assert not hasattr(window, "elsewhere"), \
+        "the 'still in run.bat' line outlived the features moving in"
+
+
+def test_nothing_in_this_window_sends_the_operator_to_a_terminal(qapp, window):
+    """"No terminal prompt anywhere in the app." A button whose help says to go and type something
+    is the numbered menu again, wearing a different hat."""
+    from PySide6.QtWidgets import QLabel, QPushButton
+
+    texts = [w.text() for w in window.findChildren(QLabel)]
+    texts += [w.text() for w in window.findChildren(QPushButton)]
+    texts += [w.toolTip() for w in window.findChildren(QPushButton)]
+    for text in texts:
+        assert "run.bat" not in (text or ""), text
+        assert "python -m flygym_tracker" not in (text or ""), text
 
 
 # =============================================================================================
@@ -274,3 +303,63 @@ def test_closing_remembers_the_session_paths(qapp, window, tmp_path):
     assert os.path.isfile(tmp_path / "gui_state.json")
     reloaded = gui_state.load_state(str(tmp_path))
     assert reloaded["output_dir"] == window.state["output_dir"]
+
+
+# =========================================================================================
+# A run measures with what is ON SCREEN, not what was on disk at launch
+# =========================================================================================
+def test_a_run_uses_the_settings_the_operator_can_see(qapp, tmp_path):
+    """Regression, and the worst kind this project can produce: days of quietly wrong data.
+
+    `build_settings` seeds each Setting by COPYING out of the config, `SettingsModel.set` assigns
+    only to the Setting, and saving rewrites the FILE. Nothing wrote back into the live config
+    object, so a run built from it used whatever was on disk when the app launched. Measured
+    before the fix: set pixel threshold 12 -> 25, save (banner reads "no changes", file holds 25),
+    start the run -- and the pipeline measured at 12.0 for the whole run while the row showed 25.
+    run_meta.json recorded 12.0 as well, so nothing downstream could have caught it.
+    """
+    import shutil
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+    from test_gui_camera_session import FakeSource
+
+    cfgp = tmp_path / "rig.yaml"
+    shutil.copy("config/flygym_rig.yaml", cfgp)
+    win = MainWindow(config=load_config(path=str(cfgp)), config_path=str(cfgp),
+                     state=gui_state.default_state(), root=str(tmp_path),
+                     camera_factory=lambda: FakeSource(), confirm=lambda t: True)
+    try:
+        assert win.config.activity.pixel_threshold == 12.0
+
+        win.controller.commit("activity.pixel_threshold", 25.0)
+        # UNSAVED edits count too: what is on screen is what gets measured, which is the only
+        # rule that cannot surprise the operator.
+        assert win._config_for_run().activity.pixel_threshold == 25.0
+
+        win.save_settings()
+        assert win._config_for_run().activity.pixel_threshold == 25.0
+    finally:
+        win.session.shutdown()
+
+
+def test_the_run_config_still_imposes_nothing_on_an_untouched_camera_row(qapp, tmp_path):
+    """Invariant 1 must survive the fix: overlaying the model must not materialise camera keys."""
+    import shutil
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+    from test_gui_camera_session import FakeSource
+
+    cfgp = tmp_path / "rig.yaml"
+    shutil.copy("config/flygym_rig.yaml", cfgp)
+    win = MainWindow(config=load_config(path=str(cfgp)), config_path=str(cfgp),
+                     state=gui_state.default_state(), root=str(tmp_path),
+                     camera_factory=lambda: FakeSource(), confirm=lambda t: True)
+    try:
+        win.controller.commit("activity.pixel_threshold", 25.0)
+        cam = win._config_for_run().source.camera
+        for key in ("width", "height", "frame_rate", "exposure_us", "gain_db"):
+            assert cam.get(key) is None, "%s must stay unset -- the sensor keeps MVS's value" % key
+    finally:
+        win.session.shutdown()

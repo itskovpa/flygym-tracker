@@ -115,6 +115,42 @@ def test_arming_a_row_does_not_push_its_editor_off_the_edge(qapp, window):
         assert back.mapTo(view._body, back.rect().bottomRight()).x() <= viewport.width()
 
 
+@pytest.mark.parametrize("size", WINDOW_SIZES)
+def test_no_value_is_clipped_inside_its_own_field(qapp, window, size):
+    """THE DEFECT THIS WAS ADDED FOR, and it was found the same way the off-the-edge one was: by
+    rendering the window and looking at the picture.
+
+    Promoting the numeral to 15pt monospace and fixing the value column at 168px left a 112px
+    field. With the unit still set as the spinbox's suffix, "12.0 grey levels" rendered as
+    "12.0 gre" and "4 frames" as "4 frame" -- the hero of the row, truncated mid-word, on every
+    row that had a long unit. Every other test passed: a clipped value still reads back correctly
+    from `value()`, which is exactly the "the method works, the operator cannot use it" gap this
+    file exists for.
+
+    CLIPPING IS A NUMBER, so it is asserted rather than eyeballed: the width of the text Qt will
+    actually draw, against the width it has to draw it in.
+    """
+    window.resize(*size)
+    qapp.processEvents()
+    view = window.settings_view
+    for key in [k for k in view.rows if k.startswith("source.camera.")]:
+        view.rows[key].arm_button.click()
+    qapp.processEvents()
+
+    clipped = []
+    for key, row in view.rows.items():
+        box = row.value_widget
+        if box is None or not hasattr(box, "text"):
+            continue
+        needed = box.fontMetrics().horizontalAdvance(box.text())
+        # The frame's own padding, from the stylesheet (1px border + 6px padding each side).
+        available = box.width() - 14
+        if needed > available:
+            clipped.append((key, box.text(), needed, available))
+    assert clipped == [], "values clipped inside their fields at %dx%d: %r" % (
+        size[0], size[1], clipped)
+
+
 def test_the_preview_pane_keeps_a_usable_share_of_the_window(qapp, window):
     """Exposure and gain are tuned by looking at the picture. A settings pane that grew until the
     preview was a sliver would defeat the reason the two are side by side."""

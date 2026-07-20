@@ -30,6 +30,14 @@ def qapp():
     """One QApplication for the whole session -- Qt permits exactly one per process."""
     from PySide6.QtWidgets import QApplication
 
+    # EVERY ANIMATION COLLAPSES TO ZERO for the whole suite. The app has exactly two motion cues
+    # (a 140ms applied-flash and a 120ms state-spine crossfade), and both carry information rather
+    # than decoration -- but a test that has to WAIT for one is a test whose timing is a race. One
+    # flag, set once, keeps the suite deterministic without adding pytest-qt for a timer helper.
+    from flygym_tracker.gui import theme
+
+    theme.REDUCE_MOTION = True
+
     yield QApplication.instance() or QApplication([])
 
 

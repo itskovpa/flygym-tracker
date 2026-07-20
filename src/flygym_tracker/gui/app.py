@@ -83,7 +83,11 @@ def main(argv: Optional[list] = None) -> int:
     from flygym_tracker.gui import theme
 
     app.setApplicationName("FlyGym v2 Tracker")
-    app.setStyleSheet(theme.STYLESHEET)
+    # FONT FIRST, THEN STYLESHEET, and both through one call so a second entry point cannot do
+    # only half of it. The font carries a real POINT size: the old global `font-size: 13px` left
+    # every widget reporting `pointSize() == -1`, which is the precondition for the
+    # `QFont::setPointSize: Point size <= 0 (-1)` line the operator saw on every launch.
+    theme.apply(app)
 
     root = args.state_dir or _repo_root()
     state = gui_state.load_state(root)

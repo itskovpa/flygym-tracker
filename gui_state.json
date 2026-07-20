@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "config_path": "config/flygym_rig.yaml",
+  "calib_dir": "calib_faces",
+  "output_dir": "output",
+  "recent_configs": []
+}

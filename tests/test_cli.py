@@ -587,7 +587,23 @@ def test_the_settings_subcommand_is_registered_with_its_flags():
 
 
 # =============================================================================================
-# run.bat -- the menu entry, verified by PARSING the file
+# run.bat -- now a LAUNCHER, verified by PARSING the file
+#
+# THIS WHOLE SECTION WAS INVERTED, DELIBERATELY, AND THAT IS WORTH READING BEFORE CHANGING IT BACK.
+#
+# It used to assert that `run.bat` carried a numbered menu: [S] settings near the top, [1]..[5]
+# unrenumbered because those digits are what is written on the note stuck to the rig and what is in
+# the operator's fingers. Every one of those assertions was RIGHT for a file that was the way in.
+#
+# It is not the way in any more. Starting a run, drawing vial positions, replaying a recording,
+# measuring the noise floor and freeing the camera are all buttons in the window, so a menu here
+# would be a SECOND way to do the same five jobs -- and a second place for the paths, the defaults
+# and the wording to drift out of step with the app. The old tests would now be pinning a duplicate
+# surface in place.
+#
+# What is still true, and is what these tests guard, is the part a window cannot do for itself:
+# find a Python, put `src` on the path, and check the imports the app needs BEFORE the app tries to
+# open. A missing PySide6 has to be reported by something that is not PySide6.
 # =============================================================================================
 RUN_BAT = os.path.join(os.path.dirname(__file__), "..", "run.bat")
 
@@ -598,80 +614,59 @@ def _run_bat_text() -> str:
 
 
 def _menu_choices(text: str):
-    """``{choice: label}`` from the menu block -- e.g. ``{"1": "Start experiment ...", "S": ...}``."""
+    """``{choice: label}`` from any menu block. Expected to be EMPTY now."""
     return dict(re.findall(r"^echo\s+\[([^\]]+)\]\s+(.*)$", text, re.MULTILINE))
 
 
-def test_run_bat_offers_the_settings_entry_in_the_main_menu():
-    """The complaint that started this work was "I don't see the settings for tracking and activity
-    detection". The panel existed; the menu never mentioned it."""
+def test_run_bat_no_longer_offers_a_numbered_menu():
+    """"No terminal prompt anywhere in the app", and the menu was the last one. A digit typed at a
+    console is the interface the window replaced."""
     choices = _menu_choices(_run_bat_text())
-    assert "S" in choices, "no [S] entry in the run.bat menu (have: %s)" % sorted(choices)
-    label = choices["S"].lower()
-    assert "setting" in label
-    assert "camera" in label, "the entry must say it covers the camera controls too"
+    assert choices == {}, "run.bat still has a menu: %s" % sorted(choices)
 
 
-def test_the_settings_entry_is_listed_near_the_top_where_it_will_be_seen():
-    """Discoverability was the entire bug. Buried under "Free the camera" it would not be found."""
+def test_run_bat_launches_the_app_and_nothing_else():
+    """One command. If a second `cli` subcommand appeared here it would be a job the window also
+    offers, reachable two ways, with two sets of defaults."""
+    commands = re.findall(r"flygym_tracker\.cli\s+([a-z-]+)", _run_bat_text())
+    assert "gui" in commands, "run.bat does not launch the app"
+    assert set(commands) == {"gui"}, "run.bat still runs other subcommands: %s" % sorted(set(commands))
+
+
+def test_run_bat_does_not_ask_the_operator_to_choose_anything_about_the_experiment():
+    """`set /p` survives ONLY for the two install questions, which are about this computer rather
+    than about the experiment -- and which cannot move into an app that will not import."""
+    prompts = re.findall(r'set\s+/p\s+(\w+)=', _run_bat_text())
+    assert set(prompts) <= {"INSTALL", "FIXCV"},         "run.bat still prompts for experiment choices: %s" % sorted(set(prompts))
+
+
+def test_run_bat_still_checks_the_imports_the_window_cannot_report_on_itself():
+    """A missing PySide6 has to be reported by something that is not PySide6, or the operator gets
+    a traceback with no window behind it -- which is where a support call starts."""
     text = _run_bat_text()
-    order = [m.group(1) for m in re.finditer(r"^echo\s+\[([^\]]+)\]", text, re.MULTILINE)]
-    assert order.index("S") <= 1, "the settings entry is buried at position %d" % order.index("S")
+    assert "PySide6" in text
+    assert "requirements.txt" in text
 
 
-def test_the_settings_entry_does_not_renumber_the_entries_the_operator_already_knows():
-    """A letter, like [Q]. Renumbering 2..5 to make room would have broken every habit and every
-    note stuck to the rig."""
-    choices = _menu_choices(_run_bat_text())
-    assert choices.keys() >= {"1", "2", "3", "4", "5", "Q", "S"}
-    assert "experiment" in choices["1"].lower()
-    assert "replay" in choices["3"].lower()
-
-
-def test_every_run_bat_menu_choice_is_dispatched_and_lands_on_a_real_label():
-    """A menu entry with no `if` line, or one jumping to a label that does not exist, is a dead
-    key: the screen redraws and nothing happens."""
+def test_run_bat_still_warns_about_a_headless_opencv_build():
+    """The app draws with Qt and does not care. The tools it LAUNCHES -- vial drawing, replay with
+    the monitor -- do, and finding out from a child process that silently fails to open a window is
+    worse than being told here."""
     text = _run_bat_text()
-    dispatch = dict(re.findall(r'^if\s+/I\s+"%CH%"=="([^"]+)"\s+(?:goto\s+(\w+)|exit\s+/b\s+\d+)',
-                               text, re.MULTILINE))
-    labels = set(re.findall(r"^:(\w+)", text, re.MULTILINE))
-    for choice in _menu_choices(text):
-        assert choice in dispatch, "menu entry [%s] is never dispatched" % choice
-        target = dispatch[choice]
-        assert target == "" or target in labels, \
-            "[%s] jumps to :%s, which does not exist" % (choice, target)
+    assert "opencv-python-headless" in text
+    assert "has_gui_support" in text
 
 
-def test_the_settings_entry_actually_runs_the_settings_subcommand():
-    """The menu could say anything; what matters is the command it launches."""
+def test_run_bat_no_longer_hard_codes_the_experiment_paths():
+    """The app owns them: config file, vial positions and output folder are chosen in the window
+    and saved. A second copy here meant choosing an output folder in the app and still getting
+    results somewhere else."""
     text = _run_bat_text()
-    block = text.split(":settings", 1)[1].split("goto done", 1)[0]
-    assert "flygym_tracker.cli settings" in block
-    assert '--config "%CONFIG%"' in block, "it must edit the same config the experiment runs from"
+    for stale in ('set "CONFIG=', 'set "CALIB=', 'set "OUTDIR='):
+        assert stale not in text, "run.bat still sets a path: %s" % stale
 
 
-def test_the_settings_entry_does_not_need_the_camera_or_a_calibration_bundle():
-    """`--probe-camera` is opt-in; the menu entry must not pass it, or choosing Settings during a
-    run would fight the experiment for the camera. Asserted on the COMMAND LINE, not on the block:
-    the echoed help text is allowed to mention the flag, and does."""
-    block = _run_bat_text().split(":settings", 1)[1].split("goto done", 1)[0]
-    command = [ln for ln in block.splitlines() if "flygym_tracker.cli settings" in ln]
-    assert len(command) == 1
-    assert "--probe-camera" not in command[0]
-    assert "--calib" not in command[0]
-
-
-def test_starting_an_experiment_still_does_not_force_the_settings_panel_open():
-    """An unattended start must never block on a window nobody is there to close."""
-    text = _run_bat_text()
-    run_block = text.split(":run", 1)[1].split("goto done", 1)[0]
-    assert "cli run " in run_block
-    assert "--settings" not in run_block
-
-
-def test_run_bat_tells_the_operator_about_both_ways_into_the_settings():
-    """The `t` key during a run, and [S] before one -- the second matters because the image size
-    cannot change mid-run at all."""
-    run_block = _run_bat_text().split(":run", 1)[1].split("goto done", 1)[0].lower()
-    assert "press t" in run_block
-    assert "[s]" in run_block
+def test_run_bat_puts_src_on_the_path_so_the_package_imports_uninstalled():
+    """The one piece of environment setup that has to happen before Python is asked to import
+    anything from this repo."""
+    assert "PYTHONPATH" in _run_bat_text()

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import subprocess
 import sys
 
@@ -47,38 +46,58 @@ def test_print_paths_reports_the_apps_own_state_and_needs_no_qt(tmp_path, monkey
     assert names["CALIB"]
 
 
-def test_run_bat_reads_the_paths_from_the_app_instead_of_keeping_its_own():
+def test_run_bat_keeps_no_paths_of_its_own():
     """THE REGRESSION THIS PREVENTS. The batch file used to carry CONFIG/CALIB/OUTDIR in a header
     block the operator edited by hand. With the app owning them, a second copy here would mean
-    choosing an output folder in the app and still getting results somewhere else from the menu's
-    "Start experiment" -- the results appearing exactly where the operator had just said not to."""
+    choosing an output folder in the app and still getting results somewhere else -- the results
+    appearing exactly where the operator had just said not to.
+
+    It used to read them back with `gui --print-paths` so the menu and the app agreed. There is no
+    menu now, so there is nothing to keep in agreement: the app reads its own saved state.
+    """
     text = io.open(RUN_BAT, encoding="utf-8", errors="replace").read()
-    assert "gui --print-paths" in text
-    # The batch VARIABLE must be gone, not every mention of the name -- the comment explaining why
-    # it is gone names it, and asserting on the name alone would forbid the explanation.
-    assert 'set "BIN_SECONDS=' not in text, \
-        "bin size is a measurement parameter and belongs in the config YAML, not the launcher"
+    for stale in ('set "CONFIG=', 'set "CALIB=', 'set "OUTDIR=', 'set "BIN_SECONDS='):
+        assert stale not in text, "run.bat still carries a path of its own: %s" % stale
     assert "--bin-seconds" not in text
 
 
-def test_run_bat_makes_the_app_the_default_choice():
+def test_run_bat_goes_straight_into_the_app_with_nothing_to_choose():
+    """It used to make the app the DEFAULT choice on a menu ([A], first in the list, taken on
+    Enter). Being the default was the best a menu could do; not having a menu is better, and it is
+    what "no terminal prompt anywhere in the app" means for the file that starts it."""
     text = io.open(RUN_BAT, encoding="utf-8", errors="replace").read()
-    # A NEW LETTER, not a renumbering. `test_cli.py` asserts that [1]..[5] keep their meanings --
-    # they are what is written on the note stuck to the rig -- so the app becomes the obvious way
-    # in by being first in the list and the default on Enter, not by taking someone else's number.
-    assert 'if not defined CH set "CH=A"' in text
-    assert 'if /I "%CH%"=="A" goto app' in text
-    order = re.findall(r"^echo\s+\[([^\]]+)\]", text, re.MULTILINE)
-    assert order[0] == "A", "the app must be the first entry the operator reads"
+    assert "flygym_tracker.cli gui" in text
+    assert 'set /p CH=' not in text, "run.bat still asks the operator to choose"
+    assert ":menu" not in text
 
 
-def test_run_bat_still_offers_every_old_menu_entry():
-    """The menu is the operator's mental model of this program. Losing an entry to a redesign is
-    how a rig owner concludes the update broke something."""
-    text = io.open(RUN_BAT, encoding="utf-8", errors="replace").read()
-    for label in ("goto run", "goto selectvials", "goto replay", "goto noise", "goto freecam",
-                  "goto settings"):
-        assert label in text, "run.bat lost %r" % label
+def test_every_old_menu_entry_still_exists_somewhere_the_operator_can_reach_it(qapp, tmp_path):
+    """THE ORIGINAL CONCERN SURVIVES THE REDESIGN, and it is a real one: "the menu is the
+    operator's mental model of this program. Losing an entry to a redesign is how a rig owner
+    concludes the update broke something."
+
+    So the assertion moved rather than being dropped. The five jobs are no longer `goto` labels in
+    a batch file; they are buttons in the window, and this checks that ALL of them made the trip.
+    Deleting this test because the labels are gone would have been the exact failure it was written
+    to catch.
+    """
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+    from PySide6.QtWidgets import QPushButton
+
+    window = MainWindow(config=load_config(path="config/flygym_rig.yaml"),
+                        config_path="config/flygym_rig.yaml", state=gui_state.default_state(),
+                        root=str(tmp_path), camera_factory=lambda: None,
+                        confirm=lambda text: False)
+    try:
+        labels = " | ".join(b.text() for b in window.findChildren(QPushButton))
+        for job in ("Start experiment", "Draw vial positions", "Replay a recording",
+                    "Measure noise floor", "Free the camera"):
+            assert job in labels, "the app has no way to %r" % job
+    finally:
+        window.run.shutdown()
+        window.session.shutdown()
 
 
 def test_run_bat_no_longer_gates_the_settings_surface_on_an_opencv_gui_build():

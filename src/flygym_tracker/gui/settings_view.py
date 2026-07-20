@@ -27,8 +27,10 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-                               QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                               QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+
+from flygym_tracker.gui import theme
 
 from flygym_tracker.gui.setting_row import NullableSettingRow, SettingRow
 from flygym_tracker.settings_model import build_camera_settings
@@ -50,6 +52,18 @@ class SettingsView(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
+
+        #: STICKY, AT THE TOP OF THE PANE. The user asked for speed to iterate: typing "exp" to
+        #: reach exposure beats scrolling a thirty-row column, and it costs nothing structurally.
+        #: It is also the inert widget that takes the window's initial focus -- Qt auto-focuses the
+        #: first focusable widget of a shown window, which would otherwise be a settings spinbox,
+        #: and a stray keypress at 2 am would then edit a camera setting. The worst a stray
+        #: keystroke can do HERE is hide some rows.
+        self.filter_box = QLineEdit()
+        self.filter_box.setPlaceholderText("Type to filter the settings...")
+        self.filter_box.setClearButtonEnabled(True)
+        self.filter_box.textChanged.connect(self._on_filter)
+        outer.addWidget(self.filter_box)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -77,11 +91,37 @@ class SettingsView(QWidget):
 
     # -- construction --------------------------------------------------------------------------
     def _build_groups(self) -> None:
+        """A group is a tracked uppercase title, a live count, a hairline, and its rows.
+
+        THE QGroupBox FRAME IS GONE, DELIBERATELY. A bordered box containing rows containing
+        bordered fields containing bordered badges is four levels of frame, and boxes-inside-boxes
+        is most of what made this surface read as dull rather than as an instrument. Precision
+        gear groups things with hairlines and alignment, not nested containers. The frame is also
+        the most expensive chrome on screen in vertical pixels, which the rows want.
+
+        `QGroupBox` is still the widget, because `refresh_titles` sets the title through it and
+        `_group_boxes` is part of this class's shape -- it just carries no border. Restyling
+        rather than replacing keeps the title/count path exactly as it was.
+        """
         model = self.controller.model
         for group in model.groups():
             box = QGroupBox(group)
+            # FLAT, AND WITH NO BORDER. The title stays on the QGroupBox rather than moving to a
+            # QLabel of its own, because `refresh_titles` writes the live count into it and
+            # `tests/test_gui_settings_view.py` reads it back from there -- one string, one owner.
+            # Uppercasing it here would have meant forking that string, so the tracking and the
+            # caps from the visual direction are dropped rather than duplicating the count.
+            box.setFlat(True)
             layout = QVBoxLayout(box)
-            layout.setSpacing(2)
+            layout.setContentsMargins(0, 6, 0, 0)
+            layout.setSpacing(1)
+
+            # The hairline that replaces the frame. One rule under the title does the grouping
+            # that four nested borders were doing, and costs one pixel instead of ten.
+            rule = QFrame()
+            rule.setProperty("role", "rule")
+            rule.setFixedHeight(1)
+            layout.addWidget(rule)
 
             note = QLabel(model.group_notes.get(group, ""))
             note.setProperty("role", "note")
@@ -93,9 +133,19 @@ class SettingsView(QWidget):
             layout.addWidget(note)
             self._group_notes[group] = note
 
+            # ROWS ARE NOT CARDS. Thirty rounded tiles is thirty boxes of noise; a 1px hairline
+            # between rows separates them for a tenth of the ink and none of the vertical space.
+            # None after the last row -- a trailing rule reads as an empty row below the group.
+            first = True
             for setting in model.settings:
                 if setting.group != group:
                     continue
+                if not first:
+                    hairline = QFrame()
+                    hairline.setProperty("role", "hairline")
+                    hairline.setFixedHeight(1)
+                    layout.addWidget(hairline)
+                first = False
                 row_class = NullableSettingRow if setting.nullable else SettingRow
                 row = row_class(setting, self.controller)
                 row.edited.connect(self._on_row_edited)
@@ -111,13 +161,23 @@ class SettingsView(QWidget):
         layout.setContentsMargins(8, 4, 8, 4)
 
         self.change_label = QLabel("no changes")
+        # VIOLET, NOT A SECOND YELLOW. "Unsaved" and "imposed on the sensor" are different facts
+        # an operator acts on differently; the retired #FFC800 sat 8 degrees from the imposed
+        # amber and the two were one colour on a dim monitor at 2 am.
+        self.change_label.setStyleSheet(
+            "color: %s; font-family: %s;" % (theme.UNSAVED, theme.FONT_MONO))
         layout.addWidget(self.change_label, 1)
 
+        # The one outlined-amber control in the app, and a knowing exception to the reservation
+        # rule: saving is the action that needs weight. Flagged in `theme` rather than left to be
+        # discovered by whoever next wonders why amber appears on a button.
         self.save_button = QPushButton("Save to config")
+        self.save_button.setProperty("role", "primary")
         self.save_button.clicked.connect(self.save_requested)
         layout.addWidget(self.save_button)
 
         self.reset_button = QPushButton("Reset")
+        self.reset_button.setProperty("role", "ghost")
         self.reset_button.setToolTip("Put every row back to what the config file says.")
         self.reset_button.clicked.connect(self._on_reset)
         layout.addWidget(self.reset_button)
@@ -127,6 +187,17 @@ class SettingsView(QWidget):
     def _on_row_edited(self, key: str) -> None:
         self.refresh_titles()
         self.changed.emit()
+
+    def _on_filter(self, text: str) -> None:
+        """Hide rows whose label or help does not mention `text`. Hiding only -- never disabling.
+
+        A hidden row still holds its value and is still saved: filtering is a way to find a setting
+        in a list, not a way to exclude one from the file.
+        """
+        needle = (text or "").strip().lower()
+        for key, row in self.rows.items():
+            haystack = "%s %s %s" % (row.setting.label, row.setting.help, key)
+            row.setVisible(not needle or needle in haystack.lower())
 
     def _on_reset(self) -> None:
         """Reset is NOT confirmed: it restores the file's own values, which the file still holds.
