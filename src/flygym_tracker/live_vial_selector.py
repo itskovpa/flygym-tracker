@@ -139,6 +139,10 @@ class SelectorState:
         self.source_label = str(source_label)
         self.frozen = False
         self.finished = False          # set by q/ESC: "stop now, keep what I have"
+        #: True when this session opened on SAVED positions rather than an empty rig. It changes
+        #: exactly one rule (`done`), because a loaded session starts already complete and would
+        #: otherwise close itself before the operator could look at anything.
+        self.editing = False
         self.message = ""
         self._message_ttl = 0
         self._polygons: List[Polygon] = []
@@ -162,7 +166,14 @@ class SelectorState:
 
     @property
     def done(self) -> bool:
-        """True when the driver loop should stop: all vials drawn, or finished early."""
+        """True when the driver loop should stop: all vials drawn, or finished early.
+
+        EDITING NEVER ENDS BY ITSELF. A session opened on saved positions starts already complete
+        -- all 16 vials are there -- so the "all drawn, we are finished" rule would close it before
+        the operator could touch anything. While `editing` is on, only an explicit finish ends it.
+        """
+        if self.editing:
+            return self.finished
         return self.finished or self.is_complete
 
     @property
@@ -234,6 +245,70 @@ class SelectorState:
         """``q``/ESC: stop now and keep every vial finished so far."""
         self.finished = True
         self.note("finished with %d vial(s)" % len(self._polygons))
+
+    # -- editing an existing selection --------------------------------------------------------
+    def load(self, polygons: Sequence[Sequence[Sequence[float]]]) -> int:
+        """Adopt saved polygons as the finished vials, and switch to editing. Returns how many.
+
+        WHAT THIS FIXES. Reusing saved positions used to be all-or-nothing: keep them exactly as
+        they are, or throw them away and re-click all sixteen. There was no way to SEE what was
+        saved, let alone nudge one tube that had drifted -- so a bundle that was 15/16 right cost a
+        whole clicking session to correct, and the operator could not even tell that it was 15/16
+        right until the run was over.
+        """
+        self._polygons = [[[int(round(float(x))), int(round(float(y)))] for x, y in poly]
+                          for poly in polygons]
+        self._current = []
+        self.editing = True
+        self.note("%d saved vial(s) loaded - drag a corner to adjust one" % len(self._polygons))
+        return len(self._polygons)
+
+    def find_vertex(self, x: float, y: float, radius: float) -> Optional[Tuple[int, int]]:
+        """``(vial_index, vertex_index)`` of the finished corner nearest ``(x, y)``, or None.
+
+        NEAREST WITHIN `radius`, not the first one inside it: vial corners sit close together at
+        the column boundaries, and grabbing whichever happened to be earlier in the list would move
+        a neighbouring tube's corner instead of the one under the pointer.
+        """
+        best = None
+        best_d2 = float(radius) ** 2
+        for i, poly in enumerate(self._polygons):
+            for j, (px, py) in enumerate(poly):
+                d2 = (px - x) ** 2 + (py - y) ** 2
+                if d2 <= best_d2:
+                    best_d2 = d2
+                    best = (i, j)
+        return best
+
+    def move_vertex(self, vial: int, vertex: int, x: float, y: float) -> bool:
+        """Move one corner of one finished vial. False if the indices name nothing."""
+        if not (0 <= vial < len(self._polygons)):
+            return False
+        poly = self._polygons[vial]
+        if not (0 <= vertex < len(poly)):
+            return False
+        poly[vertex] = [int(round(float(x))), int(round(float(y)))]
+        self.note("vial %d: corner %d moved" % (vial + 1, vertex + 1))
+        return True
+
+    def reopen_vial(self, index: int) -> bool:
+        """Take a finished vial back into the pen so it can be re-clicked from scratch."""
+        if not (0 <= index < len(self._polygons)):
+            return False
+        if self._current:
+            self.note("finish or clear the vial in progress first")
+            return False
+        self._current = self._polygons.pop(index)
+        self.note("re-opened vial %d - BACKSPACE to remove corners, ENTER when done" % (index + 1))
+        return True
+
+    def start_over(self) -> None:
+        """Throw away every vial and draw from nothing."""
+        n = len(self._polygons)
+        self._polygons = []
+        self._current = []
+        self.editing = False
+        self.note("cleared %d vial(s) - drawing from scratch" % n)
 
     # -- transient status line --------------------------------------------------------------
     def note(self, text: str, ttl: int = MESSAGE_TTL) -> None:

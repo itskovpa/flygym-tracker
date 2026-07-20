@@ -616,3 +616,105 @@ def test_starting_a_new_job_clears_the_previous_result(qapp):
     stage.begin_face_learning()
     stage._pull()
     assert "pixel threshold" not in stage.caption.text()
+
+
+# =============================================================================================
+# Loading saved vial positions: visible AND editable
+# =============================================================================================
+def _square(x, y, w=20, h=30):
+    return [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+
+
+def test_saved_positions_open_on_the_picture_instead_of_behind_a_yes_no(qapp, tmp_path):
+    """Reuse used to be all-or-nothing: keep them exactly as they are, or throw them away and
+    re-click all sixteen. A bundle that was 15/16 right cost a whole clicking session, and nothing
+    on screen said it was 15/16 right."""
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    session.latest.put(_frame(200, 200))
+    stage._pull()
+    saved = [_square(10, 10), _square(50, 10), _square(90, 10)]
+    assert stage.begin_draw(out_dir=str(tmp_path / "b"), n_vials=16, polygons=saved)
+    assert stage.draw_session.state.polygons == saved, "the saved vials are not on the picture"
+    assert stage.draw_session.state.editing
+
+
+def test_a_loaded_session_does_not_close_itself(qapp, tmp_path):
+    """It opens ALREADY COMPLETE -- all 16 vials are there -- so the "all drawn, we are finished"
+    rule would end it before the operator could touch anything."""
+    from flygym_tracker.live_vial_selector import SelectorState
+
+    state = SelectorState(n_vials=3)
+    state.load([_square(0, 0), _square(30, 0), _square(60, 0)])
+    assert state.is_complete
+    assert not state.done, "a loaded session ended itself before anything could be edited"
+    state.finish_early()
+    assert state.done
+
+
+def test_dragging_a_corner_moves_that_corner_and_places_no_new_one(qapp, tmp_path):
+    """THE POINT OF "EDITABLE". Without the press being handled before the click, every attempt to
+    adjust a vial would instead add a vertex to it."""
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    session.latest.put(_frame(200, 200))
+    stage._pull()
+    stage.begin_draw(out_dir=str(tmp_path / "b"), n_vials=16, polygons=[_square(40, 40)])
+    draw = stage.draw_session
+
+    draw.on_press(40, 40)                       # exactly on the first corner
+    draw.on_click(40, 40)                       # the click that follows every press
+    draw.on_drag(44, 47)
+    draw.on_release(45, 48)
+
+    assert draw.state.polygons[0][0] == [45, 48], "the corner did not move"
+    assert len(draw.state.polygons[0]) == 4, "dragging added a vertex"
+    assert draw.state.current == [], "dragging started a new vial"
+
+
+def test_a_press_far_from_any_corner_still_places_a_new_vertex(qapp, tmp_path):
+    """Editing must not cost the ability to draw the vials that are still missing."""
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    session.latest.put(_frame(200, 200))
+    stage._pull()
+    stage.begin_draw(out_dir=str(tmp_path / "b"), n_vials=16, polygons=[_square(10, 10)])
+    draw = stage.draw_session
+
+    draw.on_press(150, 150)
+    draw.on_click(150, 150)
+    assert draw.state.current == [[150, 150]]
+    assert len(draw.state.polygons) == 1, "the loaded vial was disturbed"
+
+
+def test_start_over_throws_everything_away(qapp, tmp_path):
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    session.latest.put(_frame(200, 200))
+    stage._pull()
+    stage.begin_draw(out_dir=str(tmp_path / "b"), n_vials=16,
+                     polygons=[_square(10, 10), _square(50, 10)])
+    stage.draw_restart_button.click()
+    assert stage.draw_session.state.polygons == []
+    assert not stage.draw_session.state.editing
+
+
+def test_editing_a_loaded_selection_saves_the_edited_shape(qapp, tmp_path):
+    """End to end: load, nudge a corner, finish -- and the moved corner is what reaches disk."""
+    import json
+
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    session.latest.put(_frame(200, 200))
+    stage._pull()
+    out = tmp_path / "b"
+    stage.begin_draw(out_dir=str(out), n_vials=1, polygons=[_square(40, 40)])
+    draw = stage.draw_session
+    draw.on_press(40, 40)
+    draw.on_release(46, 49)
+    draw.finish()
+    qapp.processEvents()
+
+    saved = json.loads((out / "calibration.json").read_text())
+    face = list(saved["faces"].values())[0]
+    assert face["vials"][0]["polygon"][0] == [46, 49], "the edit did not reach the bundle"

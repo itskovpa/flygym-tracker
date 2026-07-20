@@ -37,14 +37,15 @@ from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMessageBox, QSplitter,
 from flygym_tracker import camera_lock, readiness
 from flygym_tracker.gui import gui_state
 from flygym_tracker.gui.camera_lock_dialog import CameraLockDialog, qt_confirm
-from flygym_tracker.gui.camera_session import CLOSED, STREAMING, CameraSession
+from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, OPENING, STREAMING,
+                                               CameraSession)
 from flygym_tracker.gui.camera_status import CameraStatusBar
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.run_controller import RunController
 from flygym_tracker.gui.run_panel import RunPanel
 from flygym_tracker.gui.session_bar import SessionBar
 from flygym_tracker.gui.settings_view import SettingsView
-from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE
+from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, STARTING
 from flygym_tracker.gui.video_stage import RUN as STAGE_RUN
 from flygym_tracker.gui.video_stage import VideoStage
 from flygym_tracker.settings_controller import (SettingsController, camera_block_reason,
@@ -55,6 +56,11 @@ from flygym_tracker.settings_model import build_app_settings
 #: number itself is counted in the worker from frames that arrived, and nothing is asked of the
 #: camera to produce it.
 STATUS_REFRESH_MS = 500
+
+#: How long `start_run` waits for the preview camera to actually release the device before giving
+#: up on a clean handover. Generous -- a close that takes longer than this has gone wrong, and the
+#: honest thing then is to say so rather than to start a run on a camera somebody else still holds.
+HANDOVER_TIMEOUT_MS = 6000
 
 
 class MainWindow(QMainWindow):
@@ -84,6 +90,8 @@ class MainWindow(QMainWindow):
             config_path=config_path,
             camera_open=lambda: self.session.is_open,
         )
+        #: A run was asked for while the preview still held the camera. See `start_run`.
+        self._pending_start = False
         self._build()
         self._connect()
         self.refresh_readiness()
@@ -190,6 +198,12 @@ class MainWindow(QMainWindow):
         self.session_bar.output_changed.connect(self._on_output_changed)
         self.readiness_strip.fix_requested.connect(self._on_fix)
 
+        # The handover watchdog. A single-shot timer rather than a wait: the GUI thread must stay
+        # responsive while the camera thread releases the device, or "seamless" becomes "frozen".
+        self._handover_timer = QTimer(self)
+        self._handover_timer.setSingleShot(True)
+        self._handover_timer.timeout.connect(self._handover_timed_out)
+
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(STATUS_REFRESH_MS)
         self._status_timer.timeout.connect(self._refresh_status)
@@ -207,6 +221,11 @@ class MainWindow(QMainWindow):
 
     def _on_camera_state(self, state: str, detail: str) -> None:
         self.status_bar.set_state(state, detail, measured_fps=self.session.measured_fps)
+        # THE HANDOVER COMPLETES HERE. `start_run` asked the preview to close and left; this is the
+        # camera thread reporting that the device is actually released, which is the first moment a
+        # run can legally open it.
+        if state == CLOSED and self._pending_start:
+            self._start_run_now()
         if state == STREAMING:
             # The limits are now this sensor's rather than the datasheet's, and they can differ
             # enough that a spinbox built from the fallbacks offers a value the SDK rejects.
@@ -372,19 +391,39 @@ class MainWindow(QMainWindow):
 
     # -- the run --------------------------------------------------------------------------------
     def start_run(self) -> None:
-        """Begin an experiment in this window.
+        """Begin an experiment in this window. ONE CLICK, no question.
 
-        THE PREVIEW CAMERA IS CLOSED FIRST, AND THE OPERATOR IS TOLD (invariant 5). USB3 Vision is
-        exclusive: the preview handle and the run's handle cannot both exist. Closing it silently
-        would make the live picture vanish with no explanation at the exact moment attention is
-        highest, so it is confirmed -- this is one of the few things worth a question, because it
-        is about to take the camera for hours or days.
+        WHAT THIS USED TO ASK, and why it is gone. USB3 Vision is exclusive, so the preview handle
+        and the run's handle cannot both exist; the preview has to close first. That was put behind
+        a confirm on the grounds that the picture vanishing unexplained at the moment attention is
+        highest would be alarming. In practice the operator has just pressed "Start experiment" --
+        handing the camera over IS what they asked for, and a dialog that only ever has one sensible
+        answer trains people to click past dialogs that matter.
+
+        THE PROMPT WAS ALSO HIDING A RACE, which is the part that had to be built rather than
+        deleted. `session.close()` only POSTS the close to the camera thread: `is_open` goes false
+        at once, but the SDK handle is released later, on that thread. The old code closed and
+        started the run in the same breath -- correct only because a human took a second or two to
+        read the dialog and click Yes. Remove the dialog and the run would routinely try to open a
+        camera the preview had not finished releasing, and the SDK's answer to that is a
+        culprit-free 0x80000203.
+
+        So the start is SEQUENCED: close the preview, remember that a run is wanted, and start it
+        from `_on_camera_state` when the camera reports CLOSED.
         """
-        if self.session.is_open:
-            if not self._ask("The run needs the camera to itself - USB3 Vision allows one holder "
-                             "at a time. Close the preview and start the run?"):
-                return
+        if self.session.is_open or self.session.state in (OPENING, CLOSING):
+            self._pending_start = True
+            self.stage.show_run()          # the picture switches now, not after the handover
+            self.run_panel.set_run_state(STARTING, "handing the camera to the run")
+            self._handover_timer.start(HANDOVER_TIMEOUT_MS)
             self.session.close()
+            return
+        self._start_run_now()
+
+    def _start_run_now(self) -> None:
+        """Build the plan and hand it to the run thread. The camera is free by now."""
+        self._pending_start = False
+        self._handover_timer.stop()
         plan = {
             # The MODEL, not `self.config`. See `_config_for_run`: the config object is what was
             # on disk when the app launched, and nothing an operator does on screen writes back
@@ -397,6 +436,7 @@ class MainWindow(QMainWindow):
         }
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
+            self.stage.show_camera()       # the run did not begin; stop implying it did
             return
         # THE EXPERIMENT IS WATCHED IN THIS WINDOW. The preview camera has just been handed over,
         # so without this the picture would sit on the last frame the preview saw -- a still of the
@@ -406,6 +446,21 @@ class MainWindow(QMainWindow):
         # algorithm keys into `TrackerPipeline.apply_setting`, which applies them AND logs them as
         # `setting_change` events (invariant 4).
         self.settings_view.refresh()
+
+    def _handover_timed_out(self) -> None:
+        """The preview never reported CLOSED. Say so; do not start a run on a held camera.
+
+        Starting anyway would meet the SDK's culprit-free 0x80000203 from inside a worker thread --
+        the exact failure `camera_lock` exists to diagnose, arriving with no diagnosis.
+        """
+        if not self._pending_start:
+            return
+        self._pending_start = False
+        self.stage.show_camera()
+        self.run_panel.set_run_state(
+            IDLE, "the preview camera did not release in %.0f s, so the run was not started - "
+                  "try Free the camera..." % (HANDOVER_TIMEOUT_MS / 1000.0))
+        self.refresh_readiness()
 
     def _config_for_run(self):
         """The config a run should actually be measured with: the values that are ON SCREEN.
@@ -525,14 +580,18 @@ class MainWindow(QMainWindow):
         """
         from flygym_tracker.calibration import saved_selection
 
+        # SAVED POSITIONS ARE LOADED AND SHOWN, NOT OFFERED BEHIND A YES/NO. Reuse used to be
+        # all-or-nothing: keep them exactly as they are, or throw them away and re-click all
+        # sixteen. There was no way to SEE what was saved, so a bundle that was 15/16 right cost a
+        # whole clicking session to correct -- and nothing on screen said it was 15/16 right.
+        # Now they open on the picture with draggable corners; "Start over" is still one button.
         saved = saved_selection(calib)
-        if saved is not None and not self._ask_redraw(saved):
-            return
+        polygons = saved.polygons if saved is not None else None
         # `calibration.VIALS_PER_FACE`, which is also the CLI's `--n-vials` default -- the drum's
         # geometry, not a preference, and it is not a config key precisely because it is the rig.
         from flygym_tracker.calibration import VIALS_PER_FACE
 
-        if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE):
+        if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE, polygons=polygons):
             self.refresh_readiness()
 
     def _ask_redraw(self, saved) -> bool:

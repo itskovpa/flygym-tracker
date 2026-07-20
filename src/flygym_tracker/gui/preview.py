@@ -188,8 +188,11 @@ class PreviewWidget(QWidget):
         position = event.position()
         point = self.to_image(position.x(), position.y())
         if point is not None:
-            self.clicked.emit(point[0], point[1])
+            # PRESSED FIRST, ALWAYS. A listener has to be able to decide "this press grabs an
+            # existing thing" BEFORE `clicked` places a new one -- otherwise every attempt to
+            # adjust a saved vial corner would add a vertex to it. See `vial_draw.on_press`.
             self.pressed.emit(point[0], point[1])
+            self.clicked.emit(point[0], point[1])
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:

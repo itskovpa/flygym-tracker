@@ -363,3 +363,76 @@ def test_the_run_config_still_imposes_nothing_on_an_untouched_camera_row(qapp, t
             assert cam.get(key) is None, "%s must stay unset -- the sensor keeps MVS's value" % key
     finally:
         win.session.shutdown()
+
+
+# =============================================================================================
+# Start experiment: one click, and the camera handover is sequenced rather than raced
+# =============================================================================================
+def test_starting_a_run_asks_nothing(qapp, window, pump):
+    """The operator has just pressed "Start experiment". Handing the camera over IS what they
+    asked for, and a dialog whose only sensible answer is Yes trains people to click past the
+    dialogs that matter."""
+    window.open_camera()
+    pump(lambda: window.session.is_open)
+    before = len(window.answers)
+    window.run.start = lambda plan: True
+    window.start_run()
+    qapp.processEvents()
+    assert window.answers[before:] == [],         "starting the run asked a question: %r" % (window.answers[before:],)
+    window.run.shutdown()
+
+
+def test_the_run_waits_for_the_camera_to_actually_be_released(qapp, window, pump):
+    """THE RACE THE OLD PROMPT WAS HIDING. `session.close()` only POSTS the close to the camera
+    thread: `is_open` goes false at once, but the SDK handle is released later, on that thread.
+    Closing and starting in the same breath was correct only because a human took a second or two
+    to read the dialog. Without it, the run would try to open a camera the preview still holds --
+    and the SDK's answer to that is a culprit-free 0x80000203.
+    """
+    started = []
+    window.run.start = lambda plan: started.append(plan) or True
+    window.open_camera()
+    pump(lambda: window.session.is_open)
+
+    window.start_run()
+    assert started == [], "the run was started before the camera reported CLOSED"
+    assert window._pending_start, "nothing remembered that a run was wanted"
+
+    pump(lambda: bool(started), timeout=5.0)
+    assert started, "the run never started after the camera closed"
+    assert not window._pending_start
+    window.run.shutdown()
+
+
+def test_the_picture_switches_to_the_run_immediately_but_does_not_claim_to_be_it(
+        qapp, window, pump):
+    """"Seamless" must not become "dishonest": for the second or two of the handover what is on
+    screen is the preview's LAST frame, and captioning that as the experiment is the same class of
+    claim as calling a recording live."""
+    from flygym_tracker.gui.video_stage import RUN
+
+    window.run.start = lambda plan: True
+    window.open_camera()
+    pump(lambda: window.session.is_open)
+    window.start_run()
+    qapp.processEvents()
+
+    assert window.stage.mode == RUN, "the picture did not switch to the run"
+    window.stage._update_caption()
+    assert "not the run" in window.stage.caption.text(), window.stage.caption.text()
+    window.run.shutdown()
+
+
+def test_a_camera_that_never_releases_does_not_silently_start_a_run(qapp, window):
+    """Starting anyway would meet the SDK's culprit-free error from inside a worker thread -- the
+    exact failure `camera_lock` exists to diagnose, arriving with no diagnosis."""
+    from flygym_tracker.gui.video_stage import CAMERA
+
+    started = []
+    window.run.start = lambda plan: started.append(plan) or True
+    window._pending_start = True
+    window._handover_timed_out()
+    assert started == []
+    assert not window._pending_start
+    assert window.stage.mode == CAMERA
+    assert "did not release" in window.run_panel.state_label.text()

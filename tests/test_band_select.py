@@ -24,9 +24,30 @@ from flygym_tracker.calibration import (attach_band_rows, calibration_band_rows,
 BUNDLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "calib_faces")
 
 
-def _bundle(tmp_path) -> str:
+def _bundle(tmp_path, *, band=False, templates=False) -> str:
+    """A private copy of the repo's bundle, with the marker keys under test REMOVED by default.
+
+    THE FIXTURE STRIPS THEM ON PURPOSE. `calib_faces/` is a live working bundle -- the rig owner
+    marks a band and learns faces into it from the app, and those writes land in the working tree.
+    A test that asserted "this bundle has no band yet" therefore passed only until somebody used
+    the feature it was testing, which is exactly what happened: the rig owner marked rows
+    [451, 639] and three tests turned red without a line of source changing. What is under test is
+    the BEHAVIOUR of attach/read, not the current contents of a file that is meant to change.
+    """
     out = str(tmp_path / "calib_faces")
     shutil.copytree(BUNDLE, out)
+    path = os.path.join(out, "calibration.json")
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    drop = ([] if band else ["band_rows"]) + ([] if templates else ["band_templates",
+                                                                    "band_detector"])
+    for face in (payload.get("faces") or {}).values():
+        marker = face.get("marker")
+        if isinstance(marker, dict):
+            for key in drop:
+                marker.pop(key, None)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
     return out
 
 
@@ -50,7 +71,7 @@ def test_saving_the_band_does_not_touch_a_single_hand_drawn_vertex(tmp_path):
     """`calib_faces/` holds polygons drawn by hand, one click per vertex, and they are NOT
     reproducible. The same protection `attach_face_templates` has, for the same reason."""
     out = _bundle(tmp_path)
-    before = json.load(open(os.path.join(BUNDLE, "calibration.json"), encoding="utf-8"))
+    before = json.load(open(os.path.join(out, "calibration.json"), encoding="utf-8"))
     attach_band_rows(out, (400, 600))
     after = json.load(open(os.path.join(out, "calibration.json"), encoding="utf-8"))
     for face in before["faces"]:

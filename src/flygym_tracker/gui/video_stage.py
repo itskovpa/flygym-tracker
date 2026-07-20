@@ -131,6 +131,9 @@ class VideoStage(QWidget):
         self._job_kind = ""                   # "noise" | "faces", in JOB
         self._job_note = ""
         self._tap_error = ""                  # why a camera-backed job ended, if it ended badly
+        #: True once the RUN has actually delivered a frame. Until then the picture is the
+        #: preview's last one and the caption must not claim otherwise -- see `_update_caption`.
+        self._run_frames = False
         #: What the last video job produced, kept on screen until something else happens.
         #:
         #: BECAUSE THE CAPTION IS REWRITTEN EVERY 50 ms. `_pull` refreshes it from the current
@@ -196,6 +199,8 @@ class VideoStage(QWidget):
         self.draw_undo_vial_button = _button(
             "Re-open last vial", "Re-open the previous vial for editing. (u)")
         self.draw_clear_button = _button("Clear vial", "Throw away this vial and start it. (c)")
+        self.draw_restart_button = _button(
+            "Start over", "Throw away EVERY vial and draw all of them from nothing.")
         self.draw_done_button = _button(
             "Save and finish", "Keep the vials drawn so far and save the bundle. (q)")
         self.draw_cancel_button = _button(
@@ -206,6 +211,7 @@ class VideoStage(QWidget):
             (self.draw_undo_point_button, self._draw_undo_point),
             (self.draw_undo_vial_button, self._draw_undo_vial),
             (self.draw_clear_button, self._draw_clear),
+            (self.draw_restart_button, self._draw_restart),
             (self.draw_done_button, self._draw_done),
             (self.draw_cancel_button, self._draw_cancel),
         ):
@@ -287,12 +293,13 @@ class VideoStage(QWidget):
         self._band = None
         self._job_kind = ""
         self._box = getattr(self.run, "latest", None) if self.run is not None else None
+        self._run_frames = False
         self.view.placeholder = "Waiting for the first frame of the run"
         self._show_mode(RUN)
 
     # -- drawing vial positions -------------------------------------------------------------------
     def begin_draw(self, *, out_dir: str, n_vials: int = 16, faces=("A", "B"),
-                   video: Optional[str] = None) -> bool:
+                   video: Optional[str] = None, polygons=None) -> bool:
         """Draw vial positions, here, on the live camera or on a recording.
 
         Returns False (with a spoken caption) when there is nothing to draw ON: no video was given
@@ -312,6 +319,11 @@ class VideoStage(QWidget):
                                      out_dir=out_dir, faces=faces, parent=self)
         self._draw.changed.connect(self._on_draw_changed)
         self._draw.finished.connect(self._on_draw_finished)
+        if polygons:
+            # SAVED POSITIONS ARE SHOWN, NOT HIDDEN BEHIND A YES/NO. Reuse used to be all-or-
+            # nothing -- keep them exactly, or re-click all sixteen -- so a bundle that was 15/16
+            # right cost a whole clicking session, and nothing on screen said it was 15/16 right.
+            self._draw.load(polygons)
         if video is not None:
             if not self._start_file_job(video, PassiveJob()):
                 self._draw = None
@@ -367,6 +379,10 @@ class VideoStage(QWidget):
     def _draw_clear(self) -> None:
         if self._draw:
             self._draw.clear_vial()
+
+    def _draw_restart(self) -> None:
+        if self._draw:
+            self._draw.start_over()
 
     def _draw_done(self) -> None:
         if self._draw:
@@ -437,14 +453,20 @@ class VideoStage(QWidget):
     def _on_press(self, x: float, y: float) -> None:
         if self._mode == BAND and self._band is not None:
             self._band.on_press(x, y)
+        elif self._mode == DRAW and self._draw is not None:
+            self._draw.on_press(x, y)
 
     def _on_drag(self, x: float, y: float) -> None:
         if self._mode == BAND and self._band is not None:
             self._band.on_drag(x, y)
+        elif self._mode == DRAW and self._draw is not None:
+            self._draw.on_drag(x, y)
 
     def _on_release(self, x: float, y: float) -> None:
         if self._mode == BAND and self._band is not None:
             self._band.on_release(x, y)
+        elif self._mode == DRAW and self._draw is not None:
+            self._draw.on_release(x, y)
 
     # -- measurements that consume frames ----------------------------------------------------------
     def begin_noise(self, illum_mask, *, n_frames: int = 100, k: float = 5.0,
@@ -587,6 +609,8 @@ class VideoStage(QWidget):
         if box is not None:
             frame = box.take()
             if frame is not None:
+                if self._mode == RUN:
+                    self._run_frames = True
                 # THE DRAWING SESSION IS TOLD FIRST. It keeps the frame the calibration will be
                 # built from, and it declines the update while the picture is held -- so what is
                 # measured for the illumination mask is the image the polygons were drawn on.
@@ -654,7 +678,15 @@ class VideoStage(QWidget):
             self.caption.setText(_JOB_CAPTIONS.get(self._job_kind, ""))
             return
         if self._mode == RUN:
-            self.caption.setText("The run's own frames, as the pipeline sees them")
+            # UNTIL THE RUN'S FIRST FRAME ARRIVES, WHAT IS ON SCREEN IS THE PREVIEW'S LAST ONE.
+            # Leaving it captioned as the run's frames would be this program telling the operator
+            # that a still from before the experiment started is the experiment -- the same class
+            # of claim as calling a recording live, and the handover takes a second or two during
+            # which the picture does not visibly change.
+            self.caption.setText("The run's own frames, as the pipeline sees them"
+                                 if self._run_frames else
+                                 "handing the camera to the run - this is still the last preview "
+                                 "frame, not the run")
             return
         live = _camera_caption(self.session, self.view.frame_size)
         # The notice FIRST: it is the result of something the operator asked for, and the

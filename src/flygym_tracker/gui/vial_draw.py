@@ -84,6 +84,16 @@ class VialOverlay:
             painter.setPen(QPen(COLOR_DONE, 1))
             painter.drawText(centre, str(index + 1))
 
+            # THE CORNERS ARE DRAWN AS HANDLES, because they are draggable and a control that does
+            # not look like one is a control nobody tries. Only while editing: on a fresh session
+            # every finished vial is exactly where it was just clicked, and sixteen rows of dots
+            # over the tubes would be noise competing with the vial being drawn.
+            if getattr(self.state, "editing", False):
+                for point in points:
+                    painter.setPen(QPen(QColor(0, 0, 0, 180), 2))
+                    painter.setBrush(QBrush(COLOR_DONE))
+                    painter.drawEllipse(point, 3.5, 3.5)
+
     def _paint_current(self, painter, view) -> None:
         current = self.state.current
         if not current:
@@ -132,11 +142,47 @@ class VialDrawSession(QObject):
         #: The most recent frame that was actually shown. The illumination mask and the overlay PNG
         #: are built from THIS image, so they match the polygons drawn on top of it.
         self.last_image = None
+        #: ``(vial, vertex)`` currently being dragged, or None. See `on_press`.
+        self._drag = None
 
     # -- input ---------------------------------------------------------------------------------
+    #: How near (in IMAGE pixels) a press must be to a saved corner to grab it instead of placing
+    #: a new one. Generous, because the operator is aiming at a 4 px dot on a scaled-down picture:
+    #: at the rig's 1280x1024 in a ~700 px wide pane the image is shown at ~0.55x, so 18 image
+    #: pixels is ~10 screen pixels -- about the size of the dot they can see.
+    GRAB_RADIUS = 18.0
+
+    def on_press(self, x: float, y: float) -> None:
+        """Mouse down. Grabs a saved corner if there is one under the pointer.
+
+        RUNS BEFORE `on_click`, which is why `preview.PreviewWidget` emits `pressed` first: the
+        decision "is this a drag of an existing corner or a new corner being placed" has to be made
+        before anything is placed, or every attempt to adjust a vial would add a vertex to it.
+        """
+        self._drag = self.state.find_vertex(x, y, self.GRAB_RADIUS) if not self.state.current \
+            else None
+        if self._drag is not None:
+            self.changed.emit()
+
+    def on_drag(self, x: float, y: float) -> None:
+        if self._drag is None:
+            return
+        self.state.move_vertex(self._drag[0], self._drag[1], x, y)
+        self.changed.emit()
+
+    def on_release(self, x: float, y: float) -> None:
+        if self._drag is None:
+            return
+        self.state.move_vertex(self._drag[0], self._drag[1], x, y)
+        self._drag = None
+        self.changed.emit()
+
     def on_click(self, x: float, y: float) -> None:
-        """A click on the picture, in image pixels."""
-        if self.state.done:
+        """A click on the picture, in image pixels. Places a corner of the vial being drawn.
+
+        Suppressed while a saved corner is being dragged -- see `on_press`.
+        """
+        if self.state.done or self._drag is not None:
             return
         self.state.add_vertex(x, y)
         self.changed.emit()
@@ -181,6 +227,18 @@ class VialDrawSession(QObject):
         self.changed.emit()
         return frozen
 
+    def load(self, polygons) -> int:
+        """Show saved vial positions, ready to edit. Returns how many were loaded."""
+        n = self.state.load(polygons)
+        self.changed.emit()
+        return n
+
+    def start_over(self) -> None:
+        """Throw away every vial and draw from nothing."""
+        self.state.start_over()
+        self._drag = None
+        self.changed.emit()
+
     def cancel(self) -> None:
         """Abandon the session without writing anything."""
         self.finished.emit({"saved": False, "n_vials": len(self.state.polygons),
@@ -190,9 +248,13 @@ class VialDrawSession(QObject):
     # -- the end -------------------------------------------------------------------------------
     def status(self) -> str:
         """The one line under the picture: where the session is, and anything it just said."""
-        head = "vial %d of %d   -   %d point(s) clicked" % (
-            min(self.state.vial_number, self.state.n_vials), self.state.n_vials,
-            len(self.state.current))
+        if self.state.editing and not self.state.current:
+            head = ("%d vial(s) loaded - drag a corner to adjust, or click to start vial %d"
+                    % (len(self.state.polygons), self.state.vial_number))
+        else:
+            head = "vial %d of %d   -   %d point(s) clicked" % (
+                min(self.state.vial_number, self.state.n_vials), self.state.n_vials,
+                len(self.state.current))
         if self.state.frozen:
             head += "   -   PICTURE HELD"
         return "%s   -   %s" % (head, self.state.message) if self.state.message else head
