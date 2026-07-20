@@ -896,3 +896,81 @@ def test_templates_learned_from_real_footage_identify_every_dwell_of_that_footag
     assert set(labels) == {"A", "B"}
     assert all(labels[i] != labels[i + 1] for i in range(len(labels) - 1)), \
         "a flipping drum must alternate faces; these labels do not"
+
+
+# =============================================================================================
+# "The drum kept turning, but only one face was detected" -- diagnosed on the real rig
+# =============================================================================================
+def test_an_unreadable_band_is_reported_instead_of_waiting_for_the_drum():
+    """MEASURED ON THE RIG, and it is why this test exists. A 45 s session with the drum turning:
+    4 dwells settled, face B was offered 520 times, and the marker band was unreadable on 661 of
+    661 stationary frames because the picture was too dark. The status line said "waiting for the
+    drum to show the next one" the entire time -- so the operator kept turning a drum that was
+    never going to help. It was not waiting for the drum. It could not see.
+    """
+    import numpy as np
+
+    from flygym_tracker.face_learning import FaceLearner
+
+    learner = FaceLearner(n_faces=2)
+    # A STILL frame with texture but no lit marker band -- which is exactly what the rig produced
+    # when the illumination was down. A flat black frame will not do: phase correlation on a
+    # featureless image never settles, so it would never reach a dwell and would test nothing.
+    dark = _dim_textured_frame()
+    for _ in range(learner.UNREADABLE_RUN_TO_REPORT + learner.settle_frames + 60):
+        learner.observe(dark)
+
+    assert learner.band_unreadable, "a wholly unreadable stream was not reported as one"
+    line = learner.status_line()
+    assert "cannot be read" in line
+    assert "Turning the drum will not help" in line, \
+        "the line does not tell the operator to stop doing the thing that cannot work"
+
+
+def test_a_readable_frame_clears_the_unreadable_report():
+    """The warning must not stick once the band comes back -- a stale alarm is one nobody reads."""
+    import numpy as np
+
+    from flygym_tracker.face_learning import FaceLearner
+
+    learner = FaceLearner(n_faces=2)
+    dark = _dim_textured_frame()
+    for _ in range(learner.UNREADABLE_RUN_TO_REPORT + learner.settle_frames + 60):
+        learner.observe(dark)
+    assert learner.band_unreadable
+
+    learner._unreadable_run = 0                      # what a readable decision does
+    assert not learner.band_unreadable
+    assert "cannot be read" not in learner.status_line()
+
+
+def test_the_finished_message_names_the_unreadable_band_as_the_obstacle():
+    """"0 of 2 faces learned" and "0 of 2 faces learned, and the band was unreadable in 615 of 871
+    frames" send the operator to completely different places. The second one is where the fault
+    actually was."""
+    from flygym_tracker.gui.video_stage import _job_message
+
+    message = _job_message("faces", {"complete": False, "learned": ["A"],
+                                     "unreadable": 615, "frames": 871})
+    assert "COULD NOT BE READ" in message
+    assert "615 of 871" in message
+    assert "too dark" in message
+
+    healthy = _job_message("faces", {"complete": False, "learned": ["A"],
+                                     "unreadable": 3, "frames": 871})
+    assert "COULD NOT BE READ" not in healthy, "a healthy session was blamed on the light"
+
+
+def _dim_textured_frame():
+    """A still, dim frame with structure but NO lit marker band.
+
+    Deterministic, and deliberately not flat: `AdaptiveRotationDetector` needs something to
+    correlate on before it will call a stream stationary, so a black rectangle never reaches a
+    dwell at all and a test built on one asserts nothing.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    frame = rng.integers(0, 24, size=(240, 320), dtype=np.uint8)
+    frame[60:70, 40:280] = 30          # faint structure, nowhere near a lit LED strip
+    return frame

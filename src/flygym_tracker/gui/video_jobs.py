@@ -168,12 +168,20 @@ class FaceLearnJob(FrameJob):
         return {"frames": self.learner.frames_seen,
                 "status": self.learner.status_line(),
                 "learned": list(self.learner.learned),
+                "unreadable": self.learner.unreadable_frames,
+                "band_unreadable": self.learner.band_unreadable,
                 "moving": self.learner.moving}
 
     def result(self) -> Dict[str, Any]:
         return {"complete": self.learner.done, "aborted": bool(self.stopped),
                 "detector": self.learner.detector, "dwells": list(self.learner.dwells),
-                "learned": list(self.learner.learned)}
+                "learned": list(self.learner.learned),
+                # CARRIED INTO THE RESULT so a session that ends without learning everything can
+                # say WHY. "0 of 2 faces learned" and "0 of 2 faces learned, and the band was
+                # unreadable in 661 of 871 frames" send the operator to completely different
+                # places -- the second one to the exposure, which is where the fault actually was.
+                "frames": self.learner.frames_seen,
+                "unreadable": self.learner.unreadable_frames}
 
 
 # =================================================================================================

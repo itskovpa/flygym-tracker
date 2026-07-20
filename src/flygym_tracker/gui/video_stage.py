@@ -618,9 +618,21 @@ def _job_message(kind: str, payload: Dict[str, Any]) -> str:
         if payload.get("complete"):
             return "learned the marker band of face(s) %s - this bundle can identify faces now" \
                    % ", ".join(learned)
-        return ("face learning stopped with %d of the faces learned (%s) - the bundle still "
-                "cannot tell the faces apart, so everything would be recorded as one face"
-                % (len(learned), ", ".join(learned) or "none"))
+        tail = ("the bundle still cannot tell the faces apart, so everything would be recorded "
+                "as one face")
+        # NAME THE ACTUAL OBSTACLE. Measured on the rig: the band was unreadable in 615 of 871
+        # frames because the exposure was 10 ms (this band needs ~40 ms), and the only thing the
+        # operator was told was that it was waiting for the drum -- so they kept turning it.
+        unreadable = int(payload.get("unreadable") or 0)
+        frames = int(payload.get("frames") or 0)
+        if unreadable and frames and unreadable * 2 >= frames:
+            return ("face learning stopped with %d face(s) learned (%s): THE MARKER BAND COULD NOT "
+                    "BE READ in %d of %d frames - the picture is too dark for it. Raise the "
+                    "exposure or the illumination until the two lit strips are clearly visible, "
+                    "then run this again. %s"
+                    % (len(learned), ", ".join(learned) or "none", unreadable, frames, tail))
+        return ("face learning stopped with %d of the faces learned (%s) - %s"
+                % (len(learned), ", ".join(learned) or "none", tail))
     return str(payload.get("message") or "")
 
 

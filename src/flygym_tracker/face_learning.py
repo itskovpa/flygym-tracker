@@ -149,6 +149,16 @@ class FaceLearner:
     _stationary_run: int = 0
     _dwell_closed: bool = False
     _last_decision: Decision = None
+    #: Settled frames in a row whose marker band could not be read at all.
+    #:
+    #: MEASURED ON THE RIG, and it is why this exists. A session ran for 45 s with the drum
+    #: turning: 4 dwells settled, face B was offered 520 times, and the band was unreadable on
+    #: 661 of 661 stationary frames -- because the exposure was 10 ms and, in a controlled sweep,
+    #: this band only becomes readable at 40 ms. The whole time the status line said "waiting for
+    #: the drum to show the next one", so the operator kept turning a drum that was never going to
+    #: help. "I cannot see the band" and "I have not been shown a new face" are completely
+    #: different problems with completely different fixes, and the surface said the wrong one.
+    _unreadable_run: int = 0
 
     def __post_init__(self) -> None:
         if self.n_faces < 1:
@@ -176,13 +186,39 @@ class FaceLearner:
     def moving(self) -> bool:
         return self.state == TrackState.ROTATING
 
+    #: Consecutive unreadable settled frames after which the status line stops saying "waiting for
+    #: the drum" and starts saying "I cannot see the band". ~1 s at 20 fps: long enough that a
+    #: single smeared frame says nothing, short enough that the operator is not left turning a drum
+    #: for a minute for no reason.
+    UNREADABLE_RUN_TO_REPORT = 20
+
+    def _note_unreadable(self) -> None:
+        self.unreadable_frames += 1
+        self._unreadable_run += 1
+
+    @property
+    def band_unreadable(self) -> bool:
+        """True when settled frames keep arriving with no readable marker band in them."""
+        return self._unreadable_run >= self.UNREADABLE_RUN_TO_REPORT
+
     def status_line(self) -> str:
         """The one line that tells the operator whether anything is happening.
 
         This step takes 10-20 s of real rotation and shows a near-static picture the whole time,
         so a window that said nothing would be indistinguishable from a hung one. It always names
         both how far along the learning is and what the drum is doing right now.
+
+        AN UNREADABLE BAND OUTRANKS EVERYTHING ELSE HERE, because it is the one state in which the
+        operator's obvious action is the wrong one. Measured on the rig: 45 s with the drum
+        turning, 4 dwells settled, face B offered 520 times, band unreadable on 661 of 661
+        stationary frames -- and the line read "waiting for the drum to show the next one" the
+        whole time. It was not waiting for the drum. It could not see.
         """
+        if self.band_unreadable and not self.done:
+            return ("the marker band cannot be read - the picture is probably too dark "
+                    "(%d frames in a row). Turning the drum will not help; raise the exposure or "
+                    "the illumination until the two lit strips are clearly visible."
+                    % self._unreadable_run)
         if self.done:
             return "all %d faces learned (%s) - finishing" % (
                 len(self.learned), ", ".join(self.learned))
@@ -232,14 +268,16 @@ class FaceLearner:
             try:
                 self.detector.register_face(gray, name)
             except ValueError:
-                self.unreadable_frames += 1
+                self._note_unreadable()
                 return None            # no band in this frame; the next one may be cleaner
+            self._unreadable_run = 0
             return self._record(name, 1.0, float("nan"), LEARNED)
 
         scores = self.detector.score_faces(gray)
         if not scores:
-            self.unreadable_frames += 1
+            self._note_unreadable()
             return None
+        self._unreadable_run = 0
         order = sorted(scores, key=lambda f: -scores[f])
         best = order[0]
         best_score = float(scores[best])
@@ -259,7 +297,7 @@ class FaceLearner:
             try:
                 self.detector.register_face(gray, name)
             except ValueError:         # pragma: no cover - score_faces already read the band
-                self.unreadable_frames += 1
+                self._note_unreadable()
                 return None
             return self._record(name, best_score, margin, LEARNED)
 
