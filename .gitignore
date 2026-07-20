@@ -15,3 +15,8 @@ calib/overlay_*.png
 # keep calibration bundle + committed sample docs
 !docs/*.png
 calib_faces/overlay_*.png
+
+# THIS MACHINE'S OWN SETTINGS. `config/x.local.yaml` layers on top of the shipped `config/x.yaml`
+# and is what the app writes to, so one rig's tuning never lands in the template a fresh clone
+# gets. Ignored on purpose: these are a machine's values, not the project's.
+config/*.local.yaml

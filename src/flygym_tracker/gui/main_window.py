@@ -26,6 +26,7 @@ confirm -- it is the action a tuning loop repeats, and its warning is a line on 
 """
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
@@ -669,10 +670,50 @@ class MainWindow(QMainWindow):
         The confirm exists for the one case that can quietly ruin the next experiment -- see
         `settings_controller.arming_plan`.
         """
+        redirected = self._redirect_away_from_the_template()
         result = self.controller.save(confirm=self._confirm_unverified)
-        self.settings_view.set_status(result.message)
+        # ORDER MATTERS, AND IT WAS WRONG. `refresh_titles` rewrites the change line from the
+        # change COUNT alone, so calling it after `set_status` wiped the save result off the screen
+        # every time -- leaving exactly the "unable to tell a write from a silently skipped one"
+        # that `set_status`'s own docstring says it exists to prevent. Titles first, message second.
         self.settings_view.refresh_titles()
+        self.settings_view.set_status(
+            "%s  -  %s" % (result.message, redirected) if redirected and result.saved
+            else result.message)
         self.refresh_readiness()
+
+    def _redirect_away_from_the_template(self) -> str:
+        """Send a save aimed at a SHIPPED config to this machine's own copy instead.
+
+        THE PROBLEM THIS SOLVES. `config/flygym_rig.yaml` is in version control: it is what a fresh
+        clone gets, and it is asserted to leave every camera field null so an untouched install
+        imposes nothing on the sensor. But it was also the file the app opened and saved into, so
+        an ordinary afternoon of tuning rewrote the shipped default to whatever the last operator
+        was trying -- silently, and visible only in a diff nobody reads before an experiment.
+
+        REDIRECTING RATHER THAN REFUSING, because refusing punishes the operator for a filing
+        decision they did not make and should not have to think about. The values are theirs and
+        they asked for them to be kept; what changes is only WHICH FILE keeps them, and the status
+        line says so by name. `config/flygym_rig.local.yaml` layers on top of the template
+        (`config.load_config`), so nothing is lost and the template stays a template.
+
+        Returns a sentence to append to the save message, or "" when nothing was redirected.
+        """
+        from flygym_tracker.config import is_tracked_template, local_config_path
+
+        path = self.controller.config_path
+        if not is_tracked_template(path):
+            return ""
+        local = str(local_config_path(path))
+        self.controller.config_path = local
+        self.state["config_path"] = local
+        gui_state.remember_config(self.state, local)
+        gui_state.save_state(self.root, self.state)
+        self.session_bar.set_recent(self.state["recent_configs"])
+        self.session_bar.config_combo.setCurrentText(local)
+        return ("written to this rig's own %s, not the shipped template - the template stays as a "
+                "fresh clone gets it, and your values layer on top of it"
+                % os.path.basename(local))
 
     def _confirm_unverified(self, warning: str) -> bool:
         if self._confirm is not None:

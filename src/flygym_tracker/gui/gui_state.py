@@ -45,7 +45,11 @@ SCHEMA_VERSION = 1
 #: The shape, and the only place a default is written down. `_coerce` is driven off these types.
 DEFAULTS: Dict[str, Any] = {
     "version": SCHEMA_VERSION,
-    "config_path": "config/flygym_rig.yaml",
+    #: THIS MACHINE'S OWN config, not the shipped template. It layers on top of
+    #: `config/flygym_rig.yaml` (see `config.load_config`), so the rig gets every value the
+    #: template carries plus whatever was tuned here -- and the template stays what a fresh clone
+    #: gets rather than a record of the last operator's experiment.
+    "config_path": "config/flygym_rig.local.yaml",
     "calib_dir": "calib_faces",
     "output_dir": "output",
     "recent_configs": [],

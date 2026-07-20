@@ -17,6 +17,105 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "default_config.yaml"
 
+#: The rig's shipped config. A TEMPLATE: it is in version control, it is what a fresh clone gets,
+#: and it deliberately leaves every camera field null so an untouched install imposes nothing on
+#: the sensor.
+RIG_CONFIG_PATH = REPO_ROOT / "config" / "flygym_rig.yaml"
+
+#: Suffix marking a machine's own copy of a config. `flygym_rig.local.yaml` sits on top of
+#: `flygym_rig.yaml`; it is gitignored and it is what the app writes to.
+LOCAL_SUFFIX = ".local.yaml"
+
+#: Files that are SHIPPED and must not be written to by the app. See `local_config_path`.
+TRACKED_TEMPLATES = (DEFAULT_CONFIG_PATH, RIG_CONFIG_PATH)
+
+_LOCAL_HEADER = """\
+# THIS RIG'S OWN SETTINGS. Written by the app; safe to hand-edit; NOT in version control.
+#
+# It is a layer ON TOP OF config/flygym_rig.yaml, not a copy of it: only the values that differ
+# from the shipped template are here, and everything else -- including any improvement that
+# arrives with a new version of the template -- still comes through underneath. Delete this file
+# to go back to the shipped values.
+#
+# WHY THE APP DOES NOT WRITE TO flygym_rig.yaml. That file is the template a fresh clone gets, and
+# it is asserted to leave every camera field null so an untouched install imposes nothing on the
+# sensor. Saving tuned values into it made the shipped default "whatever the last operator was
+# trying", and the difference was invisible in a diff nobody reads before an experiment.
+"""
+
+
+def is_tracked_template(path) -> bool:
+    """True if `path` is one of the shipped, version-controlled config files."""
+    if not path:
+        return False
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, ValueError):
+        return False
+    return any(resolved == template.resolve() for template in TRACKED_TEMPLATES)
+
+
+def local_config_path(path=None) -> Path:
+    """The machine-local sibling of `path`: ``config/x.yaml`` -> ``config/x.local.yaml``.
+
+    A path that is ALREADY a local file is returned unchanged, so this is safe to apply twice --
+    which matters, because it is called both when choosing where to save and when deciding whether
+    a chosen file needs redirecting.
+    """
+    base = Path(path) if path else RIG_CONFIG_PATH
+    if str(base).endswith(LOCAL_SUFFIX):
+        return base
+    return base.with_name(base.name[:-len(base.suffix)] + LOCAL_SUFFIX)
+
+
+def template_for_local(path) -> Optional[Path]:
+    """The shipped file a `*.local.yaml` layers on top of, if it exists. Else None."""
+    text = str(path)
+    if not text.endswith(LOCAL_SUFFIX):
+        return None
+    template = Path(text[:-len(LOCAL_SUFFIX)] + ".yaml")
+    return template if template.exists() else None
+
+
+def config_layers(path=None) -> list:
+    """Every file that contributes to a config, base first. THE PROVENANCE OF A MEASUREMENT.
+
+    ``config/flygym_rig.local.yaml`` resolves to
+    ``[default_config.yaml, flygym_rig.yaml, flygym_rig.local.yaml]`` -- the packaged defaults, the
+    shipped rig template, and this machine's own values, in the order they are merged.
+    """
+    layers = [DEFAULT_CONFIG_PATH]
+    if path:
+        template = template_for_local(path)
+        if template is not None:
+            layers.append(template)
+        layers.append(Path(path))
+    return layers
+
+
+def ensure_local_config(path=None) -> str:
+    """Make sure this machine's own config exists, and return its path.
+
+    Creates it EMPTY (a header comment and nothing else) rather than as a copy of the template:
+    an empty override layer means the rig behaves exactly like a fresh clone until somebody
+    changes something, and every value still carries the template's own comment explaining it.
+
+    Never raises. A read-only install directory is a real deployment -- a shared rig, a locked-down
+    lab machine -- and being unable to create a settings file is not a reason to refuse to start;
+    the caller falls back to the template, which is read-only but perfectly usable.
+    """
+    local = local_config_path(path)
+    if local.exists():
+        return str(local)
+    try:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with open(local, "w", encoding="utf-8") as f:
+            f.write(_LOCAL_HEADER)
+    except OSError:
+        template = template_for_local(local)
+        return str(template if template is not None else DEFAULT_CONFIG_PATH)
+    return str(local)
+
 _VALID_SOURCE_TYPES = ("camera", "video")
 _VALID_OUTPUT_FORMATS = ("csv", "xlsx", "both")
 
@@ -132,12 +231,24 @@ def load_config(path: Optional[str] = None, overrides: Optional[dict] = None) ->
     deep-merged on top. If `overrides` is given, it is deep-merged on top of
     that. The merged result is validated and returned as a `Config`.
 
+    ONE EXTRA LAYER, AND IT IS THE RULE THIS FILE EXISTS TO STATE: a path ending in
+    ``.local.yaml`` is loaded ON TOP OF the ``.yaml`` of the same name, if that exists. So
+    ``config/flygym_rig.local.yaml`` means "the shipped rig template, plus whatever this machine
+    changed" rather than "these values and nothing else".
+
+    That is what lets the app write to a file of its own without the rig losing the template's
+    values -- and without the shipped template accumulating one operator's tuning as though it
+    were the default everybody gets. `config_layers` reports the resulting chain.
+
     Raises:
         FileNotFoundError: `path` was given but doesn't exist.
         ValueError: the merged config fails validation.
     """
     merged = _load_yaml(DEFAULT_CONFIG_PATH)
     if path is not None:
+        template = template_for_local(path)
+        if template is not None:
+            merged = _deep_merge(merged, _load_yaml(template))
         merged = _deep_merge(merged, _load_yaml(path))
     if overrides:
         merged = _deep_merge(merged, overrides)

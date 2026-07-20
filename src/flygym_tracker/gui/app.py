@@ -29,7 +29,7 @@ import os
 import sys
 from typing import Optional
 
-from flygym_tracker.config import DEFAULT_CONFIG_PATH, load_config
+from flygym_tracker.config import DEFAULT_CONFIG_PATH, ensure_local_config, load_config
 from flygym_tracker.gui import gui_state
 
 
@@ -92,6 +92,12 @@ def main(argv: Optional[list] = None) -> int:
     root = args.state_dir or _repo_root()
     state = gui_state.load_state(root)
     config_path = args.config or state.get("config_path") or ""
+    if not args.config:
+        # THIS MACHINE'S OWN config file, created empty on first launch. Only when the operator did
+        # not name one explicitly: `--config` is someone saying exactly which file they mean, and
+        # silently substituting a different one is how a run gets measured with values nobody
+        # chose. See `config.ensure_local_config`.
+        config_path = ensure_local_config(config_path or None)
 
     config, error = _load(config_path)
     if config is None:
