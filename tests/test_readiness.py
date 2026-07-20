@@ -122,3 +122,88 @@ def test_the_strip_renders_as_plain_text_for_a_terminal_too(tmp_path):
     text = readiness.evaluate(config_path=None).text()
     assert text.count("\n") == 5              # six checks, five newlines
     assert "[X]" in text
+
+
+# =============================================================================================
+# The strip's height, which is a measurement and not a preference
+# =============================================================================================
+def _strip(qapp):
+    from flygym_tracker.gui.readiness_strip import ReadinessStrip
+
+    strip = ReadinessStrip()
+    strip.resize(900, 300)
+    return strip
+
+
+def _checks(bad_keys=()):
+    from flygym_tracker.readiness import BAD, Check, OK
+
+    out = []
+    for key in ("config", "calibration", "output", "camera", "unverified", "unsaved"):
+        if key in bad_keys:
+            out.append(Check(key, BAD, "%s is not ready" % key, "Fix it", "fix_%s" % key))
+        else:
+            out.append(Check(key, OK, "%s is fine" % key))
+    return out
+
+
+def test_everything_passing_collapses_to_one_line(qapp):
+    """MEASURED, not preferred: six full rows took 210 px of an 880 px window -- 24% of the height
+    -- while the camera picture got 312 px. On a rig whose whole point is looking at the picture
+    (exposure and gain are tuned by eye, vial polygons are drawn on it), an all-ticks checklist was
+    the second-largest thing on screen."""
+    from flygym_tracker.readiness import Readiness
+
+    strip = _strip(qapp)
+    strip.set_readiness(Readiness(checks=_checks()))
+    assert len(strip._rows) == 1, "the passing checks did not collapse"
+
+
+def test_the_summary_names_what_passed_rather_than_counting_it(qapp):
+    """"5 of 6 checks pass" tells an operator nothing they can act on."""
+    from PySide6.QtWidgets import QLabel
+
+    from flygym_tracker.readiness import Readiness
+
+    strip = _strip(qapp)
+    strip.set_readiness(Readiness(checks=_checks()))
+    text = " ".join(label.text() for label in strip._rows[0].findChildren(QLabel))
+    for name in ("config", "vial positions", "output folder", "camera"):
+        assert name in text, "the summary does not name %r" % name
+
+
+def test_anything_not_passing_keeps_its_own_row_and_its_fix_button(qapp):
+    """The collapse must never cost the operator the thing that fixes the problem."""
+    from PySide6.QtWidgets import QPushButton
+
+    from flygym_tracker.readiness import Readiness
+
+    strip = _strip(qapp)
+    strip.set_readiness(Readiness(checks=_checks(bad_keys=("calibration",))))
+    assert len(strip._rows) == 2, "expected the problem row plus the summary"
+    buttons = [b for row in strip._rows for b in row.findChildren(QPushButton)]
+    assert [b.text() for b in buttons] == ["Fix it"]
+
+
+def test_problems_are_listed_above_the_reassurance(qapp):
+    """Whatever is wrong is what has to be acted on, so it goes where the eye lands. The other
+    order would push a cross below a row of ticks."""
+    from PySide6.QtWidgets import QLabel
+
+    from flygym_tracker.readiness import Readiness
+
+    strip = _strip(qapp)
+    strip.set_readiness(Readiness(checks=_checks(bad_keys=("output",))))
+    first = " ".join(label.text() for label in strip._rows[0].findChildren(QLabel))
+    assert "not ready" in first, "the problem was not the first thing in the strip"
+
+
+def test_the_strip_is_still_always_there(qapp):
+    """It is never hidden, even with nothing wrong: a strip that appears only when something is
+    wrong is a strip nobody has read before, so the first time it appears it is unfamiliar -- at
+    the moment it is most needed."""
+    from flygym_tracker.readiness import Readiness
+
+    strip = _strip(qapp)
+    strip.set_readiness(Readiness(checks=_checks()))
+    assert strip._rows, "the strip vanished when everything passed"
