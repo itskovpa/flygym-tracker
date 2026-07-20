@@ -1,0 +1,36 @@
+Copyright (c) 2026 Pavel Itskov. All rights reserved.
+
+FlyGym Tracker -- per-vial Drosophila locomotor-activity tracker for the FlyGym v2
+rotating IR-silhouette rig.
+
+This software is provided to authorised users of the FlyGym rig. No permission is
+granted to copy, modify, distribute, or create derivative works, except as agreed
+in writing with the copyright holder.
+
+THIS PLACEHOLDER IS THE CONSERVATIVE DEFAULT, NOT A CONSIDERED CHOICE. It was set
+to "all rights reserved" because that is the reversible option: software can be
+released under an open licence later, but a licence once granted cannot be
+withdrawn from copies already distributed. If this is to be shipped to customers,
+or published, replace this file with the licence you actually intend -- an
+academic-use licence, MIT, GPL, or a commercial EULA -- before distributing it.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+
+The installed application bundles the following, each under its own licence:
+
+    Python              PSF License Agreement
+    PySide6 / Qt        LGPL v3
+    OpenCV              Apache License 2.0
+    NumPy               BSD 3-Clause
+    pandas              BSD 3-Clause
+    PyYAML              MIT
+    openpyxl            MIT
+
+Qt is used under the LGPL. The LGPL requires that users be able to replace the Qt
+libraries with their own build. This application is distributed with Qt as
+separate, unmodified dynamic libraries in the installation directory, which
+satisfies that requirement; Qt itself is not modified.
+
+The HikRobot MVS SDK is NOT bundled and NOT redistributed. It is installed
+separately by the operator, direct from HikRobot, under HikRobot's own licence.

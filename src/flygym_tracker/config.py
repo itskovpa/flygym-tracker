@@ -12,9 +12,12 @@ from typing import Any, Optional
 
 import yaml
 
-#: Repo root, resolved from this file's own location:
-#: <repo>/src/flygym_tracker/config.py -> parents[2] == <repo>.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from flygym_tracker import paths
+
+#: Where the SHIPPED templates are read from. The repo root when running from a clone; the install
+#: directory when running from a build -- see `paths.bundle_root`, which is the one place that
+#: knows the difference. Read-only either way: nothing this program saves goes here.
+REPO_ROOT = paths.bundle_root()
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "default_config.yaml"
 
 #: The rig's shipped config. A TEMPLATE: it is in version control, it is what a fresh clone gets,
@@ -65,16 +68,40 @@ def local_config_path(path=None) -> Path:
     base = Path(path) if path else RIG_CONFIG_PATH
     if str(base).endswith(LOCAL_SUFFIX):
         return base
-    return base.with_name(base.name[:-len(base.suffix)] + LOCAL_SUFFIX)
+    local = base.with_name(base.name[:-len(base.suffix)] + LOCAL_SUFFIX)
+    if paths.is_frozen() and _inside_bundle(local):
+        # AN INSTALLED COPY CANNOT WRITE BESIDE ITS OWN TEMPLATE. The template lives in
+        # `C:\Program Files\...`, and the machine's own settings must not. They move to the user's
+        # data folder and `template_for_local` finds its way back -- see there.
+        return paths.user_data_root() / "config" / local.name
+    return local
+
+
+def _inside_bundle(path) -> bool:
+    try:
+        Path(path).resolve().relative_to(paths.bundle_root().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def template_for_local(path) -> Optional[Path]:
-    """The shipped file a `*.local.yaml` layers on top of, if it exists. Else None."""
+    """The shipped file a `*.local.yaml` layers on top of, if it exists. Else None.
+
+    LOOKS BESIDE IT FIRST, THEN IN THE INSTALL. From a clone the two sit in the same folder and the
+    first answer is right. Installed, the operator's `flygym_rig.local.yaml` is under their profile
+    while the `flygym_rig.yaml` it layers on top of is in Program Files -- and without the second
+    lookup the local file would be read as the WHOLE config rather than as an override, silently
+    dropping every value the template supplies.
+    """
     text = str(path)
     if not text.endswith(LOCAL_SUFFIX):
         return None
     template = Path(text[:-len(LOCAL_SUFFIX)] + ".yaml")
-    return template if template.exists() else None
+    if template.exists():
+        return template
+    shipped = REPO_ROOT / "config" / template.name
+    return shipped if shipped.exists() else None
 
 
 def config_layers(path=None) -> list:

@@ -20,3 +20,8 @@ calib_faces/overlay_*.png
 # and is what the app writes to, so one rig's tuning never lands in the template a fresh clone
 # gets. Ignored on purpose: these are a machine's values, not the project's.
 config/*.local.yaml
+
+# Installer build output. The bundle is ~291 MB and the installer ~82 MB; they are release
+# artifacts, rebuilt from source by `python packaging/build_installer.py`.
+packaging/dist/
+packaging/build/

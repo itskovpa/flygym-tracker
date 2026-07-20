@@ -45,13 +45,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _repo_root() -> str:
-    """The folder `gui_state.json` sits in: the repo, not the user profile.
+    """The folder `gui_state.json` sits in.
 
-    Resolved from this file (``<repo>/src/flygym_tracker/gui/app.py`` -> three parents up) rather
-    than from the working directory, because a shortcut on the desktop starts the app in whatever
-    folder Windows feels like.
+    FROM A CLONE that is the repo -- unchanged, and deliberately not the user profile: a developer's
+    remembered paths belong beside the checkout they came from. INSTALLED it is the user's own data
+    folder, because the install directory is `C:\\Program Files\\...` and Windows does not let a
+    normal user write there. See `paths.user_data_root`; that is the only place the difference is
+    decided.
+
+    Either way it is resolved from the program, never from the working directory, because a desktop
+    shortcut starts the app in whatever folder Windows feels like.
     """
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from flygym_tracker import paths
+
+    return str(paths.ensure_user_data_root())
 
 
 def camera_factory_from_config(config):

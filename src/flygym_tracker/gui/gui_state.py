@@ -34,6 +34,8 @@ import json
 import os
 from typing import Any, Dict, List
 
+from flygym_tracker import paths
+
 #: Where the file lives: next to the repo, not in the user profile, so it travels with the install
 #: and is visible in the same folder the operator already opens.
 STATE_FILENAME = "gui_state.json"
@@ -49,6 +51,10 @@ DEFAULTS: Dict[str, Any] = {
     #: `config/flygym_rig.yaml` (see `config.load_config`), so the rig gets every value the
     #: template carries plus whatever was tuned here -- and the template stays what a fresh clone
     #: gets rather than a record of the last operator's experiment.
+    #: THE FROM-A-CLONE VALUES, and the shape `_coerce` is driven off. The three path keys are
+    #: RE-RESOLVED in `default_state()` rather than being computed here, because this dict is built
+    #: at import time and an installed copy's paths depend on where the program is installed --
+    #: baking them in at import makes the answer depend on when this module first got imported.
     "config_path": "config/flygym_rig.local.yaml",
     "calib_dir": "calib_faces",
     "output_dir": "output",
@@ -72,7 +78,22 @@ MAX_RECENT = 8
 
 
 def default_state() -> Dict[str, Any]:
-    return json.loads(json.dumps(DEFAULTS))       # deep copy, no aliasing of the list
+    """A fresh state dict, with the path defaults resolved for HOW THIS COPY IS RUNNING.
+
+    RELATIVE FROM A CLONE, ABSOLUTE ONCE INSTALLED, and that difference is load-bearing. A relative
+    path resolves against the working directory, and a desktop shortcut starts the app in whatever
+    folder Windows feels like -- so on an installed copy the same button would write a run's
+    results, and read its settings, from a different place depending on how the app happened to be
+    launched. Two launches from two folders would each quietly have their own configuration.
+
+    Resolved HERE rather than in `DEFAULTS` because that dict is built when this module is first
+    imported, which would make the answer depend on import order rather than on the install.
+    """
+    state = json.loads(json.dumps(DEFAULTS))      # deep copy, no aliasing of the list or the dict
+    state["config_path"] = paths.default_config_path()
+    state["calib_dir"] = paths.default_calib_dir()
+    state["output_dir"] = paths.default_output_dir()
+    return state
 
 
 def state_path(root: str) -> str:
