@@ -93,9 +93,16 @@ class RunWorker(QObject):
     #: says so instead of showing a value that never reached anything.
     setting_applied = Signal(str, bool)
 
-    def __init__(self, plan: Dict[str, Any], parent: Optional[QObject] = None) -> None:
+    def __init__(self, plan: Dict[str, Any], latest=None,
+                 parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._plan = dict(plan)
+        #: The one-slot frame box the window's picture is pulled from, so a run -- and a replay,
+        #: which is the same pipeline over a file -- is WATCHED IN THIS WINDOW rather than in a
+        #: separate cv2 monitor window. Same box type and same reasoning as the camera preview's:
+        #: Qt does not coalesce queued signals, and a run is watched for days, so a stalled GUI
+        #: must show a STALE frame rather than queue every frame of the stall.
+        self._latest = latest
         self._stop = threading.Event()
         #: Appended to from the GUI thread, drained on this one. A `deque` because append and
         #: popleft are the two operations, and both are atomic under the GIL -- a lock here would
@@ -203,6 +210,24 @@ class RunWorker(QObject):
         now = time.monotonic()
         if now - self._last_emit < 1.0 / PROGRESS_HZ:
             return
+        # THE PICTURE IS THROTTLED WITH THE READOUT, not per frame. `payload["frame"]` is the
+        # pipeline's own grayscale working copy, so it is put in the box only at the moment the
+        # GUI is about to be told about it anyway -- at 88 fps, handing over every frame would be
+        # a memcpy per frame for a preview the eye samples at about 15.
+        #
+        # IT IS COPIED. The array in the payload belongs to the pipeline, which keeps the previous
+        # frame as the baseline of its next difference; the GUI thread paints from the box whenever
+        # it likes. Handing over the live array would make correctness depend on the pipeline never
+        # writing into a frame in place -- true today, unowned by anyone, and the failure would be
+        # a preview that tears during a measurement rather than an exception anyone could trace.
+        # At 5 Hz a 1.3 MB copy is not measurable; the guarantee is.
+        if self._latest is not None:
+            frame_image = payload.get("frame")
+            if frame_image is not None:
+                try:
+                    self._latest.put(frame_image.copy())
+                except Exception:
+                    pass                      # a preview must never be able to end a run
         self._last_emit = now
         vial_results = payload.get("vial_results") or {}
         self.progress.emit({
@@ -248,6 +273,11 @@ class RunController(QObject):
     def __init__(self, *, camera_is_open: Callable[[], bool],
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
+        from flygym_tracker.gui.camera_worker import LatestFrame
+
+        #: Frames from the running pipeline, for the window's picture. A run and a replay both fill
+        #: this, which is what makes "watch the experiment" and "watch a recording" the same view.
+        self.latest = LatestFrame()
         self._camera_is_open = camera_is_open
         self._thread: Optional[QThread] = None
         self._worker: Optional[RunWorker] = None
@@ -295,7 +325,7 @@ class RunController(QObject):
             return False
 
         self._thread = QThread()
-        self._worker = RunWorker(plan)
+        self._worker = RunWorker(plan, latest=self.latest)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)

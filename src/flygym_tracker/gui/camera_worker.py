@@ -124,6 +124,11 @@ class CameraWorker(QObject):
     ranges_changed = Signal(dict)         # {node: CameraRange}
     values_read = Signal(dict)            # current_values() read-back
     read_error = Signal(str)
+    #: The attached per-frame job has seen everything it needs; it is already detached.
+    tap_finished = Signal()
+    #: The attached per-frame job raised. It is detached, and the message says what happened --
+    #: a measurement that stopped accumulating must never keep showing progress.
+    tap_failed = Signal(str)
 
     def __init__(self, factory, latest: LatestFrame) -> None:
         """`factory` builds the `HikCameraSource`; it is injected so tests never need an SDK."""
@@ -144,6 +149,19 @@ class CameraWorker(QObject):
         self._write_lock = threading.Lock()
         self._queued_writes: list = []
         self._valid_tokens: set = set()
+        #: An optional per-frame job (`video_jobs.FrameJob`) fed EVERY frame this worker reads.
+        #:
+        #: WHY THE TAP IS HERE AND NOT ON THE PREVIEW BOX. The preview is decimated to ~15 fps out
+        #: of up to 88, on purpose. A noise floor is measured from |frame - previous frame|, so a
+        #: job fed from the preview box would be differencing frames 66 ms apart instead of 11 ms
+        #: -- a DIFFERENT measurement, silently, and the number it produces seeds the pixel
+        #: threshold every activity reading afterwards is compared against. Face learning has the
+        #: same requirement for the same reason: its rotation detector is the tracker's, and it is
+        #: tuned against consecutive frames.
+        #:
+        #: One slot, not a list: two jobs on one camera would be two measurements racing for the
+        #: same exclusive stream, which is exactly the confusion this app exists to remove.
+        self._tap = None
 
     # -- lifecycle ---------------------------------------------------------------------------
     @Slot()
@@ -208,6 +226,22 @@ class CameraWorker(QObject):
             self._stamps.append(now)
             if len(self._stamps) > FPS_WINDOW:
                 del self._stamps[:-FPS_WINDOW]
+            image = getattr(frame, "image", frame)
+            tap = self._tap
+            if tap is not None:
+                # EVERY frame, before the preview throttle. A job that raises is DETACHED rather
+                # than left to raise once per frame for the rest of a session -- and detaching it
+                # is what lets the controller notice and say so, instead of a measurement that
+                # quietly stopped accumulating while its progress bar kept moving.
+                try:
+                    tap.observe(image)
+                except Exception as exc:
+                    self._tap = None
+                    self.tap_failed.emit(str(exc))
+                else:
+                    if tap.done:
+                        self._tap = None
+                        self.tap_finished.emit()
             if (now - self._last_preview) * 1000.0 >= PREVIEW_INTERVAL_MS:
                 self._last_preview = now
                 self._latest.put(getattr(frame, "image", frame))
@@ -228,6 +262,21 @@ class CameraWorker(QObject):
             return 0.0
         span = self._stamps[-1] - self._stamps[0]
         return (len(self._stamps) - 1) / span if span > 0 else 0.0
+
+    # -- the per-frame tap ------------------------------------------------------------------------
+    def set_tap(self, job) -> None:
+        """Attach (or, with None, detach) the job fed every frame. See `_tap`.
+
+        A plain attribute write rather than a queued slot: it is one reference, the grab loop reads
+        it into a local before using it, and CPython's GIL makes both atomic. A queued slot would
+        mean the job starts accumulating some indeterminate number of frames after the operator
+        pressed the button, which is a measurement whose length nobody can state.
+        """
+        self._tap = job
+
+    @property
+    def tap(self):
+        return self._tap
 
     # -- settings ------------------------------------------------------------------------------
     def enqueue(self, key: str, value, token) -> None:

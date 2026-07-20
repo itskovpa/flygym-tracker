@@ -27,13 +27,36 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtCore import QPointF, QRect, Qt, Signal
 from PySide6.QtGui import QImage, QPainter
-from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
 #: How often the GUI pulls the latest frame. Faster than the worker offers them, so the box is
 #: usually empty and the pull is a cheap lock-and-return; the worker's throttle sets the real rate.
 PULL_INTERVAL_MS = 50
+
+#: Qt key -> the key NAMES `live_vial_selector.handle_key` already understands. That module's keymap
+#: is the one an operator has learnt at this rig, and it is tested; this table exists so the Qt
+#: surface drives THAT keymap rather than growing a second one that can drift out of step with it.
+_QT_KEY_NAMES = {
+    Qt.Key.Key_Return: "enter", Qt.Key.Key_Enter: "enter",
+    Qt.Key.Key_Backspace: "backspace", Qt.Key.Key_Delete: "backspace",
+    Qt.Key.Key_Space: "space", Qt.Key.Key_Escape: "esc",
+}
+
+
+def key_name(event) -> Optional[str]:
+    """The `handle_key` name for a `QKeyEvent`, or None for a key that means nothing here.
+
+    Letters come through as themselves, lower-cased, so ``u`` and ``c`` work with or without Shift
+    and with CapsLock on -- an operator clicking 32 polygons at 2 am should not lose a vial to a
+    stuck CapsLock.
+    """
+    named = _QT_KEY_NAMES.get(event.key())
+    if named is not None:
+        return named
+    text = (event.text() or "").strip().lower()
+    return text if len(text) == 1 and text.isprintable() else None
 
 
 def fit_rect(src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int, int, int]:
@@ -57,15 +80,118 @@ def fit_rect(src_w: int, src_h: int, dst_w: int, dst_h: int) -> Tuple[int, int, 
 
 
 class PreviewWidget(QWidget):
-    """Paints the most recent frame, letterboxed, and holds its buffer alive while it does."""
+    """Paints the most recent frame, letterboxed, and holds its buffer alive while it does.
+
+    IT IS ALSO THE SURFACE EVERY VIDEO JOB IS DONE ON. Drawing vial positions, replaying a
+    recording and watching a run all happen HERE, in the window, rather than in a cv2 window in a
+    child process. Two things make that possible and both are on this widget:
+
+      * `overlay` -- an object with ``paint(painter, view)``, called after the frame is drawn and
+        given this widget so it can map image coordinates to widget ones. The frame underneath is
+        never modified, so what the operator draws on is the picture the camera sent.
+      * `to_image` / `to_widget` -- the inverse and forward of `fit_rect`. A click lands at a widget
+        pixel and has to become an IMAGE pixel before it can be a polygon vertex, or the saved
+        calibration is in screen coordinates of whatever size the window happened to be.
+
+    THE cv2 WINDOW HAD TO KNOW HOW BIG THE DESKTOP WAS; this one does not. `live_vial_selector.
+    screen_view_limit` exists because an AUTOSIZE cv2 window draws at the frame's own pixel size and
+    silently runs off the screen edge -- the regression that put the lower vial row where it could
+    not be clicked. A letterboxed Qt widget inside a layout cannot do that: it is given a rectangle
+    and it fits the frame into it, at any window size, with the mapping staying exact.
+    """
+
+    #: Where the operator clicked, in IMAGE pixels (floats -- the caller rounds if it wants whole
+    #: pixels). Clicks on the letterbox margin are not emitted at all: they are not on the picture.
+    clicked = Signal(float, float)
+    #: A `handle_key` key name. Emitted only while `interactive` is on, so ordinary use of the
+    #: window cannot type into a drawing session that is not happening.
+    key_pressed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._array = None
         self._image: Optional[QImage] = None
+        self._interactive = False
+        self.overlay = None
+        self.placeholder = "No picture - the camera is not open"
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAutoFillBackground(False)
+
+    # -- interaction ---------------------------------------------------------------------------
+    def set_overlay(self, overlay) -> None:
+        """Draw `overlay` over every frame from now on. None removes it."""
+        self.overlay = overlay
+        self.update()
+
+    def set_interactive(self, on: bool) -> None:
+        """Take clicks and keys, or stop taking them.
+
+        FOCUS IS ONLY TAKEN WHILE A JOB WANTS IT. A frame view that always grabbed the keyboard
+        would swallow the keystrokes the settings pane is entitled to -- and the window already
+        goes out of its way to keep initial focus off anything that edits a camera setting.
+        """
+        self._interactive = bool(on)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus if on else Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if on:
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    @property
+    def interactive(self) -> bool:
+        return self._interactive
+
+    def image_rect(self) -> QRect:
+        """Where the frame is actually painted inside this widget. Empty if there is no frame."""
+        if self._image is None:
+            return QRect(0, 0, 0, 0)
+        x, y, w, h = fit_rect(self._image.width(), self._image.height(),
+                              self.width(), self.height())
+        return QRect(x, y, w, h)
+
+    def to_image(self, px: float, py: float) -> Optional[Tuple[float, float]]:
+        """Widget pixel -> image pixel, or None if that point is not ON the picture.
+
+        Returning None rather than a clamped edge coordinate is deliberate: a click on the black
+        letterbox margin is not a vertex the operator meant to place, and silently snapping it to
+        the frame edge would put a polygon corner somewhere nobody clicked.
+        """
+        rect = self.image_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+        if not (rect.x() <= px <= rect.x() + rect.width()
+                and rect.y() <= py <= rect.y() + rect.height()):
+            return None
+        sx = self._image.width() / float(rect.width())
+        sy = self._image.height() / float(rect.height())
+        return ((px - rect.x()) * sx, (py - rect.y()) * sy)
+
+    def to_widget(self, x: float, y: float) -> QPointF:
+        """Image pixel -> widget pixel. The exact inverse of `to_image` inside the frame."""
+        rect = self.image_rect()
+        if self._image is None or rect.width() <= 0 or rect.height() <= 0:
+            return QPointF(0.0, 0.0)
+        sx = rect.width() / float(self._image.width())
+        sy = rect.height() / float(self._image.height())
+        return QPointF(rect.x() + x * sx, rect.y() + y * sy)
+
+    def mousePressEvent(self, event) -> None:
+        if not self._interactive or event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        position = event.position()
+        point = self.to_image(position.x(), position.y())
+        if point is not None:
+            self.clicked.emit(point[0], point[1])
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:
+        if not self._interactive:
+            return super().keyPressEvent(event)
+        name = key_name(event)
+        if name is None:
+            return super().keyPressEvent(event)
+        self.key_pressed.emit(name)
+        event.accept()
 
     def set_frame(self, array) -> None:
         """Adopt a mono8 HxW ndarray as the frame to paint. Ignores anything else.
@@ -98,69 +224,27 @@ class PreviewWidget(QWidget):
         painter.fillRect(self.rect(), Qt.GlobalColor.black)
         if self._image is None:
             painter.setPen(Qt.GlobalColor.gray)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                             "No picture - the camera is not open")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.placeholder)
             return
-        x, y, w, h = fit_rect(self._image.width(), self._image.height(),
-                              self.width(), self.height())
-        if w and h:
-            painter.drawImage(QRect(x, y, w, h), self._image)
-
-
-class PreviewPane(QWidget):
-    """The picture, its honest caption, and the timer that pulls frames off the one-slot box.
-
-    THE PULL IS A TIMER, NOT A SIGNAL PER FRAME. Qt does not coalesce queued signals: measured, 300
-    frame-sized payloads emitted at a stalled GUI thread were all still queued after half a second,
-    holding every one of them in memory. A run is watched for days, and a stall of a minute -- a
-    dragged window, a screen lock, a virus scan -- would queue thousands. Pulling from a one-slot
-    box means a stalled GUI shows a STALE frame and drops the rest, which is the only failure mode
-    here that cannot end an experiment.
-    """
-
-    def __init__(self, session, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.session = session
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        self.view = PreviewWidget()
-        layout.addWidget(self.view, 1)
-
-        self.caption = QLabel("Camera not open - nothing is being read")
-        self.caption.setProperty("role", "note")
-        self.caption.setWordWrap(True)
-        layout.addWidget(self.caption)
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(PULL_INTERVAL_MS)
-        # A bound method of an object built on the GUI thread -- the only connection style measured
-        # to actually deliver on the GUI thread. See `camera_session`.
-        self._timer.timeout.connect(self._pull)
-        self._timer.start()
-
-    def _pull(self) -> None:
-        frame = self.session.latest.take()
-        if frame is not None:
-            self.view.set_frame(frame)
-        self._update_caption()
-
-    def _update_caption(self) -> None:
-        shown, dropped = self.session.latest.stats
-        if not self.session.is_open:
-            self.caption.setText("Camera not open - nothing is being read")
+        rect = self.image_rect()
+        if rect.width() and rect.height():
+            painter.drawImage(rect, self._image)
+        if self.overlay is None:
             return
-        delivered = self.session.measured_fps
-        width, height = self.view.frame_size
-        bits = []
-        if width and height:
-            bits.append("%dx%d" % (width, height))
-        # "measured" is stated, and it means COUNTED FROM FRAMES THAT ARRIVED -- not the frame-rate
-        # setting, and not the camera's own read-back. See the module docstring.
-        bits.append("camera delivering %.1f fps (measured)" % delivered if delivered > 0
-                    else "waiting for the first frame")
-        total = shown + dropped
-        if total:
-            bits.append("showing %d of %d frames - %d not shown" % (shown, total, dropped))
-        self.caption.setText("  -  ".join(bits))
+        # THE OVERLAY MAY NEVER TAKE THE WINDOW DOWN. It is drawn on every frame of a run that is
+        # watched for days; a paint that raised would raise again on the next frame and every one
+        # after it. A broken overlay costs its own drawing and nothing else.
+        try:
+            painter.save()
+            self.overlay.paint(painter, self)
+        except Exception:
+            pass
+        finally:
+            painter.restore()
+
+
+# `PreviewPane` USED TO LIVE HERE and has been deleted rather than left unused. It was the picture
+# plus its caption plus the pull timer -- and `video_stage.VideoStage` is now that, with the video
+# JOBS as well. Keeping both would leave two widgets that show a camera, one of which is wired to
+# nothing: the next person to add something to "the preview" would have a 50% chance of adding it
+# to the one that is not on screen. The caption logic moved with it, to `video_stage._camera_caption`.

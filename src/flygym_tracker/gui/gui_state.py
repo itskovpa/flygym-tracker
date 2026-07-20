@@ -49,6 +49,11 @@ DEFAULTS: Dict[str, Any] = {
     "calib_dir": "calib_faces",
     "output_dir": "output",
     "recent_configs": [],
+    #: The last recording a video job was pointed at, so the file picker opens where the operator
+    #: was rather than at the top of the disk. Listed HERE because `save_state` writes only the
+    #: keys in this table -- a key the window sets but this dict does not know about is dropped on
+    #: the way to disk, silently, and looks like a setting that will not stick.
+    "last_video": "",
 }
 
 #: How many entries the config dropdown keeps. Small: this is a shortcut, not a history feature,

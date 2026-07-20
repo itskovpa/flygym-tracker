@@ -648,13 +648,23 @@ def test_run_bat_still_checks_the_imports_the_window_cannot_report_on_itself():
     assert "requirements.txt" in text
 
 
-def test_run_bat_still_warns_about_a_headless_opencv_build():
-    """The app draws with Qt and does not care. The tools it LAUNCHES -- vial drawing, replay with
-    the monitor -- do, and finding out from a child process that silently fails to open a window is
-    worse than being told here."""
-    text = _run_bat_text()
-    assert "opencv-python-headless" in text
-    assert "has_gui_support" in text
+def test_run_bat_no_longer_warns_about_a_headless_opencv_build():
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the behaviour it pinned is genuinely gone.
+
+    It was right at the time: the app drew with Qt and did not care, but the tools it LAUNCHED --
+    vial drawing, replay with the monitor -- opened OpenCV windows in child processes, and finding
+    that out from a child that silently fails to open a window is worse than being told up front.
+
+    Those tools are not launched any more. Every video job happens inside the app's own window,
+    drawn with Qt (`gui/video_stage.py`), so nothing the launcher starts opens an OpenCV window.
+    OpenCV is still used for the maths -- masks, contours, frame differences -- and the headless
+    build does all of that identically. Warning about it now would send an operator to uninstall
+    and reinstall a package to fix a window that no longer exists.
+    """
+    code = "\n".join(line for line in _run_bat_text().splitlines()
+                     if not line.strip().upper().startswith("REM"))
+    assert "has_gui_support" not in code
+    assert "opencv-python-headless" not in code
 
 
 def test_run_bat_no_longer_hard_codes_the_experiment_paths():

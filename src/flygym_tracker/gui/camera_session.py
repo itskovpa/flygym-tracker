@@ -59,6 +59,9 @@ class CameraSession(QObject):
     written = Signal(str, bool, object, str)  # (key, ok, confirmed, message)
     ranges_changed = Signal(dict)
     values_read = Signal(dict)
+    #: The attached per-frame job finished, or failed with a message. See `attach_tap`.
+    tap_finished = Signal()
+    tap_failed = Signal(str)
 
     def __init__(self, factory: Callable[[], Any], parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -85,6 +88,8 @@ class CameraSession(QObject):
         self._worker.ranges_changed.connect(self._on_ranges)
         self._worker.values_read.connect(self._on_values)
         self._worker.read_error.connect(self._on_read_error)
+        self._worker.tap_finished.connect(self.tap_finished)
+        self._worker.tap_failed.connect(self.tap_failed)
         self._thread.start()
 
     # -- state -------------------------------------------------------------------------------
@@ -166,6 +171,30 @@ class CameraSession(QObject):
         self._worker.enqueue(key, value, token)
         QMetaObject.invokeMethod(self._worker, "drain_writes", Qt.ConnectionType.QueuedConnection)
         return True
+
+    def attach_tap(self, job) -> bool:
+        """Feed `job` EVERY frame the camera delivers, on the camera thread. False if it cannot be.
+
+        This is how a noise measurement or a face-learning session is done in the window against
+        the live camera without opening a second handle -- which is the one thing this class
+        exists to make impossible. The job sees the undecimated stream; the preview goes on
+        showing its ~15 fps of it (see `camera_worker._tap` for why that distinction is not
+        cosmetic).
+        """
+        if self._state != STREAMING or self._worker.tap is not None:
+            return False
+        self._worker.set_tap(job)
+        return True
+
+    def detach_tap(self) -> None:
+        """Stop feeding the attached job. Safe when there is none."""
+        self._worker.set_tap(None)
+
+    @property
+    def tap(self):
+        """The attached job, or None. Read from the GUI thread for its progress figures -- those
+        are counters written by one thread and read by another, stale by at most one frame."""
+        return self._worker.tap
 
     def refresh_ranges(self) -> None:
         if self._state == STREAMING:

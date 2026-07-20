@@ -100,11 +100,21 @@ def test_every_old_menu_entry_still_exists_somewhere_the_operator_can_reach_it(q
         window.session.shutdown()
 
 
-def test_run_bat_no_longer_gates_the_settings_surface_on_an_opencv_gui_build():
-    """The Qt app draws with Qt. Refusing to open it because OpenCV was installed headless would be
-    a support call caused by nothing."""
+def test_run_bat_never_blocks_the_app_on_an_opencv_gui_build():
+    """The app draws with Qt, and now that EVERY video job happens in its own window it does not
+    open an OpenCV window at all -- not even indirectly through a child process. Refusing to start,
+    or nagging about a headless OpenCV, would be a support call caused by nothing.
+
+    Tested as BEHAVIOUR rather than by matching a sentence: what matters is that the launcher does
+    not branch on `has_gui_support`, whatever wording explains it.
+    """
     text = io.open(RUN_BAT, encoding="utf-8", errors="replace").read()
-    assert "does not use OpenCV to draw" in text
+    code = "\n".join(line for line in text.splitlines()
+                     if not line.strip().upper().startswith("REM"))
+    assert "has_gui_support" not in code, \
+        "run.bat still gates on an OpenCV GUI build the app no longer needs"
+    assert "pip uninstall" not in code, \
+        "run.bat still offers to reinstall OpenCV for a window it no longer opens"
 
 
 def test_pyproject_ships_a_gui_entry_point_and_keeps_qt_optional():

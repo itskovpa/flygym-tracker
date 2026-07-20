@@ -38,12 +38,14 @@ from flygym_tracker.gui import gui_state
 from flygym_tracker.gui.camera_lock_dialog import CameraLockDialog, qt_confirm
 from flygym_tracker.gui.camera_session import CLOSED, STREAMING, CameraSession
 from flygym_tracker.gui.camera_status import CameraStatusBar
-from flygym_tracker.gui.preview import PreviewPane
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.run_controller import RunController
-from flygym_tracker.gui.run_panel import RunPanel, launch_cli_tool
+from flygym_tracker.gui.run_panel import RunPanel
 from flygym_tracker.gui.session_bar import SessionBar
 from flygym_tracker.gui.settings_view import SettingsView
+from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE
+from flygym_tracker.gui.video_stage import RUN as STAGE_RUN
+from flygym_tracker.gui.video_stage import VideoStage
 from flygym_tracker.settings_controller import (SettingsController, camera_block_reason,
                                                 is_start_only)
 from flygym_tracker.settings_model import build_app_settings
@@ -103,8 +105,14 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.settings_view = SettingsView(self.controller)
         splitter.addWidget(self.settings_view)
-        self.preview = PreviewPane(self.session)
-        splitter.addWidget(self.preview)
+        # THE PICTURE IS THE STAGE EVERY VIDEO OPERATION IS PERFORMED ON. Drawing vial positions,
+        # replaying a recording, measuring the noise floor and learning the drum faces used to be
+        # four child processes with four OpenCV windows; they are modes of this one widget now.
+        self.stage = VideoStage(self.session, self.run)
+        #: The old name, kept because it is what the window's own code and its tests call the
+        #: picture. It is the same object -- there is only one picture in this window.
+        self.preview = self.stage
+        splitter.addWidget(self.stage)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
         # Explicit initial sizes, not just stretch factors: stretch alone let the settings pane
@@ -171,6 +179,8 @@ class MainWindow(QMainWindow):
         self.run_panel.start_requested.connect(self.start_run)
         self.run_panel.stop_requested.connect(self.run.stop)
         self.run_panel.tool_requested.connect(self._on_tool)
+        self.stage.job_finished.connect(self._on_job_finished)
+        self.stage.mode_changed.connect(self._on_stage_mode)
         self.run.state_changed.connect(self._on_run_state)
         self.run.progress.connect(self.run_panel.set_progress)
         self.run.setting_applied.connect(self._on_run_setting_applied)
@@ -387,6 +397,10 @@ class MainWindow(QMainWindow):
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             return
+        # THE EXPERIMENT IS WATCHED IN THIS WINDOW. The preview camera has just been handed over,
+        # so without this the picture would sit on the last frame the preview saw -- a still of the
+        # rig, indistinguishable from a live one, for however many days the run lasts.
+        self.stage.show_run()
         # THE ROUTER NOW HAS A RUN TO ROUTE TO. From here `_on_setting_change` sends camera AND
         # algorithm keys into `TrackerPipeline.apply_setting`, which applies them AND logs them as
         # `setting_change` events (invariant 4).
@@ -422,8 +436,23 @@ class MainWindow(QMainWindow):
             # crash here is worse still: fall back and say so on the readiness strip.
             return self.config
 
+    def _on_stage_mode(self, mode: str) -> None:
+        """A video job has the picture, so the buttons that would start a SECOND one go grey.
+
+        Two jobs at once is not a thing that can half-work: they would be two readers of one
+        exclusive camera, or two videos interleaving frames into one box -- which on screen looks
+        exactly like a corrupted recording.
+        """
+        from flygym_tracker.gui.video_stage import CAMERA
+
+        self.run_panel.set_stage_busy(mode != CAMERA)
+
     def _on_run_state(self, state: str, detail: str) -> None:
         self.run_panel.set_run_state(state, detail)
+        # A finished run gives the picture back to the camera preview, so the next thing the
+        # operator does is not done against the last frame of the last experiment.
+        if state in (DONE, FAILED, IDLE) and self.stage.mode == STAGE_RUN:
+            self.stage.show_camera()
         # Width/Height must LOOK dead while the stream is running, not merely refuse when pressed
         # (invariant 3). The refusal itself is the pipeline's `setting_block_reason`; this is the
         # refresh that puts it on screen the moment the run starts and takes it off when it ends.
@@ -447,34 +476,182 @@ class MainWindow(QMainWindow):
             row._show_notice("this run could not take that change - it is stored for the next start")
 
     def _on_tool(self, action: str) -> None:
-        """Run one of `run.bat`'s old menu entries. cv2 tools go to a CHILD PROCESS -- see
-        `run_panel.launch_cli_tool` for the DPI measurement that makes that mandatory."""
+        """Every video job, IN THIS WINDOW.
+
+        WHAT THIS METHOD USED TO BE. Four `subprocess.Popen` calls into `python -m
+        flygym_tracker.cli`, each opening its own OpenCV window in its own process. That was not
+        laziness -- it was working around a real measurement: a `QApplication` makes this process
+        PER_MONITOR_AWARE, and `live_vial_selector.screen_view_limit` is built on the process
+        staying DPI-UNAWARE, because an AUTOSIZE cv2 window is laid out at the frame's own pixel
+        size and there is no other way to know whether that fits the desktop.
+
+        THE WORKAROUND IS GONE BECAUSE THE CONSTRAINT IS. A letterboxed Qt widget inside a layout
+        is given a rectangle and fits the frame into it; it cannot run off the screen edge at any
+        DPI, so nothing here needs to measure the desktop and nothing needs a second process to
+        stay unaware of it. What is left is what the operator asked for: one window.
+        """
         if action == "free_camera":
             self.show_camera_lock()
             return
-        config_path = self.controller.config_path or "config/flygym_rig.yaml"
         calib = self.state.get("calib_dir") or "calib_faces"
         if action == "draw_vials":
-            args = ["select-vials", "--out", calib, "--config", config_path]
+            self._begin_draw(calib)
         elif action == "noise":
-            args = ["noise", "--calib", calib, "--config", config_path]
+            self._begin_noise(calib)
+        elif action == "learn_faces":
+            self._begin_face_learning()
         elif action == "replay":
-            video, _ = QFileDialog.getOpenFileName(
-                self, "Replay which recording?", "", "Video files (*.avi *.mp4 *.mkv);;All files (*)")
-            if not video:
+            self._begin_replay(calib)
+
+    def _pick_video(self, title: str) -> Optional[str]:
+        video, _ = QFileDialog.getOpenFileName(
+            self, title, self.state.get("last_video") or "",
+            "Video files (*.avi *.mp4 *.mkv);;All files (*)")
+        if video:
+            self.state["last_video"] = video
+            gui_state.save_state(self.root, self.state)
+        return video or None
+
+    def _begin_draw(self, calib: str) -> None:
+        """Draw vial positions on the picture in this window.
+
+        THE "REUSE WHAT IS SAVED?" QUESTION IS A DIALOG NOW, not a terminal prompt. It used to be
+        `input()` in a child process, which under a GUI means a question asked into a console the
+        operator may not even have open -- and `prompt_reuse` defaults an unanswerable stdin to
+        YES, so pressing the button could silently do nothing visible at all.
+        """
+        from flygym_tracker.calibration import saved_selection
+
+        saved = saved_selection(calib)
+        if saved is not None and not self._ask_redraw(saved):
+            return
+        # `calibration.VIALS_PER_FACE`, which is also the CLI's `--n-vials` default -- the drum's
+        # geometry, not a preference, and it is not a config key precisely because it is the rig.
+        from flygym_tracker.calibration import VIALS_PER_FACE
+
+        if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE):
+            self.refresh_readiness()
+
+    def _ask_redraw(self, saved) -> bool:
+        """True = draw again. False = keep what is saved.
+
+        The DEFAULT differs by what was found, exactly as `live_vial_selector.prompt_reuse`
+        documents: a hand-drawn bundle defaults to keeping (saying no costs a keystroke, a mistaken
+        redraw costs a whole clicking session), while older AUTO-DETECTED boxes are named as such,
+        because those are the ones known to sit crookedly on the tubes.
+        """
+        from flygym_tracker.live_vial_selector import _format_saved_time
+
+        text = ("%s already holds %d vial position(s) (%s, saved %s)."
+                % (self.state.get("calib_dir") or "the calibration folder", saved.n_vials,
+                   "drawn by hand" if saved.hand_drawn
+                   else "AUTO-DETECTED boxes, known to sit crookedly on the tubes",
+                   _format_saved_time(saved.created)))
+        if self._confirm is not None:
+            return bool(self._confirm(text + " Draw them again?"))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Vial positions already exist")
+        box.setText(text)
+        box.setInformativeText("Drawing again replaces them.")
+        keep = box.addButton("Keep them", QMessageBox.ButtonRole.RejectRole)
+        redraw = box.addButton("Draw again", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(keep if saved.hand_drawn else redraw)
+        box.exec()
+        return box.clickedButton() is redraw
+
+    def _begin_noise(self, calib: str) -> None:
+        """Measure the noise floor here, watching the rig it is being measured on."""
+        mask, problem = _illum_mask(calib)
+        if mask is None:
+            QMessageBox.warning(self, "The noise floor cannot be measured yet", problem)
+            return
+        video = None
+        if not self.session.is_open:
+            video = self._pick_video("Measure the noise floor on which recording?")
+            if video is None:
+                self.stage.caption.setText(
+                    "The noise floor needs frames: open the camera, or pick a recording.")
                 return
-            args = ["replay", "--video", video, "--calib", calib, "--config", config_path,
-                    "--monitor"]
-        else:
+        self.stage.begin_noise(mask, k=float(_cfg(self.config, "activity.k") or 5.0),
+                               video=video)
+
+    def _begin_face_learning(self) -> None:
+        video = None
+        if not self.session.is_open:
+            video = self._pick_video("Learn the drum faces from which recording?")
+            if video is None:
+                self.stage.caption.setText(
+                    "Learning the faces needs frames: open the camera, or pick a recording.")
+                return
+        self.stage.begin_face_learning(video=video)
+
+    def _begin_replay(self, calib: str) -> None:
+        """Replay a recording through the IDENTICAL pipeline, watched in this window.
+
+        A replay is not a different program from a run -- it is the same pipeline with a file
+        instead of a sensor, which is what makes it worth anything as a check. So it goes through
+        `RunController` like a run does, fills the same frame box, and is watched in the same view.
+        The `source_factory` is the only difference, and it is built ON THE RUN THREAD (the plan
+        carries a callable, not an open file) so nothing opens a video on the GUI thread.
+        """
+        video = self._pick_video("Replay which recording?")
+        if video is None:
             return
-        try:
-            launch_cli_tool(args, cwd=self.root)
-        except Exception as exc:
-            # A tool that silently does not open is indistinguishable from one that is slow to
-            # start, and the operator's next move is to press the button again.
-            QMessageBox.warning(self, "That tool could not be started", str(exc))
+        plan = {
+            "config": self._config_for_run(),
+            "calib_dir": calib,
+            "output_dir": self.state.get("output_dir") or getattr(
+                getattr(self.config, "output", None), "dir", None),
+            "config_path": self.controller.config_path,
+            "source_factory": _video_source_factory(video),
+            "replay_of": video,
+        }
+        if not self.run.start(plan):
+            self.run_panel.set_run_state(self.run.state, self.run.detail)
             return
-        self.settings_view.set_status("started: %s" % " ".join(args[:2]))
+        self.stage.show_run()
+        self.settings_view.refresh()
+
+    def _on_job_finished(self, kind: str, payload: dict) -> None:
+        """A video job ended. Say what it produced, and put a measurement where it belongs.
+
+        THE NOISE FLOOR IS OFFERED INTO THE SETTINGS, NOT WRITTEN TO THE CONFIG FILE. Its whole
+        output is three suggested thresholds, and the old command printed them to a console for the
+        operator to retype. They land on the rows instead, as UNSAVED changes -- so they are
+        visible, comparable against what was there, revertable, and saved only when the operator
+        says so. Writing them straight to disk would be a measurement silently redefining what
+        every later activity reading means.
+        """
+        self.settings_view.set_status(payload.get("message", ""))
+        if kind == "noise" and not payload.get("failed"):
+            self._offer_noise_thresholds(payload)
+        self.settings_view.refresh()
+        self.refresh_readiness()
+
+    def _offer_noise_thresholds(self, payload: dict) -> None:
+        suggested = {
+            "activity.pixel_threshold": payload.get("suggested_pixel_threshold"),
+            "rotation.enter_threshold": payload.get("suggested_enter_threshold"),
+            "rotation.exit_threshold": payload.get("suggested_exit_threshold"),
+        }
+        applied = []
+        for key, value in suggested.items():
+            if value is None:
+                continue
+            try:
+                result = self.controller.commit(key, float(value))
+            except Exception:
+                continue
+            # `.moved`, NOT the result object. `commit` returns a `CommitResult` for every call,
+            # including a refusal and a no-op, and every one of those is truthy -- so testing the
+            # object would report a threshold as "put on the row" when the row had refused it.
+            if getattr(result, "moved", False):
+                applied.append(key)
+        if applied:
+            self.settings_view.set_status(
+                "%s  -  %d suggested threshold(s) put on the rows, UNSAVED. Check them, then save."
+                % (payload.get("message", ""), len(applied)))
 
     def _ask(self, text: str) -> bool:
         if self._confirm is not None:
@@ -582,6 +759,10 @@ class MainWindow(QMainWindow):
         # unflushed and the handle leaked -- which is how the NEXT session's "camera is busy"
         # appears, with no window on screen to explain it.
         self.run.shutdown()
+        # BEFORE the camera session: the stage may hold a tap on the camera thread and a thread of
+        # its own reading a video. Tearing the camera down under an attached job would have the
+        # grab loop calling into a job whose owner has gone.
+        self.stage.shutdown()
         self.session.shutdown()
         gui_state.save_state(self.root, self.state)
         event.accept()
@@ -607,6 +788,49 @@ class MainWindow(QMainWindow):
         if clicked is discard:
             return "discard"
         return "cancel"
+
+
+def _video_source_factory(video: str):
+    """A callable that opens `video`, built to run ON THE RUN THREAD.
+
+    A module-level function rather than a closure defined in the method: the plan dict is handed
+    across a thread boundary, and a closure over `self` would carry the whole window -- and every
+    widget in it -- into an object the run thread holds for the length of the run.
+    """
+    def factory():
+        from flygym_tracker.frame_source import VideoFileSource
+
+        return VideoFileSource(video)
+
+    return factory
+
+
+def _illum_mask(calib_dir: str):
+    """``(mask, None)`` for the first face's illumination mask, or ``(None, why not)``.
+
+    The noise floor is measured INSIDE this mask -- the lit part of the picture -- so without it
+    there is no measurement to make. Every failure is a sentence naming the folder, because all of
+    them are fixed by drawing the vials or by pointing at a different bundle.
+    """
+    import cv2
+
+    from flygym_tracker.calibration import load_calibration
+
+    if not calib_dir:
+        return None, "No calibration folder is chosen, so there is no lit area to measure inside."
+    try:
+        calib = load_calibration(calib_dir)
+    except Exception as exc:
+        return None, ("%s does not hold a calibration bundle yet (%s). Draw the vial positions "
+                      "first - that is what writes the illumination mask." % (calib_dir, exc))
+    if not calib.faces:
+        return None, "%s holds a calibration with no faces in it." % calib_dir
+    face = "A" if "A" in calib.faces else sorted(calib.faces)[0]
+    path = calib.faces[face].illum_mask_path
+    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None, "The illumination mask for face %s could not be read (%s)." % (face, path)
+    return mask, None
 
 
 def _cfg(config, path: str):

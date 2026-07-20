@@ -58,24 +58,17 @@ if errorlevel 1 (
   )
 )
 
-REM ---- OpenCV must be the GUI build for the vial editor and the live monitor ----
-REM      The app itself does not need it: it draws with Qt, not with cv2. But the
-REM      tools it LAUNCHES as child processes (draw vial positions, replay with
-REM      the monitor) do, and finding that out from a child process that silently
-REM      fails to open a window is worse than being told here.
-%PY% -c "from flygym_tracker.gui_support import has_gui_support; raise SystemExit(0 if has_gui_support() else 3)" >nul 2>&1
-if errorlevel 3 (
-  echo.
-  echo   NOTE: this OpenCV build has no GUI support ^(opencv-python-headless^).
-  echo   Drawing vial positions and the live monitor cannot open a window.
-  echo   The rest of the app is unaffected - it does not use OpenCV to draw.
-  set "FIXCV="
-  set /p FIXCV="  Fix it now? [Y/n]: "
-  if /I not "!FIXCV!"=="n" (
-    %PY% -m pip uninstall -y opencv-python-headless
-    %PY% -m pip install opencv-python
-  )
-)
+REM ---- OpenCV's GUI build is no longer needed BY THE APP ----
+REM      It used to be checked here and offered as a fix, because the app launched
+REM      the vial editor and the live monitor as child processes with cv2 windows.
+REM      It does not any more: drawing vial positions, replaying a recording,
+REM      measuring the noise floor and learning the drum faces all happen inside
+REM      the app's own window, drawn with Qt (see gui/video_stage.py). OpenCV is
+REM      still used for the MATHS - masks, contours, frame differences - and that
+REM      works identically in the headless build.
+REM
+REM      The `cli` subcommands (select-vials, edit-rois, replay --monitor) DO still
+REM      open cv2 windows when run from a terminal, and they check for themselves.
 
 REM ---- the one line this file exists for ----
 %PY% -m flygym_tracker.cli gui

@@ -9,20 +9,27 @@ NO TERMINAL PROMPT ANYWHERE. `run.bat` was a numbered menu over `python -m flygy
 every job it offered was one the operator reached by reading a list and typing a digit. They are
 buttons now.
 
-THE cv2 TOOLS ARE STILL LAUNCHED AS SUBPROCESSES, AND THAT IS NOT LAZINESS -- IT IS THE RULE
-`gui/app.py` documents at length. MEASURED: process DPI awareness is 0 (UNAWARE) before
-`QApplication(...)` and 2 (PER_MONITOR_AWARE) after. `live_vial_selector.screen_view_limit` depends
-on the process staying UNAWARE, because `SM_CXFULLSCREEN` then reports the desktop in the same
-coordinate space the OpenCV window is laid out in. On this machine's 2880x1800 panel at 200%
-scaling, running the ROI editor in a DPI-aware process put the bottom rows of every frame below the
-screen edge -- "not visible, and impossible to click... exactly the part of the tube the operator
-most needs to enclose". So the button starts a child process; it does not import cv2 here.
+AND THEY NO LONGER LAUNCH ANYTHING. These buttons used to start CHILD PROCESSES, one OpenCV window
+each. That was not laziness: process DPI awareness is 0 (UNAWARE) before `QApplication(...)` and 2
+(PER_MONITOR_AWARE) after, and `live_vial_selector.screen_view_limit` depends on the process
+staying UNAWARE, because an AUTOSIZE OpenCV window is laid out at the frame's own pixel size and
+`SM_CXFULLSCREEN` is the only thing that reports the desktop in that same coordinate space. On this
+machine's 2880x1800 panel at 200% scaling, a DPI-aware process put the bottom rows of every frame
+below the screen edge -- "not visible, and impossible to click... exactly the part of the tube the
+operator most needs to enclose".
+
+THE CONSTRAINT WENT AWAY WITH THE OpenCV WINDOW. A letterboxed Qt widget inside a layout is handed
+a rectangle and fits the frame into it; it cannot run off the screen edge at any DPI, so nothing
+needs to measure the desktop and nothing needs a second process to stay unaware of it. Each button
+now emits `tool_requested`, and the window switches `video_stage` into the mode that does the job
+IN the picture. See `video_stage`'s module docstring.
+
+THE TOOL STRIP WRAPS. A QHBoxLayout's minimum width is the sum of its children; measured, this row
+alone reported 1532 px against a 1440 px desktop. See `flow_layout` -- fourth occurrence of that
+bug class on this project.
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -30,6 +37,7 @@ from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton, QS
                                QVBoxLayout, QWidget)
 
 from flygym_tracker.gui import theme
+from flygym_tracker.gui.flow_layout import flow_strip
 from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, RUNNING, STARTING, STOPPING
 
 #: The drum: two faces of sixteen vials. Laid out as the rig is, so a dead column on screen is a
@@ -108,6 +116,8 @@ class RunPanel(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._running = False
+        self._stage_busy = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 6, 10, 6)
         outer.setSpacing(6)
@@ -150,17 +160,30 @@ class RunPanel(QWidget):
         self.vials = VialStrip()
         strip_row.addWidget(self.vials)
         strip_row.addStretch(1)
+        outer.addLayout(strip_row)
 
         # THE JOBS THAT WERE IN run.bat. Buttons, not a numbered menu, and each one names what it
         # opens rather than what it is called internally.
+        #
+        # ON A WRAPPING STRIP, which is not cosmetic. A QHBoxLayout's minimum width is the SUM of
+        # its children: measured, this row alone reported 1532 px, and the rig laptop's whole
+        # desktop is 1440 px wide -- so the window could not be fully seen and the buttons past the
+        # edge could not be reached. See `flow_layout` for the full measurement; it is the FOURTH
+        # time something on this project has been laid out wider or taller than that screen.
+        tools_widget, tools_row = flow_strip(spacing=8)
         for action, label, tip in (
             ("draw_vials", "Draw vial positions",
-             "Opens the vial selector on the rig camera, in its own process (see the module "
-             "docstring: a DPI-aware process draws the lower vial row below the screen edge)."),
+             "Draw the vials on the picture in this window, on the live camera or on a "
+             "recording. Click corners; the keys and the buttons under the picture do the same."),
             ("replay", "Replay a recording",
-             "Run the identical pipeline against a recorded video instead of the camera."),
+             "Run the identical pipeline against a recorded video instead of the camera, and "
+             "watch it in this window."),
             ("noise", "Measure noise floor",
-             "Measure the static-rig noise floor and suggest activity/rotation thresholds."),
+             "Measure the static-rig noise floor, watching the rig while it is measured. The "
+             "suggested thresholds land on the settings rows, unsaved."),
+            ("learn_faces", "Learn drum faces",
+             "Learn one marker template per drum face while the drum turns. Without this, "
+             "everything is recorded as one face."),
             ("free_camera", "Free the camera...",
              "Name what is holding the camera, and offer to stop it. Nothing is stopped "
              "without a yes."),
@@ -170,20 +193,33 @@ class RunPanel(QWidget):
             button.setToolTip(tip)
             button.clicked.connect(
                 lambda _checked=False, a=action: self.tool_requested.emit(a))
-            strip_row.addWidget(button)
+            tools_row.addWidget(button)
             setattr(self, "tool_%s_button" % action, button)
-        outer.addLayout(strip_row)
+        outer.addWidget(tools_widget)
+
+    #: The video jobs. All of them want frames, and there is one picture to show them in.
+    VIDEO_TOOLS = ("draw_vials", "replay", "noise", "learn_faces")
 
     # -- state ----------------------------------------------------------------------------------
+    def set_stage_busy(self, busy: bool) -> None:
+        """A video job already has the picture, so nothing may start a second one."""
+        self._stage_busy = bool(busy)
+        self._refresh_tools()
+
+    def _refresh_tools(self) -> None:
+        blocked = self._running or self._stage_busy
+        for action in self.VIDEO_TOOLS:
+            getattr(self, "tool_%s_button" % action).setEnabled(not blocked)
+
     def set_run_state(self, state: str, detail: str = "") -> None:
         """Enable exactly the actions that are legal now, and say what is happening in a sentence."""
         running = state in (STARTING, RUNNING, STOPPING)
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(state in (STARTING, RUNNING))
-        # A cv2 tool wants the camera, and the run has it. Offering the button anyway would be
+        # A video job wants frames, and the run has the camera. Offering the button anyway would be
         # offering a job that can only fail with the SDK's culprit-free error.
-        for action in ("draw_vials", "replay", "noise"):
-            getattr(self, "tool_%s_button" % action).setEnabled(not running)
+        self._running = running
+        self._refresh_tools()
         self.state_label.setText(_state_sentence(state, detail))
         if state in (IDLE, DONE, FAILED):
             self.vials.clear()
@@ -218,19 +254,14 @@ def _hms(seconds: float) -> str:
     return "%d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
 
 
-def launch_cli_tool(args, *, cwd: Optional[str] = None):
-    """Start `python -m flygym_tracker.cli <args>` as a CHILD PROCESS. Never in-process.
-
-    See the module docstring for the measurement: a `QApplication` in this process makes it
-    PER_MONITOR_AWARE, and `live_vial_selector.screen_view_limit` is built on the process staying
-    UNAWARE. Importing cv2 here would also risk a cv2/Qt symbol clash for no gain.
-
-    Returns the `Popen`, or raises -- the caller reports the failure on screen, because a tool that
-    silently does not open is indistinguishable from one that is slow to start.
-    """
-    command = [sys.executable, "-m", "flygym_tracker.cli"] + [str(a) for a in args]
-    env = dict(os.environ)
-    # The child must NOT inherit the offscreen platform the test suite sets, or a tool launched
-    # from a real window would open where nobody can see it.
-    env.pop("QT_QPA_PLATFORM", None)
-    return subprocess.Popen(command, cwd=cwd or None, env=env)
+# `launch_cli_tool` USED TO LIVE HERE and has been deleted rather than left unused. It started
+# `python -m flygym_tracker.cli <args>` as a child process so the cv2 tools could run in a
+# DPI-UNAWARE process -- `live_vial_selector.screen_view_limit` depends on that, because an
+# AUTOSIZE OpenCV window is laid out at the frame's own pixel size and there is no other way to
+# find out whether that fits the desktop.
+#
+# NOTHING IN THIS WINDOW OPENS AN OpenCV WINDOW ANY MORE (see `video_stage`), so the constraint is
+# gone with the thing that had it. Keeping the helper would leave a working, tested-looking way to
+# launch a second copy of a tool that is already in this window -- against a camera this process
+# may be holding exclusively. The CLI subcommands themselves are untouched and still work from a
+# terminal; this was only the GUI's way of shelling out to them.

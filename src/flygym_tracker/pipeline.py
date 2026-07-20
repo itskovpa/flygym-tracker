@@ -1047,6 +1047,72 @@ class TrackerPipeline:
         return bool(stop_flag)
 
 
+class NoiseAccumulator:
+    """The noise-floor arithmetic, one frame at a time. No source, no loop, no I/O.
+
+    EXTRACTED SO THERE IS ONE IMPLEMENTATION, NOT TWO. `measure_noise` drives it over a source in a
+    blocking loop (the CLI path); the window drives it from a worker thread that also feeds the
+    live picture to the preview, so the operator can SEE the rig they are measuring the noise floor
+    of. Restating the running-sum arithmetic in the GUI would mean a suggested pixel threshold that
+    could differ between the two surfaces -- and that number seeds every activity measurement the
+    rig makes afterwards.
+
+    Streaming sums rather than stored frames: a 3-minute measurement at 88 fps is ~16000 frames of
+    1280x1024, and keeping them to compute a standard deviation at the end would be 20 GB.
+    """
+
+    def __init__(self, illum_mask, k: float = 5.0) -> None:
+        self._mask = _to_bool_mask(illum_mask)
+        self.k = float(k)
+        self._prev: Optional[np.ndarray] = None
+        self._metric_vals: List[float] = []
+        self._sum1 = 0.0          # sum of masked per-pixel abs-diffs
+        self._sum2 = 0.0          # sum of squares
+        self._count = 0           # number of masked pixels pooled
+        self.n_frames = 0
+        self.n_pairs = 0
+
+    def observe(self, image) -> None:
+        """Feed one frame, in acquisition order. The first one only becomes a baseline."""
+        self.n_frames += 1
+        if self._prev is not None:
+            vals = cv2.absdiff(image, self._prev)[self._mask].astype(np.float64)
+            if vals.size:
+                self._sum1 += float(vals.sum())
+                self._sum2 += float(np.square(vals).sum())
+                self._count += int(vals.size)
+                self._metric_vals.append(float(vals.mean()))
+                self.n_pairs += 1
+        self._prev = image
+
+    def result(self) -> dict:
+        """The suggested thresholds. Raises `ValueError` if nothing measurable was seen."""
+        if self.n_pairs == 0:
+            raise ValueError(
+                f"measure_noise needs at least 2 frames within the mask; got {self.n_frames} "
+                f"frame(s), {self.n_pairs} usable pair(s)."
+            )
+        noise_mean = self._sum1 / self._count
+        noise_std = float(np.sqrt(max(0.0, self._sum2 / self._count - noise_mean * noise_mean)))
+        metric_arr = np.asarray(self._metric_vals, dtype=np.float64)
+        metric_mean = float(metric_arr.mean())
+        metric_std = float(metric_arr.std())
+        return {
+            "noise_mean": float(noise_mean),
+            "noise_std": float(noise_std),
+            "suggested_pixel_threshold": float(noise_mean + self.k * noise_std),
+            "metric_mean": metric_mean,
+            "metric_std": metric_std,
+            "suggested_enter_threshold": float(metric_mean + DEFAULT_ENTER_K * metric_std),
+            "suggested_exit_threshold": float(metric_mean + DEFAULT_EXIT_K * metric_std),
+            "k": self.k,
+            "enter_k": DEFAULT_ENTER_K,
+            "exit_k": DEFAULT_EXIT_K,
+            "n_frames": self.n_frames,
+            "n_pairs": self.n_pairs,
+        }
+
+
 def measure_noise(source: FrameSource, illum_mask, n_frames: int = 100, k: float = 5.0) -> dict:
     """Measure the static-rig noise floor to seed activity + rotation thresholds (DESIGN.md §9).
 
@@ -1074,58 +1140,11 @@ def measure_noise(source: FrameSource, illum_mask, n_frames: int = 100, k: float
     ``source`` is opened if not already (``open()`` is idempotent on the shipped sources); lifecycle
     (closing) stays with the caller -- wrap it in ``with source:`` or close it yourself.
     """
-    mask = _to_bool_mask(illum_mask)
     source.open()
-
-    prev: Optional[np.ndarray] = None
-    metric_vals: List[float] = []
-    sum1 = 0.0            # sum of masked per-pixel abs-diffs
-    sum2 = 0.0            # sum of squares
-    count = 0             # number of masked pixels pooled
-    n_read = 0
-    n_pairs = 0
-
-    while n_read < n_frames:
+    accumulator = NoiseAccumulator(illum_mask, k=k)
+    while accumulator.n_frames < n_frames:
         frame = source.read()
         if frame is None:
             break
-        n_read += 1
-        cur = frame.image
-        if prev is not None:
-            diff = cv2.absdiff(cur, prev)
-            vals = diff[mask].astype(np.float64)
-            if vals.size:
-                sum1 += float(vals.sum())
-                sum2 += float(np.square(vals).sum())
-                count += int(vals.size)
-                metric_vals.append(float(vals.mean()))
-                n_pairs += 1
-        prev = cur
-
-    if n_pairs == 0:
-        raise ValueError(
-            f"measure_noise needs at least 2 frames within the mask; got {n_read} frame(s), "
-            f"{n_pairs} usable pair(s)."
-        )
-
-    noise_mean = sum1 / count
-    noise_var = max(0.0, sum2 / count - noise_mean * noise_mean)
-    noise_std = float(np.sqrt(noise_var))
-    metric_arr = np.asarray(metric_vals, dtype=np.float64)
-    metric_mean = float(metric_arr.mean())
-    metric_std = float(metric_arr.std())
-
-    return {
-        "noise_mean": float(noise_mean),
-        "noise_std": float(noise_std),
-        "suggested_pixel_threshold": float(noise_mean + k * noise_std),
-        "metric_mean": metric_mean,
-        "metric_std": metric_std,
-        "suggested_enter_threshold": float(metric_mean + DEFAULT_ENTER_K * metric_std),
-        "suggested_exit_threshold": float(metric_mean + DEFAULT_EXIT_K * metric_std),
-        "k": float(k),
-        "enter_k": DEFAULT_ENTER_K,
-        "exit_k": DEFAULT_EXIT_K,
-        "n_frames": n_read,
-        "n_pairs": n_pairs,
-    }
+        accumulator.observe(frame.image)
+    return accumulator.result()
