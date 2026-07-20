@@ -188,6 +188,7 @@ class TrackerPipeline:
         exit_threshold: Optional[float] = None,
         max_residual: float = DEFAULT_MAX_RESIDUAL,
         max_shift: Optional[float] = None,
+        track_flies: bool = True,
         read_retries: int = DEFAULT_READ_RETRIES,
         read_retry_sleep: float = DEFAULT_READ_RETRY_SLEEP,
     ) -> None:
@@ -249,6 +250,27 @@ class TrackerPipeline:
         self._face_calib_bbox: Dict[str, Dict[int, Bbox]] = {}                  # face -> gvid -> anchor bbox
         self._face_calib_quad: Dict[str, Dict[int, Optional[list]]] = {}        # face -> gvid -> anchor quad|None
         self._vial_meta: Dict[int, Tuple[str, object]] = {}                     # gvid -> (face, VialROI)
+        #: Fly tracking, on its own threads beside this loop. See `fly_runner` for why threads
+        #: genuinely help here (cv2 releases the GIL) and why this can never block the loop.
+        #:
+        #: ONE POOL OVER THE 16 LOCAL VIAL IDS, not 32 globals. Only one drum face faces the
+        #: camera at a time and both faces share identical polygon coordinates, so there are
+        #: sixteen tubes to track; which FACE they belong to is decided when a dwell's summaries
+        #: are harvested, from the face that was current while that dwell was tracked.
+        self.track_flies = bool(track_flies)
+        self._pool = None
+        #: Full-frame boolean masks per LOCAL vial id. `_face_active` stores crop-sized submasks,
+        #: and `VialTracker` wants a full-frame ROI.
+        self._track_masks: Dict[int, np.ndarray] = {}
+        self._track_axes: Dict[int, tuple] = {}
+        #: Harvested dwell summaries waiting for the bin they belong to.
+        self._behaviour_pending: List[dict] = []
+        self.n_behaviour_records = 0
+        #: Behaviour writes that failed. Reported in the run summary AND as an event -- see
+        #: `_flush_behaviour` for the measured reason this is counted rather than swallowed.
+        self.behaviour_write_errors = 0
+        self._tracking_summary: dict = {}
+
         self._precompute_faces()
         self.max_shift = (
             float(self._max_shift_arg) if self._max_shift_arg is not None
@@ -694,6 +716,18 @@ class TrackerPipeline:
             fps = 0.0
         self._fps = fps if fps > 0 else 1.0
 
+        # STARTED HERE, NOT IN THE CONSTRUCTOR, for two reasons: the frame rate is only known once
+        # the source is open (it sets the tracker's link gate), and a pipeline that is built and
+        # never run must not leave worker threads behind.
+        if self.track_flies and self._pool is None:
+            try:
+                self._build_tracking()
+            except Exception:
+                # Fly tracking is an addition; activity is the run. A rig whose bundle cannot
+                # produce tracking geometry still measures activity for three days.
+                self.track_flies = False
+                self._pool = None
+
         frames_processed = 0
         stopped_reason = "eof"
         try:
@@ -716,7 +750,20 @@ class TrackerPipeline:
             final = self.accumulator.flush()
             if final is not None:
                 self._emit_bin(final)
+            # THE LAST DWELL COUNTS TOO. A run stopped mid-dwell has trackers holding frames that
+            # were measured and would otherwise be thrown away with the threads -- the same reason
+            # the accumulator flushes its final, partial bin rather than dropping it.
+            if self.track_flies:
+                self._harvest_dwell(self._last_elapsed, None)
+                self._flush_behaviour()
         finally:
+            if self._pool is not None:
+                # READ BEFORE CLOSING. How much of the stream was actually tracked belongs in the
+                # run summary -- a behavioural figure computed from 60% of the frames is a real
+                # measurement of those frames, and the number saying so must survive the teardown.
+                self._tracking_summary = self._pool.stats()
+                self._pool.close()
+                self._pool = None
             self.logger.close()
             self.source.close()
 
@@ -727,11 +774,104 @@ class TrackerPipeline:
             "n_rotations": self.n_rotations,
             "n_bins": self.n_bins,
             "n_activity_records": self.n_activity_records,
+            "n_behaviour_records": self.n_behaviour_records,
+            "behaviour_write_errors": self.behaviour_write_errors,
+            "tracking": self._tracking_summary,
             "faces_seen": list(self._faces_seen),
             "per_face_frames": dict(self._per_face_frames),
             "stopped_reason": stopped_reason,
             "observer_failures": self.observer_failures,
         }
+
+    # ---- fly tracking (beside the loop, never inside it) --------------------------------------
+
+    def _build_tracking(self) -> None:
+        """Full-frame masks and climbing axes for the 16 local vials, and the worker pool.
+
+        Built ONCE, from the first face in the bundle: both faces carry identical polygon
+        coordinates by construction (`build_two_face_calibration_from_polygons`), so one set of
+        shapes serves whichever face is in front of the camera.
+        """
+        from flygym_tracker.fly_runner import FlyTrackingPool, vial_axis
+
+        faces = self.calibration.faces
+        name = "A" if "A" in faces else sorted(faces)[0]
+        height, width = self.calibration.image_height, self.calibration.image_width
+        for vial in faces[name].vials:
+            if not vial.present:
+                continue
+            shape = vial_shape(vial)
+            if shape is None:
+                continue
+            mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+            cv2.fillPoly(mask, [np.asarray(shape, dtype=np.int32).reshape(-1, 1, 2)], 255)
+            self._track_masks[int(vial.id)] = mask.astype(bool)
+            self._track_axes[int(vial.id)] = vial_axis(shape)
+        if not self._track_masks:
+            self.track_flies = False
+            return
+        fps = float(getattr(self.source, "fps", 0.0) or 20.0)
+        self._pool = FlyTrackingPool(
+            {vid: (self._track_masks[vid], self._track_axes[vid]) for vid in self._track_masks},
+            fps=fps)
+        self._pool.start()
+
+    def _harvest_dwell(self, elapsed_s: float, frame) -> None:
+        """A dwell has ended: turn its trackers into rows, tagged with the face that was showing.
+
+        HARVESTED AT THE DWELL BOUNDARY, NOT AT THE BIN BOUNDARY, and that is the whole reason
+        this is not two lines. A bin is 10 s and a dwell is ~2 s, so a bin spans several dwells and
+        usually a face change; taking the summaries when the BIN rolls would attribute every dwell
+        in it to whichever face happened to be showing at the end. One tracker per dwell is
+        `fly_tracking`'s rule, so one row per dwell is the honest unit to report.
+        """
+        if self._pool is None:
+            return
+        face = self._current_face or sorted(self.calibration.faces)[0]
+        fidx = self._face_index.get(face, 0)
+        for local_id, summary in self._pool.take_summaries().items():
+            row = dict(summary)
+            row.update({
+                "run_id": self.run_id,
+                "iso_time": self._iso_at(elapsed_s),
+                "elapsed_s": round(float(elapsed_s), 3),
+                "face": face,
+                "vial_id": fidx * 16 + int(local_id),
+            })
+            self._behaviour_pending.append(row)
+        self._pool.reset_dwell()
+
+    def _flush_behaviour(self) -> None:
+        """Write whatever dwells have completed. Called when a bin rolls, so the two files are
+        written at the same cadence even though they are measured at different ones."""
+        if not self._behaviour_pending:
+            return
+        rows, self._behaviour_pending = self._behaviour_pending, []
+        try:
+            self.logger.log_behaviour(rows)
+            self.n_behaviour_records += len(rows)
+        except Exception as exc:
+            # A behaviour write must never take down a run whose ACTIVITY is the primary result --
+            # but it must never be SILENT either, and the first version of this was.
+            #
+            # MEASURED, on the first end-to-end run: `log_behaviour` raised NameError (a missing
+            # import), this swallowed it, and the run reported "0 behaviour rows" while
+            # `take_summaries` had returned data for every vial twice over. Measured rows were
+            # thrown away and the summary said nothing had been measured -- which is the one
+            # outcome worse than crashing, because it looks like a rig with no flies in it.
+            self.behaviour_write_errors += 1
+            if self.behaviour_write_errors == 1:
+                # Once, not per bin: a 3-day run would otherwise fill events.csv with one copy of
+                # the same message every ten seconds and bury the events that matter.
+                self._log_event(self._last_elapsed, None, "behaviour_write_failed",
+                                "%d row(s) lost: %s" % (len(rows), exc))
+
+    def tracking_stats(self) -> dict:
+        return self._pool.stats() if self._pool is not None else {}
+
+    def fly_tracks(self) -> dict:
+        """`{local_vial_id: [polyline, ...]}` for the current dwell, for the live overlay."""
+        return self._pool.tracks() if self._pool is not None else {}
 
     # ---- per-frame processing ---------------------------------------------------------------
 
@@ -755,6 +895,9 @@ class TrackerPipeline:
             self.n_rotations += 1
             self._log_event(elapsed_s, frame, "rotation_start")
             self._prev_stationary = None  # reset diff baseline (DESIGN §5.2)
+            # The dwell that just ended is the unit of a behaviour row -- see `_harvest_dwell`.
+            if self.track_flies:
+                self._harvest_dwell(elapsed_s, frame)
         if stationary_onset:
             if prev_state == TrackState.ROTATING:
                 self._log_event(elapsed_s, frame, "rotation_end")
@@ -777,6 +920,12 @@ class TrackerPipeline:
                 self._prev_stationary = gray
                 obs_vial_results = vial_results
                 rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, vial_results)
+            # TRACKING ONLY WHILE THE DRUM IS STILL. Mid-rotation the flies are being shaken past
+            # the lens: there is nothing to link and the blobs are smeared. `submit` never blocks
+            # -- a frame the workers cannot take is dropped for tracking and counted, and the
+            # activity measurement above has already happened regardless.
+            if self.track_flies and self._pool is not None:
+                self._pool.submit(gray, elapsed_s)
         elif state == TrackState.ROTATING:
             # Feed present-vial keys (motion/active ignored by the accumulator for ROTATING) so
             # `n_rotating_frames`/`lit_area_px` stay populated -> a bin straddling a rotation is
@@ -788,6 +937,7 @@ class TrackerPipeline:
             rolled = self.accumulator.add(elapsed_s, state, None)
         if rolled is not None:
             self._emit_bin(rolled)
+            self._flush_behaviour()
 
         if self._current_face is not None:
             self._per_face_frames[self._current_face] = (

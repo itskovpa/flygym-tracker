@@ -178,6 +178,27 @@ class ActivityRecord:
         return {k: getattr(self, k) for k in ACTIVITY_COLUMNS}
 
 
+#: CSV column order for the BEHAVIOUR table -- one row per vial per dwell, from `fly_tracking.
+#: summarize`. A SEPARATE FILE from activity.csv, keyed by `run_id`/`elapsed_s`/`vial_id` so the
+#: two join, because they are different measurements at different scales: activity is a
+#: frame-difference over a whole bin and needs nothing but the ROI, while these are fly-level
+#: statistics that only exist when the drum is still and the tracker could see individual animals.
+#: Widening activity.csv would also have meant every existing analysis script seeing new columns.
+BEHAVIOUR_COLUMNS = [
+    "run_id", "iso_time", "elapsed_s", "face", "vial_id",
+    # height / climbing
+    "mean_height", "median_height", "frac_above_mid", "max_height",
+    # counts
+    "n_blobs_mean", "est_n_flies_mean",
+    # speed / path
+    "mean_speed", "median_speed", "p90_speed", "mean_speed_norm",
+    "total_path_length", "median_path_length",
+    # diagnostics -- READ THESE BEFORE QUOTING ANYTHING ABOVE. A low `mean_fragment_frames` means
+    # the tracks were shredded by crowding, and every per-fly figure above is then a statement
+    # about fragments rather than about flies.
+    "mean_fragment_frames", "n_tracks", "n_frames",
+]
+
 EVENT_COLUMNS = ["run_id", "iso_time", "elapsed_s", "event", "detail"]
 
 

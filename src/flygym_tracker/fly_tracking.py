@@ -815,6 +815,10 @@ def summarize(
         ``p90_speed``        90th percentile fragment speed, px/s
         ``mean_speed_norm``  mean fragment speed in normalized-height units/s
         ``total_path_length`` summed displacement over all fragments, px
+        ``median_path_length`` MEDIAN fragment displacement, px -- prefer this one. With ~20 flies
+                             per vial a merged blob contributes one long fragment while crowding
+                             shreds the rest into short ones, so the mean sits wherever the merges
+                             put it and the median describes the typical fragment.
 
     Diagnostics — read these BEFORE quoting anything above:
         ``mean_fragment_frames`` mean fragment length in frames. Low = tracks are shredded.
@@ -854,6 +858,19 @@ def summarize(
         "p90_speed": float(np.percentile(speeds_arr, 90)) if speeds_arr.size else float("nan"),
         "mean_speed_norm": _nanmean(speeds_norm),
         "total_path_length": float(sum(t.path_length for t in tracks)),
+        # MEDIAN fragment path length, and the median is the point of it. This rig runs up to ~20
+        # flies per vial, where two things skew every mean: a merged blob (several flies touching,
+        # tracked as one) contributes one long fragment, and crowding shreds the rest into many
+        # short ones. The mean sits wherever the merges put it; the median describes the typical
+        # fragment, which is what "how far is a fly moving" is asking. Single-frame fragments are
+        # excluded for the same reason they are excluded from the speeds: they have no displacement
+        # by construction, and counting them as 0 would drag the statistic down hardest exactly
+        # when crowding is worst. `n_tracks` and `mean_fragment_frames` remain the place to see
+        # that the tracking fell apart.
+        "median_path_length": (
+            float(np.median([t.path_length for t in tracks if t.n_frames > 1]))
+            if any(t.n_frames > 1 for t in tracks) else float("nan")
+        ),
         # diagnostics
         "mean_fragment_frames": (
             float(np.mean([t.n_frames for t in tracks])) if tracks else float("nan")

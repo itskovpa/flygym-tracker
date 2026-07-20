@@ -212,6 +212,12 @@ class FlyTrackingPool:
                          for i, shard in enumerate(shards) if shard]
         self.frames_submitted = 0
         self.frames_dropped = 0
+        #: Bumped by every `reset_dwell`. THE OVERLAY NEEDS THIS. `tracks()` returns only the
+        #: CURRENT dwell's fragments -- they are thrown away at each rotation, because identity is
+        #: lost there -- but the operator wants the paths to keep building up on screen until they
+        #: press Clear. The accumulator watches this number to know when the live fragments have
+        #: become history and should be frozen rather than replaced.
+        self.dwell_index = 0
         self._started = False
 
     def start(self) -> None:
@@ -240,6 +246,7 @@ class FlyTrackingPool:
 
     def reset_dwell(self) -> None:
         """A rotation happened: every identity is gone, so every tracker goes."""
+        self.dwell_index += 1
         for worker in self._workers:
             worker.reset_dwell()
 
@@ -266,6 +273,7 @@ class FlyTrackingPool:
             "fraction_tracked": (self.frames_submitted / total) if total else 0.0,
             "vial_failures": sum(worker.failures for worker in self._workers),
             "workers": len(self._workers),
+            "dwells": self.dwell_index,
         }
 
     def close(self) -> None:

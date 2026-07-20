@@ -42,6 +42,7 @@ import pandas as pd
 
 from flygym_tracker.types import (
     ACTIVITY_COLUMNS,
+    BEHAVIOUR_COLUMNS,
     EVENT_COLUMNS,
     ActivityRecord,
     EventRecord,
@@ -155,6 +156,26 @@ class ActivityLogger:
             path = self._activity_csv_path(date_key)
             self._append_rows(path, ACTIVITY_COLUMNS, rows)
             self._dirty_csvs.add(path)
+
+    def log_behaviour(self, rows: list) -> None:
+        """Append fly-level rows to `behaviour.csv`. No-op for an empty list.
+
+        A SEPARATE FILE, not extra columns on activity.csv, and the reason is that they are
+        different measurements at different scales. An activity row exists for every vial in every
+        bin and needs nothing but the ROI. A behaviour row exists only where the drum was still
+        long enough for the tracker to see individual flies -- so on a widened activity table most
+        rows would carry fourteen empty columns, and every analysis script already reading that
+        file would have to be updated to ignore them.
+
+        Rows are plain dicts (`fly_tracking.summarize` output plus the keys that identify them), so
+        nothing here has to know what the tracker measures -- adding a parameter there adds a
+        column here, provided it is listed in `BEHAVIOUR_COLUMNS`.
+        """
+        if not rows:
+            return
+        path = Path(self.output_dir) / "behaviour.csv"
+        self._append_rows(path, BEHAVIOUR_COLUMNS, rows)
+        self._dirty_csvs.add(path)
 
     def log_event(self, event: Optional[EventRecord]) -> None:
         """Append one row to `events.csv`. No-op if `event` is None."""
