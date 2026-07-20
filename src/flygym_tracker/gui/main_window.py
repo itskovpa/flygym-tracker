@@ -37,8 +37,8 @@ from PySide6.QtWidgets import (QDockWidget, QFileDialog, QMainWindow, QMessageBo
 from flygym_tracker import camera_lock, readiness
 from flygym_tracker.gui import gui_state
 from flygym_tracker.gui.camera_lock_dialog import CameraLockDialog, qt_confirm
-from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, OPENING, STREAMING,
-                                               CameraSession)
+from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERROR_OTHER,
+                                               OPENING, STREAMING, CameraSession)
 from flygym_tracker.gui.camera_status import CameraStatusBar
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.results_panel import ResultsPanel
@@ -62,6 +62,11 @@ STATUS_REFRESH_MS = 500
 #: up on a clean handover. Generous -- a close that takes longer than this has gone wrong, and the
 #: honest thing then is to say so rather than to start a run on a camera somebody else still holds.
 HANDOVER_TIMEOUT_MS = 6000
+
+#: How long a video job waits for the camera it asked to be opened. Enumerating and configuring a
+#: USB3 Vision device is not instant; a wait longer than this means something is wrong, and saying
+#: so beats a button that appears to have done nothing.
+CAMERA_OPEN_TIMEOUT_MS = 8000
 
 
 class MainWindow(QMainWindow):
@@ -93,6 +98,9 @@ class MainWindow(QMainWindow):
         )
         #: A run was asked for while the preview still held the camera. See `start_run`.
         self._pending_start = False
+        #: A video job waiting for the camera to finish opening. See `with_camera`.
+        self._camera_then = None
+        self._camera_why = ""
         self._build()
         self._connect()
         self.refresh_readiness()
@@ -241,6 +249,11 @@ class MainWindow(QMainWindow):
         self._handover_timer.setSingleShot(True)
         self._handover_timer.timeout.connect(self._handover_timed_out)
 
+        # The other watchdog: a job asked for the camera and the camera never arrived.
+        self._camera_timer = QTimer(self)
+        self._camera_timer.setSingleShot(True)
+        self._camera_timer.timeout.connect(self._camera_open_timed_out)
+
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(STATUS_REFRESH_MS)
         self._status_timer.timeout.connect(self._refresh_status)
@@ -270,6 +283,13 @@ class MainWindow(QMainWindow):
         # run can legally open it.
         if state == CLOSED and self._pending_start:
             self._start_run_now()
+        # A JOB IS WAITING FOR THIS CAMERA. Both endings are handled: streaming runs it, and any
+        # error path tells it why it will not run rather than leaving it pending forever.
+        if self._camera_then is not None:
+            if state == STREAMING:
+                self._camera_ready()
+            elif state in (ERROR_BUSY, ERROR_OTHER):
+                self._camera_failed(detail or state)
         if state == STREAMING:
             # The limits are now this sensor's rather than the datasheet's, and they can differ
             # enough that a spinbox built from the fallbacks offers a value the SDK rejects.
@@ -650,6 +670,64 @@ class MainWindow(QMainWindow):
         elif action == "replay":
             self._begin_replay(calib)
 
+    # -- getting the camera for a job -------------------------------------------------------------
+    def with_camera(self, then, *, why: str) -> None:
+        """Run `then()` once the LIVE camera is streaming, opening it if it is not.
+
+        THE RIG OWNER'S RULE, verbatim: "as soon as I click draw vial positions or learn drum faces
+        it needs to do the necessary steps for the operation, always prioritize live camera for all
+        measurements." Before this, pressing Draw vial positions with the camera closed did
+        NOTHING VISIBLE -- the job refused, wrote a sentence into the caption under the picture, and
+        the operator was left to work out that a different button in a different band had to be
+        pressed first. The button did not do its job; it described a precondition.
+
+        THE OPEN IS ASYNCHRONOUS, which is why this is a continuation and not two lines. `open()`
+        posts to the camera thread and returns; the device is not usable until that thread reports
+        STREAMING. Calling the job straight after would have it ask a camera that is not there yet
+        -- the same race `start_run` had, in the other direction.
+
+        WHY THIS DOES NOT VIOLATE "the app never takes the camera by itself". That rule is about
+        LAUNCH: an app that grabs an exclusive device the moment it opens is an app that blocks the
+        rig. Here the operator has pressed a button whose whole meaning is "do this to the rig
+        now", so taking the camera IS what was asked for. It is still never taken without a click.
+        """
+        if self.session.is_open:
+            then()
+            return
+        if self.run.is_running:
+            # The run owns the camera and must keep it. Saying so is the useful answer; opening
+            # would fail with the SDK's culprit-free error, and stopping the run to draw vials
+            # would end an experiment to change its calibration.
+            self.stage.caption.setText(
+                "the experiment has the camera - stop the run first, then %s" % why)
+            return
+        self._camera_then = then
+        self._camera_why = why
+        self.stage.caption.setText("opening the camera to %s..." % why)
+        self._camera_timer.start(CAMERA_OPEN_TIMEOUT_MS)
+        self.session.open()
+
+    def _camera_ready(self) -> None:
+        """The camera reached STREAMING. Run whatever was waiting for it."""
+        self._camera_timer.stop()
+        then, self._camera_then = self._camera_then, None
+        if then is not None:
+            then()
+
+    def _camera_failed(self, detail: str) -> None:
+        """The camera did not open. Say why, in terms of the job that wanted it."""
+        self._camera_timer.stop()
+        why, self._camera_then, self._camera_why = self._camera_why, None, ""
+        if not why:
+            return
+        self.stage.caption.setText(
+            "could not open the camera to %s: %s   -   try Free the camera..." % (why, detail))
+        self.refresh_readiness()
+
+    def _camera_open_timed_out(self) -> None:
+        self._camera_failed("it did not start streaming in %.0f s"
+                            % (CAMERA_OPEN_TIMEOUT_MS / 1000.0))
+
     def _pick_video(self, title: str) -> Optional[str]:
         video, _ = QFileDialog.getOpenFileName(
             self, title, self.state.get("last_video") or "",
@@ -680,8 +758,12 @@ class MainWindow(QMainWindow):
         # geometry, not a preference, and it is not a config key precisely because it is the rig.
         from flygym_tracker.calibration import VIALS_PER_FACE
 
-        if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE, polygons=polygons):
-            self.refresh_readiness()
+        def draw():
+            if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE,
+                                         polygons=polygons):
+                self.refresh_readiness()
+
+        self.with_camera(draw, why="draw the vial positions")
 
     def _ask_redraw(self, saved) -> bool:
         """True = draw again. False = keep what is saved.
@@ -736,25 +818,19 @@ class MainWindow(QMainWindow):
         if mask is None:
             QMessageBox.warning(self, "The noise floor cannot be measured yet", problem)
             return
-        video = None
-        if not self.session.is_open:
-            video = self._pick_video("Measure the noise floor on which recording?")
-            if video is None:
-                self.stage.caption.setText(
-                    "The noise floor needs frames: open the camera, or pick a recording.")
-                return
-        self.stage.begin_noise(mask, k=float(_cfg(self.config, "activity.k") or 5.0),
-                               video=video)
+        # The noise floor is a property of THIS rig as it stands right now -- its illumination, its
+        # exposure, its sensor. Measuring it from a recording answers the question for the rig as
+        # it was when that clip was taken, which is not the question being asked.
+        self.with_camera(
+            lambda: self.stage.begin_noise(mask, k=float(_cfg(self.config, "activity.k") or 5.0)),
+            why="measure the noise floor")
 
     def _begin_face_learning(self) -> None:
-        video = None
-        if not self.session.is_open:
-            video = self._pick_video("Learn the drum faces from which recording?")
-            if video is None:
-                self.stage.caption.setText(
-                    "Learning the faces needs frames: open the camera, or pick a recording.")
-                return
-        self.stage.begin_face_learning(video=video, band_rows=self._band_rows())
+        # THE LIVE CAMERA IS THE POINT of this step: it watches the drum turn NOW. Asking which
+        # recording to use before even trying the camera had it backwards.
+        self.with_camera(
+            lambda: self.stage.begin_face_learning(band_rows=self._band_rows()),
+            why="learn the drum faces")
 
     def _band_rows(self):
         """The marker band the operator drew, if this bundle carries one. None means "guess it".
