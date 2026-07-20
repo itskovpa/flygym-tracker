@@ -31,6 +31,20 @@ from flygym_tracker.cli import main
 from flygym_tracker.config import load_config
 from flygym_tracker.types import ACTIVITY_COLUMNS, Calibration, FaceCalibration, VialROI
 
+
+def _one(directory, pattern):
+    """The single file matching `pattern` in `directory`.
+
+    OUTPUT FILES CARRY THE RUN'S START STAMP now (`events_20260720-142233.csv`), so a test cannot
+    spell the name. Globbing keeps the test about the CONTENT, which is what it was ever checking.
+    """
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
 # =============================================================================================
 # Synthetic scene (mirrors tests/test_pipeline.py's design; re-encoded through a real video file)
 # =============================================================================================
@@ -172,8 +186,8 @@ def test_replay_end_to_end_writes_activity_csv(tmp_path):
     totals = df.groupby("vial_id")["motion_px_sum"].sum()
     assert totals.get(1, 0) > totals.get(2, 0)
 
-    assert (out_dir / "events.csv").exists()
-    meta = json.loads((out_dir / "run_meta.json").read_text(encoding="utf-8"))
+    assert (_one(out_dir, "events_*.csv")).exists()
+    meta = json.loads((_one(out_dir, "run_meta_*.json")).read_text(encoding="utf-8"))
     assert meta["run_id"].startswith("run_")
     assert meta["stop_iso"] is not None
 

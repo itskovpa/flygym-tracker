@@ -57,15 +57,27 @@ class VialPlotGrid(QWidget):
         self.cumulative = False
         self._range = None
         self._time = None
+        self._points = {}
         self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-    def configure(self, *, field, bin_seconds, cumulative, value_range, time_range) -> None:
+    def configure(self, *, field, bin_seconds, cumulative, value_range, time_range,
+                  points) -> None:
+        """Adopt ONE SNAPSHOT: the points AND the range they were measured from, together.
+
+        THE BUG THIS FIXES, reported from the rig: a line ran outside its cell. `paintEvent` used
+        to re-read the shared store, while the y range had been computed a moment earlier in
+        `refresh` -- and behaviour rows arrive from the run thread in between. So the painter drew
+        points the range had never seen, and anything above the old maximum was plotted above the
+        top of the cell. Range and points must come from the same read or the axis is a claim
+        about different data than the line.
+        """
         self.field = field
         self.bin_seconds = bin_seconds
         self.cumulative = cumulative
         self._range = value_range
         self._time = time_range
+        self._points = points or {}
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -78,9 +90,7 @@ class VialPlotGrid(QWidget):
         font.setPointSize(theme.PT_TINY)
         painter.setFont(font)
 
-        points = self.series.face_series(self.field, self.face,
-                                         bin_seconds=self.bin_seconds,
-                                         cumulative=self.cumulative)
+        points = self._points
         for index in range(VIALS_PER_FACE):
             row, col = divmod(index, COLUMNS)
             x0, y0 = col * cell_w, row * cell_h
@@ -91,8 +101,14 @@ class VialPlotGrid(QWidget):
             painter.setPen(QPen(QColor(theme.TEXT_FAINT), 1))
             painter.drawText(int(x0) + 4, int(y0) + 12, "%s%d" % (self.face, index + 1))
 
+            painter.save()
+            # CLIPPED TO ITS OWN CELL. The snapshot above makes an out-of-range point impossible;
+            # this makes it impossible to DRAW one, so a future bug of the same kind is visible as
+            # a clipped line inside the right cell rather than a stray line across a neighbour.
+            painter.setClipRect(int(x0) + 1, int(y0) + 1, int(cell_w) - 2, int(cell_h) - 2)
             self._paint_cell(painter, points.get(index) or [], colour,
                              x0 + 4, y0 + 16, cell_w - 8, cell_h - 22)
+            painter.restore()
 
     def _paint_cell(self, painter, points, colour, x, y, w, h) -> None:
         if w <= 2 or h <= 2:
@@ -179,11 +195,14 @@ class BehaviourPlotPanel(QWidget):
     def refresh(self) -> None:
         """Re-read the shared store. Cheap enough to call on every completed dwell."""
         kwargs = {"bin_seconds": self.bin_seconds(), "cumulative": self.cumulative()}
-        value_range = self.series.value_range(self.field, **kwargs)
+        # ONE READ of the store for the whole panel: the points every cell draws and the range
+        # every cell is scaled by come from the same snapshot. See `VialPlotGrid.configure`.
+        points = {face: self.series.face_series(self.field, face, **kwargs) for face in FACES}
+        value_range = _range_of(points)
         time_range = self.series.time_range()
-        for grid in self.grids.values():
+        for face, grid in self.grids.items():
             grid.configure(field=self.field, value_range=value_range, time_range=time_range,
-                           **kwargs)
+                           points=points.get(face) or {}, **kwargs)
         if value_range is None:
             self.range_label.setText("no data yet")
         else:
@@ -213,6 +232,22 @@ class BehaviourPlotDock(QDockWidget):
 
     def refresh(self) -> None:
         self.panel.refresh()
+
+
+def _range_of(points_by_face) -> Optional[tuple]:
+    """`(low, high)` over every point of every cell, or None. Computed from the SAME snapshot the
+    cells will draw, which is the whole point -- see `VialPlotGrid.configure`."""
+    low = high = None
+    for cells in (points_by_face or {}).values():
+        for points in (cells or {}).values():
+            for _t, value in points or ():
+                low = value if low is None else min(low, value)
+                high = value if high is None else max(high, value)
+    if low is None:
+        return None
+    if high - low < 1e-9:
+        return (low - 0.5, high + 0.5)
+    return (low, high)
 
 
 def _bin_label(seconds: int) -> str:

@@ -19,12 +19,28 @@ from flygym_tracker.frame_source import FrameSource
 from flygym_tracker.logger import ActivityLogger
 from flygym_tracker.pipeline import TrackerPipeline, measure_noise
 from flygym_tracker.types import (
+
+
     ACTIVITY_COLUMNS,
     Calibration,
     FaceCalibration,
     Frame,
     VialROI,
 )
+
+
+def _one(directory, pattern):
+    """The single file matching `pattern` in `directory`.
+
+    OUTPUT FILES CARRY THE RUN'S START STAMP now (`events_20260720-142233.csv`), so a test cannot
+    spell the name. Globbing keeps the test about the CONTENT, which is what it was ever checking.
+    """
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
 
 
 # =============================================================================================
@@ -177,11 +193,11 @@ BIN2_ISO = "2026-07-18T00:00:02"
 
 
 def _events(tmp_path) -> pd.DataFrame:
-    return pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    return pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
 
 
 def _activity(tmp_path) -> pd.DataFrame:
-    return pd.read_csv(tmp_path / "activity_20260718.csv")
+    return pd.read_csv(_one(tmp_path, "activity_*_20260718.csv"))
 
 
 def _row(df, vial_id, iso):

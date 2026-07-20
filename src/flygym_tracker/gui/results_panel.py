@@ -28,12 +28,11 @@ GUI thread, capable of disagreeing with the file.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QVBoxLayout, QWidget)
 
 from flygym_tracker.gui import theme
 
@@ -41,29 +40,8 @@ from flygym_tracker.gui import theme
 VIALS_PER_FACE = 16
 N_FACES = 2
 
-#: Columns of the recorded-rows table, and the `ActivityRecord` field each one reads. The field
-#: names are the CSV's own, so what is on screen and what is in the file cannot drift apart.
-COLUMNS = (
-    ("elapsed", "elapsed_s"),
-    ("face", "face"),
-    ("vial", "vial_id"),
-    ("motion px", "motion_px_sum"),
-    ("active", "active_fraction_mean"),
-    ("still", "n_stationary_frames"),
-    ("rot", "n_rotating_frames"),
-    ("lit px", "lit_area_px"),
-)
-
-#: How many recorded rows to keep on screen. A 3-day run at 10 s bins writes ~26000 rows per vial;
-#: keeping them all in a widget would be a slow memory leak for no gain, because the file has them
-#: all and this panel is for watching, not for analysis.
-MAX_ROWS = 400
-
-
-def _fmt(value) -> str:
-    if isinstance(value, float):
-        return "%.3f" % value if abs(value) < 100 else "%.1f" % value
-    return str(value)
+# `COLUMNS`, `MAX_ROWS` and `_fmt` USED TO LIVE HERE, for the recorded-rows table. The table is
+# gone (see `ResultsPanel`), and with it the only reason this module knew the CSV's column names.
 
 
 class VialActivityGrid(QWidget):
@@ -119,7 +97,16 @@ class VialActivityGrid(QWidget):
         drum face is visible at a time, so the other face's sixteen SHOULD be blank.
         """
         for index, cell in enumerate(self.cells):
-            result = vial_results.get(index)
+            # GLOBAL VIAL IDS ARE 1-BASED: `pipeline` builds them as `face_index * 16 + v.id` with
+            # v.id running 1..16, so face A is 1..16 and face B is 17..32. Cell 0 is A1, which is
+            # gvid 1.
+            #
+            # THE BUG THIS FIXES, seen on the rig: reading `vial_results[index]` shifted every
+            # reading one cell to the right -- A1 was always blank, A2 showed A1's number, and
+            # face A's vial 16 appeared in the cell labelled B1. On screen that read as "15 vials
+            # on face A and 1 on face B being measured at the same time", which is impossible:
+            # only one drum face is in front of the camera at a time.
+            result = vial_results.get(index + 1)
             if result is None:
                 cell.setText("")
                 cell.setStyleSheet(self._style(theme.INK_2, theme.TEXT_FAINT))
@@ -166,24 +153,21 @@ class ResultsPanel(QWidget):
         grid_scroll.setFixedHeight(56)
         layout.addWidget(grid_scroll)
 
-        rec_head = QHBoxLayout()
-        title2 = QLabel("WRITTEN TO activity.csv")
-        title2.setProperty("role", "grouptitle")
-        rec_head.addWidget(title2)
+        # THE TABLE IS GONE. It listed every row as it was written -- 32 rows per bin, scrolling
+        # past faster than anyone reads -- and the rig owner's verdict was that it "should just go
+        # as a graph". They were right: a wall of numbers answers "is a row being written", which
+        # the counter below already answers in one line, while the question actually being asked of
+        # a running experiment is "is this vial's number going up or down", which is a shape.
+        # Everything the table showed is in the plot docks and in the file.
+        # WHAT THE TABLE IS REPLACED BY, at this end: one line saying how much has been written.
+        # That is the only question the table answered that a graph does not -- "is the file
+        # actually growing" -- and it takes a line rather than a scrolling wall.
         self.recorded_note = QLabel("no bins finished yet")
         self.recorded_note.setProperty("role", "note")
-        rec_head.addWidget(self.recorded_note, 1)
-        layout.addLayout(rec_head)
-
-        self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels([label for label, _ in COLUMNS])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.table.setAlternatingRowColors(False)
-        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.table.setMinimumHeight(120)
-        layout.addWidget(self.table, 1)
+        self.recorded_note.setWordWrap(True)
+        self.recorded_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.recorded_note)
+        layout.addStretch(1)
 
     # -- live ------------------------------------------------------------------------------------
     def set_progress(self, payload: dict) -> None:
@@ -201,39 +185,17 @@ class ResultsPanel(QWidget):
 
     # -- recorded --------------------------------------------------------------------------------
     def add_bin(self, payload: dict) -> None:
-        """One completed bin: append its rows, exactly as they went to the file."""
+        """One completed bin. COUNTED, not listed -- the rows themselves are in the plot docks."""
         records = payload.get("records") or []
         if not records:
             return
         self._bins += 1
         self._rows_written += len(records)
-        for record in records:
-            self._append(record)
-        self._trim()
-        self.table.scrollToBottom()
         self.recorded_note.setText(
-            "%d bin(s), %d row(s) written   -   showing the last %d"
-            % (self._bins, self._rows_written, min(self._rows_written, MAX_ROWS)))
-
-    def _append(self, record: Dict) -> None:
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        for column, (_label, field) in enumerate(COLUMNS):
-            item = QTableWidgetItem(_fmt(record.get(field, "")))
-            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            # A vial the calibration marks as absent is dimmed rather than hidden: it still has a
-            # row in the file, and a reader comparing screen to CSV has to find it in both.
-            if not record.get("present", True):
-                item.setForeground(QColor(theme.TEXT_FAINT))
-            self.table.setItem(row, column, item)
-
-    def _trim(self) -> None:
-        while self.table.rowCount() > MAX_ROWS:
-            self.table.removeRow(0)
+            "%d bin(s), %d row(s) written to activity.csv" % (self._bins, self._rows_written))
 
     def clear(self) -> None:
         self.grid.clear()
-        self.table.setRowCount(0)
         self._rows_written = 0
         self._bins = 0
         self.live_note.setText("per frame, not yet binned - not in the file")

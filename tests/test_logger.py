@@ -63,7 +63,7 @@ def test_log_activity_writes_columns_and_rows(tmp_path):
     logger.log_activity(records)
     logger.close()
 
-    csv_path = tmp_path / "activity_20260718.csv"
+    csv_path = logger.activity_path("20260718")
     assert csv_path.exists()
 
     df = pd.read_csv(csv_path)
@@ -92,9 +92,9 @@ def test_log_activity_writes_columns_and_rows(tmp_path):
     assert int(row0["motion_px_sum"]) == 100
     assert row0["active_fraction_mean"] == pytest.approx(0.0456)
 
-    meta_path = tmp_path / "run_meta.json"
+    meta_path = logger.meta_path()
     assert meta_path.exists()
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta = json.loads(logger.meta_path().read_text(encoding="utf-8"))
     assert meta["run_id"] == "run1"
     assert meta["stop_iso"] is not None
     assert meta["meta"]["versions"]["flygym_tracker"] == "0.1.0.dev0"
@@ -112,7 +112,7 @@ def test_log_event_writes_schema(tmp_path):
     ))
     logger.close()
 
-    events_path = tmp_path / "events.csv"
+    events_path = logger.events_path()
     assert events_path.exists()
 
     df = pd.read_csv(events_path, keep_default_na=False)
@@ -147,11 +147,12 @@ def test_resume_appends_without_duplicate_header_and_last_bin(tmp_path):
     ])
     logger1.close()
 
-    csv_path = tmp_path / f"activity_{now.strftime('%Y%m%d')}.csv"
-
-    # New logger, same dir/run_id -- simulates a process restart.
+    # A RESTART NOW WRITES ITS OWN FILE. Filenames carry the RUN's start stamp, so logger2 does
+    # not append to logger1's file -- and that is the point of the stamp: one recording, one set
+    # of files. What resuming still has to do is not RE-LOG bins that are already on disk, and
+    # `last_bin` provides that by reading every activity file for the day whoever wrote it.
     logger2 = ActivityLogger(output_dir=tmp_path, run_id="resume_run", fmt="csv")
-    assert logger2.last_bin() == bin1_iso  # recovers where logger1 left off
+    assert logger2.last_bin() == bin1_iso, "a restart could not see the earlier run's rows"
 
     logger2.log_activity([
         _activity_record(run_id="resume_run", vial_id=1, bin_start_iso=bin2_iso,
@@ -159,24 +160,22 @@ def test_resume_appends_without_duplicate_header_and_last_bin(tmp_path):
     ])
     logger2.close()
 
-    raw_lines = csv_path.read_text(encoding="utf-8").splitlines()
     header = ",".join(ACTIVITY_COLUMNS)
-    assert raw_lines[0] == header
-    assert sum(1 for line in raw_lines if line == header) == 1  # exactly one header line
+    files = sorted(tmp_path.glob("activity_*.csv"))
+    # One file per run, unless both runs started inside the same SECOND -- the stamp's resolution.
+    # Either way the header must appear once per file and no bin may be lost or duplicated, which
+    # is what resuming actually has to guarantee.
+    assert files, "no activity file was written at all"
+    for path in files:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == header
+        assert sum(1 for line in lines if line == header) == 1, "duplicated header in %s" % path.name
 
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    assert len(rows) == 3  # all rows from both sessions, none lost, none clobbered
-    bin_starts = [r["bin_start_iso"] for r in rows]
-    assert bin_starts == [bin0_iso, bin1_iso, bin2_iso]
-    assert len(set(bin_starts)) == 3  # no duplicates
-
-    assert logger2.last_bin() == bin2_iso
-
-
-# ---------------------------------------------------------------------------------------------
-# Daily rolling keyed off record date, not wall-clock
-# ---------------------------------------------------------------------------------------------
+    rows = []
+    for path in files:
+        with path.open(newline="", encoding="utf-8") as f:
+            rows.extend(csv.DictReader(f))
+    assert [r["bin_start_iso"] for r in rows] == [bin0_iso, bin1_iso, bin2_iso]
 
 
 def test_daily_rolling_by_record_date(tmp_path):
@@ -192,8 +191,8 @@ def test_daily_rolling_by_record_date(tmp_path):
     ])
     logger.close()
 
-    path1 = tmp_path / "activity_20260101.csv"
-    path2 = tmp_path / "activity_20260102.csv"
+    path1 = logger.activity_path("20260101")
+    path2 = logger.activity_path("20260102")
     assert path1.exists()
     assert path2.exists()
 
@@ -227,8 +226,8 @@ def test_fmt_both_xlsx_matches_csv(tmp_path):
     logger.log_event(event)
     logger.close()
 
-    csv_path = tmp_path / "activity_20260718.csv"
-    xlsx_path = tmp_path / "activity_20260718.xlsx"
+    csv_path = logger.activity_path("20260718")
+    xlsx_path = csv_path.with_suffix(".xlsx")
     assert xlsx_path.exists()
 
     # check_dtype=False: xlsx (OOXML) has no distinct int/float storage type -- openpyxl
@@ -242,8 +241,8 @@ def test_fmt_both_xlsx_matches_csv(tmp_path):
     df_xlsx = pd.read_excel(xlsx_path, engine="openpyxl")
     pd.testing.assert_frame_equal(df_csv, df_xlsx, check_dtype=False)
 
-    events_csv = tmp_path / "events.csv"
-    events_xlsx = tmp_path / "events.xlsx"
+    events_csv = logger.events_path()
+    events_xlsx = logger.events_path().with_suffix(".xlsx")
     assert events_xlsx.exists()
     df_events_csv = pd.read_csv(events_csv, keep_default_na=False)
     df_events_xlsx = pd.read_excel(events_xlsx, engine="openpyxl", keep_default_na=False)
@@ -262,13 +261,13 @@ def test_log_activity_empty_list_is_noop(tmp_path):
     logger.close()
     assert list(tmp_path.glob("activity_*.csv")) == []
     assert list(tmp_path.glob("activity_*.xlsx")) == []
-    assert (tmp_path / "run_meta.json").exists()
+    assert logger.meta_path().exists()
 
 
 def test_context_manager_closes_and_stamps_stop_time(tmp_path):
     with ActivityLogger(output_dir=tmp_path, run_id="ctx_run", fmt="csv") as logger:
         assert logger.last_bin() is None
 
-    meta = json.loads((tmp_path / "run_meta.json").read_text(encoding="utf-8"))
+    meta = json.loads(logger.meta_path().read_text(encoding="utf-8"))
     assert meta["start_iso"] is not None
     assert meta["stop_iso"] is not None

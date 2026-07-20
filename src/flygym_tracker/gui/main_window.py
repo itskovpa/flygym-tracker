@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         self.run.progress.connect(self.run_panel.set_progress)
         self.run.progress.connect(self.results.set_progress)
         self.run.progress.connect(self._on_run_progress)
-        self.run.bin_done.connect(self.results.add_bin)
+        self.run.bin_done.connect(self._on_activity_rows)
         self.run.behaviour_done.connect(self._on_behaviour_rows)
         self.run.setting_applied.connect(self._on_run_setting_applied)
         self.session_bar.config_changed.connect(self._on_config_changed)
@@ -630,6 +630,12 @@ class MainWindow(QMainWindow):
         # refresh that puts it on screen the moment the run starts and takes it off when it ends.
         self.settings_view.refresh()
         self.refresh_readiness()
+
+    def _on_activity_rows(self, payload: dict) -> None:
+        """Activity rows go into the SAME store the behaviour rows do, so both can be plotted from
+        one menu. They are already keyed by elapsed_s / face / vial_id, which is all the store
+        needs -- see `behaviour_series.PLOTTABLE`."""
+        self._on_behaviour_rows({"rows": payload.get("records") or []})
 
     def _on_behaviour_rows(self, payload: dict) -> None:
         """Completed dwells arrived: store them and redraw whatever plots are open."""

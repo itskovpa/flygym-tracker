@@ -51,6 +51,20 @@ from flygym_tracker.settings_panel import (
 from flygym_tracker.types import Calibration, FaceCalibration, Frame, VialROI
 
 
+def _one(directory, pattern):
+    """The single file matching `pattern` in `directory`.
+
+    OUTPUT FILES CARRY THE RUN'S START STAMP now (`events_20260720-142233.csv`), so a test cannot
+    spell the name. Globbing keeps the test about the CONTENT, which is what it was ever checking.
+    """
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
+
 def _float_setting(**kw):
     base = dict(key="a.f", label="f", value=5.0, lo=0.0, hi=10.0, step=0.5,
                 kind="float", group="G", help="h")
@@ -1113,7 +1127,7 @@ def test_a_setting_change_leaves_exactly_one_event_naming_the_key_and_both_value
                       and pipe.apply_setting("activity.pixel_threshold", 10.0))
     pipe.run()
 
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     rows = events[events["event"] == "setting_change"]
     assert len(rows) == 1
     detail = rows.iloc[0]["detail"]
@@ -1133,7 +1147,7 @@ def test_setting_the_same_value_again_is_accepted_but_logged_once_only(tmp_path)
         pipe.apply_setting("activity.pixel_threshold", 12.0) for _ in range(6)])
     pipe.run()
 
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     assert (events["event"] == "setting_change").sum() == 1
 
 
@@ -1151,7 +1165,7 @@ def test_settings_chosen_before_the_first_frame_are_not_logged_as_changes(tmp_pa
     assert pipe.pixel_threshold == 12.0             # ...still fully APPLIED
     pipe.run()
 
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     assert (events["event"] == "setting_change").sum() == 0
 
 
@@ -1163,7 +1177,7 @@ def test_a_change_after_the_first_frame_is_still_logged(tmp_path):
                       and pipe.apply_setting("activity.pixel_threshold", 10.0))
     pipe.run()
 
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     rows = events[events["event"] == "setting_change"]
     assert len(rows) == 1
     assert rows.iloc[0]["detail"].endswith("-> 10.0")
@@ -1181,7 +1195,7 @@ def test_a_multi_step_drag_logs_an_unbroken_chain_of_transitions(tmp_path):
         pipe.apply_setting("activity.pixel_threshold", v) for v in dragged])
     pipe.run()
 
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     details = events[events["event"] == "setting_change"]["detail"].tolist()
     assert len(details) == len(dragged)
     assert details[0].startswith("activity.pixel_threshold: 30.0 ->")
@@ -1213,7 +1227,7 @@ def test_the_panel_opened_mid_run_changes_the_measurement_and_leaves_an_event(tm
 
     assert set(px for idx, px in measured if idx < 6) == {0}
     assert set(px for idx, px in measured if idx > 6) == {BLOCK_PX}
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     rows = events[events["event"] == "setting_change"]
     assert len(rows) == 1 and "30.0 -> 10.0" in rows.iloc[0]["detail"]
 
@@ -1223,7 +1237,7 @@ def test_an_unknown_key_is_refused_and_writes_nothing(tmp_path):
     assert pipe.apply_setting("activity.made_up", 1.0) is False
     assert pipe.apply_setting("logger", "nonsense") is False
     pipe.run()
-    events = pd.read_csv(tmp_path / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"), keep_default_na=False)
     assert (events["event"] == "setting_change").sum() == 0
 
 
@@ -1914,7 +1928,7 @@ def test_a_mid_run_camera_change_is_logged_like_any_other_regime_change(tmp_path
 
     pipe.add_observer(watch)
     pipe.run()
-    events = pd.read_csv(tmp_path / "events.csv")
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"))
     rows = events[events["event"] == "setting_change"]
     assert len(rows) == 1
     assert "source.camera.exposure_us" in rows.iloc[0]["detail"]
@@ -1931,7 +1945,7 @@ def test_clearing_a_camera_setting_mid_run_is_logged_as_going_back_to_the_defaul
 
     pipe.add_observer(watch)
     pipe.run()
-    detail = pd.read_csv(tmp_path / "events.csv").query("event == 'setting_change'").iloc[-1]
+    detail = pd.read_csv(_one(tmp_path, "events_*.csv")).query("event == 'setting_change'").iloc[-1]
     assert "camera default" in detail["detail"], \
         "None in an events.csv cell reads like a missing field, not like a deliberate unset"
 
@@ -1943,7 +1957,7 @@ def test_a_camera_setting_chosen_before_the_first_frame_is_not_logged_as_a_chang
     pipe, source = _camera_pipeline(tmp_path, _scene(4))
     assert pipe.apply_setting("source.camera.frame_rate", 25.0) is True
     pipe.run()
-    events = pd.read_csv(tmp_path / "events.csv")
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"))
     assert events[events["event"] == "setting_change"].empty
     assert source.frame_rate == pytest.approx(25.0)
 
@@ -1977,7 +1991,7 @@ def test_a_blocked_geometry_change_writes_no_event_because_nothing_changed(tmp_p
 
     pipe.add_observer(watch)
     pipe.run()
-    events = pd.read_csv(tmp_path / "events.csv")
+    events = pd.read_csv(_one(tmp_path, "events_*.csv"))
     assert events[events["event"] == "setting_change"].empty
 
 

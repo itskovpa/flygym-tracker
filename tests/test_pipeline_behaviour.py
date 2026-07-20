@@ -21,6 +21,20 @@ from flygym_tracker.logger import ActivityLogger
 from flygym_tracker.pipeline import TrackerPipeline
 from flygym_tracker.types import BEHAVIOUR_COLUMNS, Frame
 
+
+def _one(directory, pattern):
+    """The single file matching `pattern` in `directory`.
+
+    OUTPUT FILES CARRY THE RUN'S START STAMP now (`events_20260720-142233.csv`), so a test cannot
+    spell the name. Globbing keeps the test about the CONTENT, which is what it was ever checking.
+    """
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
 H, W = 240, 400
 FPS = 20.0
 
@@ -79,11 +93,14 @@ def _run(tmp_path, frames, **kwargs):
 
 
 def _rows(out):
-    path = os.path.join(out, "behaviour.csv")
-    if not os.path.exists(path):
+    paths = sorted(glob.glob(os.path.join(out, "behaviour_*.csv")))
+    if not paths:
         return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    rows = []
+    for path in paths:
+        with open(path, newline="", encoding="utf-8") as f:
+            rows.extend(csv.DictReader(f))
+    return rows
 
 
 def _two_dwells():
@@ -185,7 +202,7 @@ def test_tracking_off_writes_no_behaviour_file(tmp_path):
     """Rather than a file full of empty columns, which reads like a measurement that failed."""
     summary, out = _run(tmp_path, _two_dwells(), track_flies=False)
     assert summary["n_behaviour_records"] == 0
-    assert not os.path.exists(os.path.join(out, "behaviour.csv"))
+    assert not glob.glob(os.path.join(out, "behaviour_*.csv"))
 
 
 def test_the_run_summary_says_how_much_was_actually_tracked(tmp_path):
@@ -230,6 +247,6 @@ def test_a_failed_behaviour_write_is_counted_and_never_silent(tmp_path):
     assert summary["behaviour_write_errors"] > 0, "a failed write was not counted"
     assert summary["n_activity_records"] > 0, "a behaviour failure took the activity run down"
 
-    with open(os.path.join(out, "events.csv"), newline="", encoding="utf-8") as f:
+    with open(str(_one(out, "events_*.csv")), newline="", encoding="utf-8") as f:
         events = [row["event"] for row in csv.DictReader(f)]
     assert "behaviour_write_failed" in events, "the failure never reached events.csv"

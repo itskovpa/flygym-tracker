@@ -57,6 +57,9 @@ _VALID_ROLLING = {"daily"}  # only mode implemented (DESIGN.md §7); kept as a p
 # timestamp, or face label that happens to look numeric must not silently become an int/float.
 _ACTIVITY_STR_COLUMNS = ["run_id", "bin_start_iso", "bin_end_iso", "face"]
 _EVENT_STR_COLUMNS = ["run_id", "iso_time", "event", "detail"]
+#: Behaviour columns that must stay text: a run_id or a face label that happens to look numeric
+#: must not silently become an int.
+_BEHAVIOUR_STR_COLUMNS = ["run_id", "iso_time", "face"]
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
@@ -110,10 +113,18 @@ class ActivityLogger:
         self._dirty_csvs: set = set()  # CSV Paths written since the last flush()
         self._closed = False
 
-        self._meta_path = self.output_dir / "run_meta.json"
+        #: EVERY FILE OF ONE RUN CARRIES THE RUN'S START TIME, as asked. Taken once, here, and
+        #: never re-derived: naming each file when it happens to be written would scatter one
+        #: run's outputs across the timeline and give the workbook a different stamp from the CSVs.
+        #: A directory of several runs then sorts and groups by eye.
+        started = datetime.now()
+        self.started_iso = started.isoformat()
+        self.stamp = started.strftime("%Y%m%d-%H%M%S")
+
+        self._meta_path = self.output_dir / ("run_meta_%s.json" % self.stamp)
         self._run_meta = {
             "run_id": run_id,
-            "start_iso": datetime.now().isoformat(),
+            "start_iso": self.started_iso,
             "stop_iso": None,
             "meta": meta or {},
         }
@@ -173,7 +184,7 @@ class ActivityLogger:
         """
         if not rows:
             return
-        path = Path(self.output_dir) / "behaviour.csv"
+        path = self.behaviour_path()
         self._append_rows(path, BEHAVIOUR_COLUMNS, rows)
         self._dirty_csvs.add(path)
 
@@ -184,6 +195,29 @@ class ActivityLogger:
         path = self._events_csv_path()
         self._append_rows(path, EVENT_COLUMNS, [event.as_row()])
         self._dirty_csvs.add(path)
+
+    def activity_path(self, date_key: Optional[str] = None) -> Path:
+        """This run's activity file for a day. Public so callers and tests never spell the
+        naming scheme themselves -- it has changed once and may change again."""
+        return self._activity_csv_path(date_key or self._today_key())
+
+    def events_path(self) -> Path:
+        return self._events_csv_path()
+
+    def behaviour_path(self) -> Path:
+        return self.output_dir / ("behaviour_%s.csv" % self.stamp)
+
+    def meta_path(self) -> Path:
+        return self._meta_path
+
+    def workbook_path(self) -> Path:
+        """Where `matrix_export` writes this run's one-sheet-per-parameter workbook."""
+        return self.output_dir / ("flygym_%s.xlsx" % self.stamp)
+
+    def run_meta(self) -> dict:
+        """The run metadata as written to run_meta_<stamp>.json. Kept, as asked, and handed to the
+        workbook so a sheet of numbers carries its start time and config with it."""
+        return dict(self._run_meta)
 
     def last_bin(self) -> Optional[str]:
         """Max `bin_start_iso` already recorded in *today's* activity file, or None.
@@ -198,12 +232,19 @@ class ActivityLogger:
         data (process restart), call `last_bin()` once and only pass `log_activity` records for
         bins strictly after it — the logger itself does not de-duplicate.
         """
-        path = self._activity_csv_path(self._today_key())
-        if not path.exists():
+        # EVERY ACTIVITY FILE FOR TODAY, not just this logger's own. Filenames now carry the
+        # RUN's start stamp, so a restarted process writes to a new file -- and reading only its
+        # own would report "nothing recorded today" while the previous process's rows sat beside
+        # it. Resuming has to look at what is on disk for the day, whoever wrote it.
+        paths = sorted(self.output_dir.glob("activity_*_%s.csv" % self._today_key()))
+        if not paths:
             return None
         best: Optional[str] = None
-        with path.open("r", newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
+        rows_iter = []
+        for path in paths:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                rows_iter.extend(list(csv.DictReader(f)))
+        for row in rows_iter:
                 v = row.get("bin_start_iso")
                 if v and (best is None or v > best):
                     best = v
@@ -251,10 +292,12 @@ class ActivityLogger:
         return datetime.now().strftime("%Y%m%d")
 
     def _activity_csv_path(self, date_key: str) -> Path:
-        return self.output_dir / f"activity_{date_key}.csv"
+        # BOTH STAMPS. The run stamp groups a run's files together; the date key is what makes the
+        # daily rolling work, so a three-day run still splits into one file per day WITHIN its run.
+        return self.output_dir / f"activity_{self.stamp}_{date_key}.csv"
 
     def _events_csv_path(self) -> Path:
-        return self.output_dir / "events.csv"
+        return self.output_dir / f"events_{self.stamp}.csv"
 
     @staticmethod
     def _append_rows(path: Path, columns: list, rows: list) -> None:
@@ -269,8 +312,24 @@ class ActivityLogger:
 
     @staticmethod
     def _schema_for(csv_path: Path):
-        if csv_path.name == "events.csv":
+        """Which schema a CSV in this directory follows, BY PREFIX rather than by exact name.
+
+        TWO BUGS THIS FIXES, both mine and both caught by the logger's own tests once the files
+        were renamed:
+
+        * it matched the literal ``"events.csv"``, so once events carried the run stamp
+          (`events_20260720-202020.csv`) it fell through to the ACTIVITY schema and the xlsx
+          rebuild raised `KeyError` for twelve columns an event row has never had;
+        * `behaviour_*.csv` was added to the rebuild set when `log_behaviour` was written, with no
+          schema of its own -- so it would have been re-encoded as an activity table too.
+
+        Matching on the prefix is what makes the naming scheme and the schema move together.
+        """
+        name = csv_path.name
+        if name.startswith("events"):
             return EVENT_COLUMNS, _EVENT_STR_COLUMNS
+        if name.startswith("behaviour"):
+            return BEHAVIOUR_COLUMNS, _BEHAVIOUR_STR_COLUMNS
         return ACTIVITY_COLUMNS, _ACTIVITY_STR_COLUMNS
 
     def _rewrite_xlsx(self, csv_path: Path) -> None:

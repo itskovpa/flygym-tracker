@@ -134,6 +134,22 @@ def _detector_can_identify(detector) -> bool:
         return True
 
 
+def _read_csv_rows(directory, pattern: str) -> list:
+    """Every row of every CSV matching `pattern`, as plain dicts. Never raises."""
+    import csv as _csv
+    import glob as _glob
+    import os as _os
+
+    rows = []
+    for path in sorted(_glob.glob(_os.path.join(str(directory), pattern))):
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                rows.extend(_csv.DictReader(f))
+        except OSError:
+            continue
+    return rows
+
+
 def _clip_bbox(bbox: Bbox, width: int, height: int) -> Bbox:
     """Clip an (x, y, w, h) bbox to the image; returns (x, y, w, h) with w/h >= 0."""
     x, y, w, h = bbox
@@ -270,6 +286,9 @@ class TrackerPipeline:
         #: `_flush_behaviour` for the measured reason this is counted rather than swallowed.
         self.behaviour_write_errors = 0
         self._tracking_summary: dict = {}
+        #: Where the run's workbook landed, and why it did not if it did not.
+        self.workbook_path: Optional[str] = None
+        self.workbook_error: str = ""
 
         self._precompute_faces()
         self.max_shift = (
@@ -765,6 +784,7 @@ class TrackerPipeline:
             if self.track_flies:
                 self._harvest_dwell(self._last_elapsed, None)
                 self._flush_behaviour()
+            self._write_workbook()
         finally:
             if self._pool is not None:
                 # READ BEFORE CLOSING. How much of the stream was actually tracked belongs in the
@@ -785,6 +805,8 @@ class TrackerPipeline:
             "n_activity_records": self.n_activity_records,
             "n_behaviour_records": self.n_behaviour_records,
             "behaviour_write_errors": self.behaviour_write_errors,
+            "workbook": self.workbook_path,
+            "workbook_error": self.workbook_error,
             "tracking": self._tracking_summary,
             "faces_seen": list(self._faces_seen),
             "per_face_frames": dict(self._per_face_frames),
@@ -878,6 +900,29 @@ class TrackerPipeline:
                 # the same message every ten seconds and bury the events that matter.
                 self._log_event(self._last_elapsed, None, "behaviour_write_failed",
                                 "%d row(s) lost: %s" % (len(rows), exc))
+
+    def _write_workbook(self) -> None:
+        """One workbook for the run: a sheet per parameter, vials down, timepoints across.
+
+        BUILT AT THE END, FROM THE CSVs. A sheet like that grows a COLUMN per timepoint, and
+        neither openpyxl nor Excel is happy adding one to a 30 000-column sheet every ten seconds
+        for three days -- so the CSVs take the streaming load and this is the readable snapshot.
+        A failure here can therefore cost nothing that is not already on disk, which is why it is
+        caught: the run's measurements are complete before this is attempted.
+        """
+        try:
+            from flygym_tracker.matrix_export import write_workbook
+
+            path = self.logger.workbook_path()
+            write_workbook(path,
+                           {"activity": _read_csv_rows(self.logger.output_dir,
+                                                       "activity_%s_*.csv" % self.logger.stamp),
+                            "behaviour": _read_csv_rows(self.logger.output_dir,
+                                                        "behaviour_%s.csv" % self.logger.stamp)},
+                           meta=self.logger.run_meta())
+            self.workbook_path = str(path)
+        except Exception as exc:
+            self.workbook_error = str(exc)
 
     def tracking_stats(self) -> dict:
         return self._pool.stats() if self._pool is not None else {}

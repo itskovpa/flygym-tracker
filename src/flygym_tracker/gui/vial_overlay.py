@@ -37,6 +37,9 @@ COLOR_OUTLINE = QColor(theme.FOCUS)
 #: A vial the calibration marks as absent -- it still has rows in the file, so it is still drawn.
 COLOR_ABSENT = QColor(theme.TEXT_FAINT)
 
+#: The drum: sixteen vials per face. Global ids are `face_index * 16 + local`.
+VIALS_PER_FACE = 16
+
 #: Motion (px) at which the tint saturates. Matches `results_panel.VialActivityGrid` so the picture
 #: and the grid agree about what "bright" means.
 FULL_SCALE = 400.0
@@ -64,7 +67,17 @@ class RunVialOverlay:
         activity: Dict[int, float] = {}
         for gvid, result in (vial_results or {}).items():
             try:
-                index = int(gvid) % max(1, len(self.polygons))
+                # 1-BASED GLOBAL IDS (`face_index * 16 + v.id`, v.id 1..16), so face A is 1..16 and
+                # face B is 17..32, and the -1 is what makes gvid 1 the FIRST polygon. Without it
+                # gvid 16 wrapped to polygon 0 and every vial's tint sat one tube to the right.
+                #
+                # MODULO 16, NOT len(polygons): sixteen is the drum's geometry, while the polygon
+                # count is however many vials this bundle marks PRESENT. On a bundle with a vial
+                # missing the two differ, and dividing by the wrong one would silently re-map every
+                # tint on that face.
+                index = (int(gvid) - 1) % VIALS_PER_FACE
+                if index >= len(self.polygons):
+                    continue
                 activity[index] = float(result[0])
             except (TypeError, ValueError, IndexError):
                 continue

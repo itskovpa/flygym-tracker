@@ -30,6 +30,16 @@ from flygym_tracker.pipeline import TrackerPipeline
 from flygym_tracker.types import Calibration, FaceCalibration, Frame, TrackState, VialROI
 
 
+def _one(directory, pattern):
+    """The single file matching `pattern`. Output files carry the run's start stamp now."""
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
+
 # =============================================================================================
 # Fake in-memory frame source + synthetic scene (trimmed copy of tests/test_pipeline.py's design)
 # =============================================================================================
@@ -248,8 +258,9 @@ def test_no_observer_registered_leaves_activity_output_unchanged(tmp_path):
                 "n_activity_records", "faces_seen", "per_face_frames", "stopped_reason"):
         assert summary_plain[key] == summary_observed[key], key
 
-    plain_csv = (tmp_path / "plain" / "activity_20260719.csv").read_text(encoding="utf-8")
-    observed_csv = (tmp_path / "observed" / "activity_20260719.csv").read_text(encoding="utf-8")
+    plain_csv = _one(tmp_path / "plain", "activity_*_20260719.csv").read_text(encoding="utf-8")
+    observed_csv = _one(tmp_path / "observed",
+                        "activity_*_20260719.csv").read_text(encoding="utf-8")
     assert plain_csv == observed_csv
 
 

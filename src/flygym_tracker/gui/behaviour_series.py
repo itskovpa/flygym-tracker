@@ -34,8 +34,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 #: Parameters offered for plotting, in the order they are shown, as ``(field, label)``.
 #: `median_path_length` FIRST because it is the rig owner's default: with up to 20 flies per vial
 #: the mean is dominated by merges, so the median fragment length is the readable one.
+#: ACTIVITY IS IN THE SAME LIST AS THE TRACKING PARAMETERS, from the operator's point of view
+#: there is no reason for "how much did this vial move" to live in a different surface from "how
+#: far did its flies walk" -- they are both per-vial numbers over the same run. They arrive by
+#: different routes (activity per BIN from the accumulator, behaviour per DWELL from the tracker)
+#: and `BehaviourSeries` does not care: a row is a row with an elapsed time, a face, a vial and
+#: some fields.
 PLOTTABLE = (
     ("median_path_length", "median track length (px)"),
+    ("motion_px_sum", "activity: motion (px)"),
+    ("active_fraction_mean", "activity: active fraction"),
     ("total_path_length", "total path length (px)"),
     ("median_speed", "median speed (px/s)"),
     ("mean_speed", "mean speed (px/s)"),

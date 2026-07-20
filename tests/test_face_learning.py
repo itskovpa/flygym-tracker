@@ -56,6 +56,20 @@ from flygym_tracker.markers import MarkerDetector
 from flygym_tracker.pipeline import TrackerPipeline
 from flygym_tracker.types import Frame
 
+
+def _one(directory, pattern):
+    """The single file matching `pattern` in `directory`.
+
+    OUTPUT FILES CARRY THE RUN'S START STAMP now (`events_20260720-142233.csv`), so a test cannot
+    spell the name. Globbing keeps the test about the CONTENT, which is what it was ever checking.
+    """
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
 # =============================================================================================
 # A synthetic rig frame: marker band + 16 vials + illuminated stage
 # =============================================================================================
@@ -575,7 +589,7 @@ def _run(tmp_path, frames, calib, detector, name="run"):
     pipe = TrackerPipeline(cfg, calib, Seq(frames), logger, marker_detector=detector,
                            clock="index", pixel_threshold=30)
     summary = pipe.run()
-    events = pd.read_csv(out / "events.csv", keep_default_na=False)
+    events = pd.read_csv(_one(out, "events_*.csv"), keep_default_na=False)
     # A run that attributed nothing writes no activity rows at all -- which is the POINT of some
     # of these tests, so an absent table is an empty one here, not an error.
     tables = [pd.read_csv(out / n) for n in sorted(os.listdir(out)) if n.startswith("activity")]

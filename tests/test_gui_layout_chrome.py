@@ -164,13 +164,29 @@ def test_the_vials_are_drawn_on_the_run(qapp):
 
 
 def test_the_overlay_tints_by_what_each_vial_reports(qapp):
+    """GLOBAL IDS ARE 1-BASED and the modulo is by 16 -- the drum's geometry -- not by however
+    many vials the bundle marks present. Getting either wrong puts every tint one tube over."""
     from flygym_tracker.gui.vial_overlay import RunVialOverlay
 
-    overlay = RunVialOverlay([_square(0, 0), _square(40, 0)])
-    overlay.set_activity({0: (120, 900, 0.3), 17: (300, 900, 0.5)})
-    assert overlay.activity[0] == 120
-    # Global id 17 is face B's vial 2, which shares face A's coordinates on this rig.
-    assert overlay.activity[1] == 300
+    overlay = RunVialOverlay([_square(40 * i, 0) for i in range(16)])
+    # FACE A ONLY -- which is also what the pipeline emits, because only one face is in front of
+    # the camera at a time. (Both faces share these coordinates, so face B's ids map onto the same
+    # polygons; feeding both at once here would just have one overwrite the other and prove
+    # nothing.)
+    overlay.set_activity({1: (120, 900, 0.3), 16: (99, 900, 0.2)})
+    assert overlay.activity[0] == 120, "face A vial 1 did not land on the first polygon"
+    assert overlay.activity[15] == 99, "face A vial 16 did not land on the last polygon"
+
+
+def test_face_b_ids_map_onto_the_same_shapes(qapp):
+    """Face B's vial 1 is global 17 and shares face A's coordinates, so it draws on the first
+    polygon. Only one face is visible at a time, so they never collide in a real frame."""
+    from flygym_tracker.gui.vial_overlay import RunVialOverlay
+
+    overlay = RunVialOverlay([_square(40 * i, 0) for i in range(16)])
+    overlay.set_activity({17: (300, 900, 0.5), 32: (7, 900, 0.1)})
+    assert overlay.activity[0] == 300
+    assert overlay.activity[15] == 7
 
 
 def test_an_unreported_vial_is_left_untinted_rather_than_drawn_as_zero(qapp):
@@ -179,7 +195,8 @@ def test_an_unreported_vial_is_left_untinted_rather_than_drawn_as_zero(qapp):
     from flygym_tracker.gui.vial_overlay import RunVialOverlay
 
     overlay = RunVialOverlay([_square(0, 0), _square(40, 0)])
-    overlay.set_activity({0: (120, 900, 0.3)})
+    overlay.set_activity({1: (120, 900, 0.3)})
+    assert 0 in overlay.activity
     assert 1 not in overlay.activity
 
 

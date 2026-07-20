@@ -28,6 +28,16 @@ from flygym_tracker.pipeline import TrackerPipeline
 from flygym_tracker.registration import estimate_shift
 from flygym_tracker.types import Frame
 
+
+def _one(directory, pattern):
+    """The single file matching `pattern`. Output files carry the run's start stamp now."""
+    import pathlib
+
+    matches = sorted(pathlib.Path(directory).glob(pattern))
+    assert matches, "no file matching %r in %s" % (pattern, directory)
+    return matches[0]
+
+
 W, H, BG, BAR, FLY = 120, 80, 30, 200, 40
 BOX_A, BOX_B = (15, 10, 30, 60), (75, 10, 30, 60)  # identical bars, 60 px pitch
 
@@ -113,7 +123,7 @@ def test_registration_guard_keeps_per_vial_attribution_after_rotation(tmp_path):
     assert summary["n_rotations"] == 1
 
     adf = pd.concat([pd.read_csv(c) for c in glob.glob(str(tmp_path / "out" / "activity_*.csv"))])
-    edf = pd.read_csv(str(tmp_path / "out" / "events.csv"))
+    edf = pd.read_csv(_one(tmp_path / "out", "events_*.csv"))
 
     late = adf[adf.elapsed_s >= 5]  # deep into phase 3
     b_late = late[late.vial_id == 2].motion_px_sum.sum()
