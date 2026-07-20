@@ -31,8 +31,8 @@ from typing import Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QFileDialog, QMainWindow, QMessageBox, QSplitter, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QDockWidget, QFileDialog, QMainWindow, QMessageBox, QSplitter,
+                               QVBoxLayout, QWidget)
 
 from flygym_tracker import camera_lock, readiness
 from flygym_tracker.gui import gui_state
@@ -112,9 +112,28 @@ class MainWindow(QMainWindow):
             _cfg(self.config, "source.camera.serial"), _cfg(self.config, "source.camera.index"))
         layout.addWidget(self.session_bar)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # THE SETTINGS ARE A DOCK, NOT A COLUMN, and that is a screen-space decision the rig owner
+        # made: the settings column was "occupying too much screen space with a lot of dead space".
+        # Ten rows of controls held a 560 px column open beside a picture that wants every pixel,
+        # and most of that column was empty below the last row.
+        #
+        # A QDockWidget rather than a hand-rolled collapsible: it closes to nothing, it FLOATS AS A
+        # REAL SEPARATE WINDOW -- which is what was asked for, so the settings can sit on a second
+        # monitor while the rig picture fills this one -- Qt handles the drag and the re-dock, and
+        # `toggleViewAction` is the single source of truth for "is it showing", so the button and
+        # the dock can never disagree about it.
         self.settings_view = SettingsView(self.controller)
-        splitter.addWidget(self.settings_view)
+        self.settings_dock = QDockWidget("Settings", self)
+        self.settings_dock.setObjectName("settings")
+        self.settings_dock.setWidget(self.settings_view)
+        self.settings_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea
+                                           | Qt.DockWidgetArea.RightDockWidgetArea)
+        self.settings_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                                       | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                                       | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.settings_dock)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         # THE PICTURE IS THE STAGE EVERY VIDEO OPERATION IS PERFORMED ON. Drawing vial positions,
         # replaying a recording, measuring the noise floor and learning the drum faces used to be
         # four child processes with four OpenCV windows; they are modes of this one widget now.
@@ -131,15 +150,13 @@ class MainWindow(QMainWindow):
         self.results = ResultsPanel()
         self.results.setVisible(False)
         splitter.addWidget(self.results)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 4)
-        splitter.setStretchFactor(2, 3)
+        # Two panes now that the settings have their own dock: the picture and, once a run starts,
+        # the measurement. The PICTURE keeps the larger share -- it is the pane that cannot be read
+        # by scrolling.
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([760, 420])
         self._splitter = splitter
-        # Explicit initial sizes, not just stretch factors: stretch alone let the settings pane
-        # open narrower than its content, which pushed the value controls off the right edge (seen
-        # by rendering this window offscreen). The preview still gets the larger half.
-        splitter.setSizes([600, 640])
-        splitter.setCollapsible(0, False)
         layout.addWidget(splitter, 1)
 
         self.readiness_strip = ReadinessStrip()
@@ -186,6 +203,12 @@ class MainWindow(QMainWindow):
         self.status_bar.open_requested.connect(self.open_camera)
         self.status_bar.close_requested.connect(self.session.close)
         self.status_bar.free_requested.connect(self.show_camera_lock)
+        # BOTH DIRECTIONS, so the button follows the dock however the dock was closed -- its own
+        # X, a drag, or this button. One of them driving the other only would leave the button
+        # showing "on" over a dock that is not there.
+        self.status_bar.settings_button.toggled.connect(self.settings_dock.setVisible)
+        self.settings_dock.visibilityChanged.connect(self._on_settings_visibility)
+        self.status_bar.settings_button.setChecked(True)
 
         # Bound methods of GUI-thread objects, never lambdas -- see `camera_session`.
         self.session.state_changed.connect(self._on_camera_state)
@@ -204,6 +227,7 @@ class MainWindow(QMainWindow):
         self.run.state_changed.connect(self._on_run_state)
         self.run.progress.connect(self.run_panel.set_progress)
         self.run.progress.connect(self.results.set_progress)
+        self.run.progress.connect(self._on_run_progress)
         self.run.bin_done.connect(self.results.add_bin)
         self.run.setting_applied.connect(self._on_run_setting_applied)
         self.session_bar.config_changed.connect(self._on_config_changed)
@@ -221,6 +245,13 @@ class MainWindow(QMainWindow):
         self._status_timer.setInterval(STATUS_REFRESH_MS)
         self._status_timer.timeout.connect(self._refresh_status)
         self._status_timer.start()
+
+    def _on_settings_visibility(self, visible: bool) -> None:
+        button = self.status_bar.settings_button
+        if button.isChecked() != visible:
+            button.blockSignals(True)          # not a request to change the dock; it already did
+            button.setChecked(visible)
+            button.blockSignals(False)
 
     def take_initial_focus(self) -> None:
         """Move focus off the first spinbox, AFTER `show()`. See the module docstring."""
@@ -374,11 +405,10 @@ class MainWindow(QMainWindow):
         new = SettingsView(self.controller)
         new.changed.connect(self.refresh_readiness)
         new.save_requested.connect(self.save_settings)
-        splitter = old.parentWidget()
-        while splitter is not None and not isinstance(splitter, QSplitter):
-            splitter = splitter.parentWidget()
-        if splitter is not None:
-            splitter.replaceWidget(splitter.indexOf(old), new)
+        # The pane lives in the dock now, so the swap is one call rather than a walk up the
+        # parents looking for a splitter that no longer holds it.
+        self.settings_dock.setWidget(new)
+        old.setParent(None)
         old.deleteLater()
         self.settings_view = new
         # The filter box belongs to the pane, so a replaced pane brings a new one -- and the
@@ -448,6 +478,7 @@ class MainWindow(QMainWindow):
             "config_path": self.controller.config_path,
         }
         self.results.clear()
+        self._show_run_vials()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             self.stage.show_camera()       # the run did not begin; stop implying it did
@@ -466,7 +497,7 @@ class MainWindow(QMainWindow):
     #: cannot be read by scrolling. Measured without this: showing the pane left the splitter at
     #: [560, 320, 600], i.e. the picture squeezed to its 320 px minimum while the results table --
     #: which scrolls perfectly well at half that -- took the most room on screen.
-    RUN_WIDTH_SHARES = (0.28, 0.42, 0.30)
+    RUN_WIDTH_SHARES = (0.60, 0.40)
 
     def _share_width_with_results(self) -> None:
         """Re-proportion the three panes the first time the results appear.
@@ -476,7 +507,7 @@ class MainWindow(QMainWindow):
         so the pane that matters most shrank to make room for the one that scrolls.
         """
         sizes = self._splitter.sizes()
-        if len(sizes) != 3:
+        if len(sizes) != len(self.RUN_WIDTH_SHARES):
             return
         total = sum(sizes) or self._splitter.width()
         if total <= 0:
@@ -497,6 +528,18 @@ class MainWindow(QMainWindow):
             IDLE, "the preview camera did not release in %.0f s, so the run was not started - "
                   "try Free the camera..." % (HANDOVER_TIMEOUT_MS / 1000.0))
         self.refresh_readiness()
+
+    def _show_run_vials(self) -> None:
+        """Put the bundle's vial shapes on the picture for the run to be watched through."""
+        from flygym_tracker.calibration import load_calibration
+        from flygym_tracker.gui.vial_overlay import overlay_from_calibration
+
+        try:
+            calib = load_calibration(self.state.get("calib_dir") or "calib_faces")
+        except Exception:
+            self.stage.set_run_overlay(None)
+            return
+        self.stage.set_run_overlay(overlay_from_calibration(calib))
 
     def _config_for_run(self):
         """The config a run should actually be measured with: the values that are ON SCREEN.
@@ -556,6 +599,10 @@ class MainWindow(QMainWindow):
         # refresh that puts it on screen the moment the run starts and takes it off when it ends.
         self.settings_view.refresh()
         self.refresh_readiness()
+
+    def _on_run_progress(self, payload: dict) -> None:
+        """Tint the vial outlines on the picture by what each vial is reporting."""
+        self.stage.set_run_activity(payload.get("vial_results") or {})
 
     def _on_run_setting_applied(self, key: str, applied: bool) -> None:
         """The closed loop for a mid-run change: the row says whether it REACHED the pipeline.
@@ -746,6 +793,7 @@ class MainWindow(QMainWindow):
             "replay_of": video,
         }
         self.results.clear()
+        self._show_run_vials()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             return

@@ -25,9 +25,9 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QGridLayout, QLabel, QLineEdit, QToolButton,
-                               QWidget)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
+                               QLineEdit, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 
 class PathField(QWidget):
@@ -78,8 +78,44 @@ class SessionBar(QWidget):
 
     def __init__(self, state: dict, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        layout = QGridLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # THE HEADER, AND WHY COLLAPSING DOES NOT JUST HIDE THIS BAND. These four paths decide
+        # which experiment runs, where its results land and which camera is opened -- they are set
+        # once at the start of a session and then never touched, which is exactly what makes four
+        # full-width rows of them a poor use of the screen for the other three days.
+        #
+        # Collapsed, the header keeps a ONE-LINE SUMMARY of what is chosen. A collapsed section
+        # that showed only its title would hide the answer to "am I about to overwrite yesterday's
+        # output folder", which is a question worth answering without a click.
+        header = QHBoxLayout()
+        header.setContentsMargins(10, 4, 10, 4)
+        header.setSpacing(8)
+        self.toggle = QToolButton()
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(True)
+        self.toggle.setAutoRaise(True)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.toggle.setToolTip("Show or hide the experiment's paths")
+        self.toggle.toggled.connect(self.set_expanded)
+        header.addWidget(self.toggle)
+
+        title = QLabel("EXPERIMENT")
+        title.setProperty("role", "grouptitle")
+        header.addWidget(title)
+
+        self.summary = QLabel("")
+        self.summary.setProperty("role", "note")
+        self.summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        header.addWidget(self.summary, 1)
+        outer.addLayout(header)
+
+        self.body = QWidget()
+        outer.addWidget(self.body)
+        layout = QGridLayout(self.body)
+        layout.setContentsMargins(10, 2, 10, 6)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(4)
 
@@ -107,12 +143,14 @@ class SessionBar(QWidget):
         self.calib_field = PathField(directory=True, caption="Folder holding the vial positions")
         self.calib_field.set_value(state.get("calib_dir") or "")
         self.calib_field.picked.connect(self.calib_changed)
+        self.calib_field.picked.connect(self._on_path_picked)
         layout.addWidget(self.calib_field, 1, 1, 1, 2)
 
         layout.addWidget(_label("results go to"), 2, 0)
         self.output_field = PathField(directory=True, caption="Folder for the results")
         self.output_field.set_value(state.get("output_dir") or "")
         self.output_field.picked.connect(self.output_changed)
+        self.output_field.picked.connect(self._on_path_picked)
         layout.addWidget(self.output_field, 2, 1, 1, 2)
 
         # Which physical camera the config asks for. It is READ-ONLY here because it is a property
@@ -126,6 +164,35 @@ class SessionBar(QWidget):
         layout.addWidget(self.camera_label, 3, 1, 1, 2)
 
         layout.setColumnStretch(1, 1)
+        self._refresh_summary()
+
+    # -- collapsing --------------------------------------------------------------------------
+    def set_expanded(self, expanded: bool) -> None:
+        """Show or hide the path rows. The header and its summary always stay."""
+        expanded = bool(expanded)
+        if self.toggle.isChecked() != expanded:
+            self.toggle.setChecked(expanded)
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.body.setVisible(expanded)
+        self._refresh_summary()
+
+    def is_expanded(self) -> bool:
+        return self.body.isVisible()
+
+    def _refresh_summary(self) -> None:
+        """What is chosen, in one line, named by folder rather than by full path.
+
+        Basenames because the full paths are long enough to push each other off the end of the
+        line, and the question a collapsed header has to answer is "is this the right bundle and
+        the right output folder", which the last component answers. The full path is the tooltip.
+        """
+        parts = [os.path.basename(self.config_path()) or "no config",
+                 os.path.basename(self.calib_field.value().rstrip("\\/")) or "no vial positions",
+                 os.path.basename(self.output_field.value().rstrip("\\/")) or "no output folder"]
+        self.summary.setText("   ".join(parts))
+        self.summary.setToolTip("config: %s\nvial positions: %s\nresults: %s"
+                                % (self.config_path(), self.calib_field.value(),
+                                   self.output_field.value()))
 
     def set_camera_identity(self, serial, index) -> None:
         """Say which camera will be opened, in the terms the config actually selects by.
@@ -152,10 +219,15 @@ class SessionBar(QWidget):
         self.config_combo.setCurrentText(current)
         self.config_combo.blockSignals(False)
 
+    def _on_path_picked(self, _path: str) -> None:
+        self._refresh_summary()
+
     def _on_config_activated(self, _index: int) -> None:
+        self._refresh_summary()
         self.config_changed.emit(self.config_path())
 
     def _on_config_typed(self) -> None:
+        self._refresh_summary()
         self.config_changed.emit(self.config_path())
 
     def _browse_config(self) -> None:
@@ -164,6 +236,7 @@ class SessionBar(QWidget):
                                                  "Config files (*.yaml *.yml);;All files (*)")
         if chosen:
             self.config_combo.setCurrentText(chosen)
+            self._refresh_summary()
             self.config_changed.emit(chosen)
 
 

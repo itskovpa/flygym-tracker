@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from flygym_tracker.gui import theme
 from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERROR_OTHER, OPENING,
@@ -43,12 +43,32 @@ class CameraStatusBar(QWidget):
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(8)
 
+        # THE WAY BACK TO A CLOSED SETTINGS DOCK. A dock that can be closed needs a visible switch
+        # to reopen it, or closing it once removes the settings from the app for good as far as the
+        # operator can tell. It is CHECKABLE and driven by the dock's own `toggleViewAction`, so the
+        # button and the dock cannot disagree about whether the settings are showing.
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setCheckable(True)
+        self.settings_button.setProperty("role", "ghost")
+        self.settings_button.setToolTip(
+            "Show or hide the settings. Drag its title bar out to float it as its own window - "
+            "on a second monitor, say - and drop it back on an edge to re-dock it.")
+        layout.addWidget(self.settings_button)
+
         self.dot = QLabel("*")
         self.dot.setFixedWidth(14)
         layout.addWidget(self.dot)
 
         self.sentence = QLabel("")
         self.sentence.setWordWrap(False)
+        # A STATUS LINE MUST NOT DECIDE HOW WIDE THE WINDOW IS. With the default policy this
+        # label's sizeHint is the full width of its longest sentence ("Camera DA4282883 is yours -
+        # 1280x1024 - streaming, 20.0 fps delivered (measured)"), and measured that alone demanded
+        # 1186 px of the window's minimum. It stayed under the 1400 px limit only while it was the
+        # widest thing in the window; the moment the settings moved into a dock beside it, the
+        # window's minimum became 1752 px on a 1440 px desktop. Same rule the run band's state
+        # label already follows, and the same rule as `flow_layout` -- fifth occurrence.
+        self.sentence.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.sentence, 1)
 
         self.open_button = QPushButton("Open camera")

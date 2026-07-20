@@ -134,6 +134,8 @@ class VideoStage(QWidget):
         #: True once the RUN has actually delivered a frame. Until then the picture is the
         #: preview's last one and the caption must not claim otherwise -- see `_update_caption`.
         self._run_frames = False
+        #: The vials the run is measuring, drawn on the run's picture. See `vial_overlay`.
+        self._run_overlay = None
         #: What the last video job produced, kept on screen until something else happens.
         #:
         #: BECAUSE THE CAPTION IS REWRITTEN EVERY 50 ms. `_pull` refreshes it from the current
@@ -264,6 +266,12 @@ class VideoStage(QWidget):
             overlay = self._draw.overlay
         elif mode == BAND and self._band is not None:
             overlay = self._band.overlay
+        elif mode == RUN:
+            # THE VIALS STAY ON THE PICTURE WHILE THEY ARE BEING MEASURED. They are not decoration:
+            # which pixels went into each row of activity.csv is decided entirely by these shapes,
+            # and a run watched without them is a drum and a table of numbers with no way to see
+            # that one outline has slipped onto the tube next door.
+            overlay = self._run_overlay
         self.view.set_overlay(overlay)
         self.mode_changed.emit(mode)
 
@@ -280,6 +288,13 @@ class VideoStage(QWidget):
         self._box = getattr(self.session, "latest", None)
         self.view.placeholder = "No picture - the camera is not open"
         self._show_mode(CAMERA)
+
+    def set_run_overlay(self, overlay) -> None:
+        """Draw these vial shapes over the run's picture (None removes them)."""
+        self._run_overlay = overlay
+        if self._mode == RUN:
+            self.view.set_overlay(overlay)
+        self.view.update()
 
     def show_run(self) -> None:
         """Watch the running pipeline -- an experiment, or a replay of a recording.
@@ -572,6 +587,13 @@ class VideoStage(QWidget):
         self._notice = payload.get("message", "")
         self._update_caption()
         self.job_finished.emit(kind, payload)
+
+    def set_run_activity(self, vial_results: dict) -> None:
+        """Tint the drawn vials by what each is reporting right now."""
+        if self._run_overlay is not None:
+            self._run_overlay.set_activity(vial_results or {})
+            if self._mode == RUN:
+                self.view.update()
 
     def _on_job_progress(self, snapshot: dict) -> None:
         self._job_note = _job_progress_line(self._job_kind, snapshot)
