@@ -58,6 +58,12 @@ DEFAULTS: Dict[str, Any] = {
     #: keys in this table -- a key the window sets but this dict does not know about is dropped on
     #: the way to disk, silently, and looks like a setting that will not stick.
     "last_video": "",
+    #: Whether a run also writes a video, and what that video costs. OFF is the default and has to
+    #: be: a full-rate recording of a three-day run is hundreds of gigabytes, and an operator who
+    #: never asked for video must not discover it by finding the disk full at hour 50. The two
+    #: knobs are remembered because they are a property of the rig and the disk it writes to,
+    #: settled once and not per experiment.
+    "recording": {"enabled": False, "every_nth": 2, "scale": 0.5},
 }
 
 #: How many entries the config dropdown keeps. Small: this is a shortcut, not a history feature,
@@ -80,6 +86,20 @@ def _coerce(key: str, value: Any) -> Any:
     must not reach the widgets: a `QComboBox` handed an int raises somewhere far from the cause.
     """
     default = DEFAULTS[key]
+    if isinstance(default, dict):
+        # PER-SUBKEY, and an unrecognised or wrongly-typed one falls back to ITS default rather
+        # than throwing the whole group away. A hand-edited file that broke `scale` should not also
+        # lose the operator's `enabled`.
+        merged = dict(default)
+        if isinstance(value, dict):
+            for sub, sub_default in default.items():
+                if sub not in value:
+                    continue
+                try:
+                    merged[sub] = type(sub_default)(value[sub])
+                except (TypeError, ValueError):
+                    pass
+        return merged
     if isinstance(default, list):
         if not isinstance(value, list):
             return list(default)

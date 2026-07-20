@@ -125,6 +125,10 @@ class RunWorker(QObject):
         self._pipeline = None
         self._last_emit = 0.0
         self._frames = 0
+        #: The optional video of this run. Built in `_build` only if the window asked for one, fed
+        #: from `_on_frame`, and closed in `run`'s teardown. None when recording is off, which is
+        #: the default -- and when it is None the frame loop pays a single `is not None`.
+        self._recorder = None
 
     # -- called from the GUI thread ---------------------------------------------------------
     def queue_setting(self, key: str, value: Any) -> None:
@@ -166,10 +170,26 @@ class RunWorker(QObject):
                                    stop_flag=self._stop.is_set)
         except Exception as exc:
             self._pipeline = None
+            self._close_recorder()      # a failed run still leaves whatever it recorded playable
             self.failed.emit(str(exc))
             return
         self._pipeline = None
-        self.finished.emit(dict(summary or {}))
+        summary = dict(summary or {})
+        # THE VIDEO IS FINALISED AFTER THE PIPELINE, NOT INSIDE IT. `close` drains the frames
+        # already accepted and releases the writer, which is what makes the file playable; doing it
+        # from the pipeline's teardown would put an encode of up to sixteen frames in front of the
+        # logger's final flush, i.e. in front of the measurement reaching the disk.
+        summary["video"] = self._close_recorder()
+        self.finished.emit(summary)
+
+    def _close_recorder(self) -> Optional[dict]:
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return None
+        try:
+            return recorder.close()
+        except Exception as exc:
+            return {"error": "could not finalise the video: %s" % exc}
 
     def _build(self):
         """Assemble the pipeline from the SAME helpers the CLI uses.
@@ -185,6 +205,7 @@ class RunWorker(QObject):
                                         _make_run_id)
         from flygym_tracker.logger import ActivityLogger
         from flygym_tracker.pipeline import TrackerPipeline
+        from flygym_tracker.video_recorder import recorder_for_run
 
         plan = self._plan
         config = plan["config"]
@@ -204,8 +225,17 @@ class RunWorker(QObject):
         pipeline = TrackerPipeline(
             config=config, calibration=calib, source=source, logger=logger,
             marker_detector=_build_marker_detector(config, calib), clock="auto")
+        # OFF UNLESS ASKED FOR, and built from the LOGGER'S stamp so the video sits beside the
+        # CSVs of the same run instead of carrying a time of its own. The file is not opened here:
+        # its frame size comes from the first frame, because the config's width and height are what
+        # was ASKED of the camera and a camera that rounded to its increment would leave every
+        # submitted frame silently refused.
+        self._recorder = recorder_for_run(
+            plan["output_dir"], logger.stamp, plan.get("recording"),
+            fps=float(getattr(config.source, "fps", 0) or 20.0))
         return pipeline, {"run_id": run_id, "output_dir": plan["output_dir"],
-                          "calib_dir": plan["calib_dir"]}
+                          "calib_dir": plan["calib_dir"],
+                          "video": (self._recorder.path.name if self._recorder else None)}
 
     # -- per frame, on the run thread ----------------------------------------------------------
     def _on_frame(self, payload: dict) -> None:
@@ -222,6 +252,8 @@ class RunWorker(QObject):
         """
         self._drain_pending()
         self._frames = int(payload.get("index", self._frames) or 0)
+        if self._recorder is not None:
+            self._record(payload)
 
         now = time.monotonic()
         if now - self._last_emit < 1.0 / PROGRESS_HZ:
@@ -262,7 +294,33 @@ class RunWorker(QObject):
             # second per-frame signal carrying polylines would be the queue problem the frame box
             # exists to avoid.
             "fly_tracks": self._pipeline.fly_tracks() if self._pipeline is not None else None,
+            # WHAT THE RECORDING IS DOING, on the throttled signal because it is a readout and not
+            # a measurement. Carried at all because a recorder that is silently dropping frames --
+            # a slow disk, a full one -- looks exactly like one that is keeping up unless it is
+            # asked, and the answer is only useful while there is still time to lower the rate.
+            "video": self._recorder.stats() if self._recorder is not None else None,
         })
+
+    def _record(self, payload: dict) -> None:
+        """Offer this frame to the recorder. EVERY frame, not the throttled 5 Hz the picture gets.
+
+        UNTHROTTLED BECAUSE A VIDEO IS A RECORD, not a preview: sampling it at the rate the eye
+        happens to refresh at would produce a file that cannot be stepped through to see what a fly
+        did. What the operator asks for instead is `every_nth`, which is a stated sampling rate the
+        file's frame rate is divided to match -- so the video always plays back at life speed and
+        always says how coarsely it was sampled.
+
+        THE COST HERE IS A QUEUE APPEND AND A COPY, both of which `submit` skips when the frame is
+        skipped or the encoder is behind. It must not raise: this is inside the pipeline's frame
+        loop, so an exception would be one per frame for the rest of a three-day run -- and losing
+        the video must never cost the measurement it was recording.
+        """
+        try:
+            image = payload.get("frame")
+            if image is not None:
+                self._recorder.submit(image, float(payload.get("elapsed_s") or 0.0))
+        except Exception:
+            pass
 
     def _on_bin(self, payload: dict) -> None:
         """A bin rolled over. Ship its ROWS across as plain dicts -- the same fields as the CSV.
@@ -436,8 +494,9 @@ class RunController(QObject):
         self.started.emit(meta)
 
     def _on_finished(self, summary: dict) -> None:
-        self._set_state(DONE, "%d frames, %d rotations" % (
-            summary.get("frames_processed", 0), summary.get("n_rotations", 0)))
+        self._set_state(DONE, "%d frames, %d rotations%s" % (
+            summary.get("frames_processed", 0), summary.get("n_rotations", 0),
+            _video_summary(summary.get("video"))))
         self._join()
         self.finished.emit(summary)
 
@@ -452,6 +511,25 @@ class RunController(QObject):
             thread.wait(SHUTDOWN_WAIT_MS)
         self._thread = None
         self._worker = None
+
+
+def _video_summary(stats) -> str:
+    """What the run's video ended up being, for the line the operator reads when it finishes.
+
+    A DROP COUNT IS NAMED IN THE SUMMARY rather than left in the file. It is the one figure that
+    says the recording is not a complete record of the run, and the moment it matters is when
+    somebody sits down to look at the video -- which is after this line is the only thing left.
+    """
+    if not stats:
+        return ""
+    if stats.get("error"):
+        return "; VIDEO FAILED: %s" % stats["error"]
+    written = int(stats.get("frames_written") or 0)
+    dropped = int(stats.get("frames_dropped") or 0)
+    text = "; video %d frames (%.0f MB)" % (written, float(stats.get("bytes") or 0) / 1048576.0)
+    if dropped:
+        text += ", %d DROPPED" % dropped
+    return text
 
 
 #: Matches `camera_session.SHUTDOWN_WAIT_MS`. Long enough for a final bin flush and a logger close;

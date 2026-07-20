@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self.session_bar = SessionBar(self.state)
         self.session_bar.set_camera_identity(
             _cfg(self.config, "source.camera.serial"), _cfg(self.config, "source.camera.index"))
+        self.session_bar.set_recording_settings(self.state.get("recording"))
         layout.addWidget(self.session_bar)
 
         # THE SETTINGS ARE A DOCK, NOT A COLUMN, and that is a screen-space decision the rig owner
@@ -147,7 +148,16 @@ class MainWindow(QMainWindow):
                                        | QDockWidget.DockWidgetFeature.DockWidgetClosable)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.settings_dock)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # UNDER THE PICTURE, AT THE PICTURE'S WIDTH -- the rig owner's call, and the geometry is the
+        # reason it is right. The measurement is 32 cells in two rows of sixteen: a shape that is
+        # wide and short. Beside the picture it had to be squeezed into a column narrow enough to
+        # leave the drum visible, so the cells were scrolled sideways and half of face B was off the
+        # edge. Under it, the row of sixteen gets the full width it wants, and the picture gets back
+        # the width the drum wants -- both shapes stop fighting for the same axis.
+        #
+        # A vertical splitter rather than a plain layout, so the operator can still trade height
+        # between the drum and the numbers.
+        splitter = QSplitter(Qt.Orientation.Vertical)
         # THE PICTURE IS THE STAGE EVERY VIDEO OPERATION IS PERFORMED ON. Drawing vial positions,
         # replaying a recording, measuring the noise floor and learning the drum faces used to be
         # four child processes with four OpenCV windows; they are modes of this one widget now.
@@ -156,20 +166,20 @@ class MainWindow(QMainWindow):
         #: picture. It is the same object -- there is only one picture in this window.
         self.preview = self.stage
         splitter.addWidget(self.stage)
-        # THE MEASUREMENT, BESIDE THE PICTURE. Until now the window showed frames, fps and a
+        # THE MEASUREMENT, UNDER THE PICTURE. Until now the window showed frames, fps and a
         # brightness strip -- all of which say the machine is running, none of which is a number
         # that reaches the results. It is HIDDEN until a run starts: with nothing measuring, an
-        # empty table of result columns is a promise the window cannot keep, and it would be
-        # taking width from the picture that the picture needs for drawing vials.
+        # empty row of result cells is a promise the window cannot keep, and it would be taking
+        # height from the picture that the picture needs for drawing vials.
         self.results = ResultsPanel()
         self.results.setVisible(False)
         splitter.addWidget(self.results)
-        # Two panes now that the settings have their own dock: the picture and, once a run starts,
-        # the measurement. The PICTURE keeps the larger share -- it is the pane that cannot be read
-        # by scrolling.
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 3)
-        splitter.setSizes([760, 420])
+        # THE PICTURE TAKES THE HEIGHT. The measurement is two rows of cells and a line of text --
+        # it has a natural height and gains nothing from more, while the picture is the pane that
+        # cannot be read by scrolling.
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([620, 150])
         self._splitter = splitter
         layout.addWidget(splitter, 1)
 
@@ -249,6 +259,7 @@ class MainWindow(QMainWindow):
         self.session_bar.config_changed.connect(self._on_config_changed)
         self.session_bar.calib_changed.connect(self._on_calib_changed)
         self.session_bar.output_changed.connect(self._on_output_changed)
+        self.session_bar.recording_changed.connect(self._on_recording_changed)
         self.readiness_strip.fix_requested.connect(self._on_fix)
 
         # The handover watchdog. A single-shot timer rather than a wait: the GUI thread must stay
@@ -455,6 +466,17 @@ class MainWindow(QMainWindow):
         gui_state.save_state(self.root, self.state)
         self.refresh_readiness()
 
+    def _on_recording_changed(self, settings: dict) -> None:
+        """Remember the video choice. It does NOT reach a running experiment.
+
+        A run reads `recording` once, when Start is pressed, and the recorder is built then. That
+        is deliberate: starting or stopping a video mid-run would produce a file whose frames begin
+        somewhere in the middle of the measurement with nothing in it saying where -- and stopping
+        one would look, afterwards, exactly like a crash.
+        """
+        self.state["recording"] = dict(settings or {})
+        gui_state.save_state(self.root, self.state)
+
     def _on_filter(self, text: str) -> None:
         """Kept as the window's entry point; the filter itself now lives in the settings pane, so
         the box can be sticky at the top of the column it filters."""
@@ -504,6 +526,9 @@ class MainWindow(QMainWindow):
             "output_dir": self.state.get("output_dir") or getattr(
                 getattr(self.config, "output", None), "dir", None),
             "config_path": self.controller.config_path,
+            # OFF UNLESS THE TICK BOX SAYS OTHERWISE. Read here rather than held as window state so
+            # what is recorded is what the box showed at the moment Start was pressed.
+            "recording": self.session_bar.recording_settings(),
         }
         self.results.clear()
         self.behaviour.clear()
@@ -524,27 +549,30 @@ class MainWindow(QMainWindow):
         # `setting_change` events (invariant 4).
         self.settings_view.refresh()
 
-    #: Width shares once the results pane appears: settings, picture, results. THE PICTURE KEEPS
-    #: THE LARGEST SHARE because it is where the run is actually watched -- and it is the pane that
-    #: cannot be read by scrolling. Measured without this: showing the pane left the splitter at
-    #: [560, 320, 600], i.e. the picture squeezed to its 320 px minimum while the results table --
-    #: which scrolls perfectly well at half that -- took the most room on screen.
-    RUN_WIDTH_SHARES = (0.60, 0.40)
+    #: How tall the measurement gets when it appears UNDER the picture. It is two rows of cells and
+    #: two lines of text -- a natural height of about this, and nothing to gain from more. The
+    #: picture takes every remaining pixel, because it is where the run is actually watched and the
+    #: one pane that cannot be read by scrolling.
+    RESULTS_HEIGHT = 150
+    #: Never leave the picture shorter than this, whatever the window is doing.
+    MIN_PICTURE_HEIGHT = 240
 
     def _share_width_with_results(self) -> None:
-        """Re-proportion the three panes the first time the results appear.
+        """Give the measurement its band under the picture, the first time it appears.
 
         Set EXPLICITLY rather than left to Qt. A newly shown pane is given whatever the stretch
-        factors and minimum sizes happen to produce, which here was the picture at its minimum --
-        so the pane that matters most shrank to make room for the one that scrolls.
+        factors and minimum sizes happen to produce, which when this pane sat BESIDE the picture
+        was the picture at its 320 px minimum -- the pane that matters most shrinking to make room
+        for the one that scrolls. Under it, the same rule applies to height.
         """
         sizes = self._splitter.sizes()
-        if len(sizes) != len(self.RUN_WIDTH_SHARES):
+        if len(sizes) != 2:
             return
-        total = sum(sizes) or self._splitter.width()
+        total = sum(sizes) or self._splitter.height()
         if total <= 0:
             return
-        self._splitter.setSizes([max(300, int(total * share)) for share in self.RUN_WIDTH_SHARES])
+        results = min(self.RESULTS_HEIGHT, max(0, total - self.MIN_PICTURE_HEIGHT))
+        self._splitter.setSizes([total - results, results])
 
     def _handover_timed_out(self) -> None:
         """The preview never reported CLOSED. Say so; do not start a run on a held camera.
@@ -621,6 +649,18 @@ class MainWindow(QMainWindow):
         # to read them -- and the run's final, partial bin is flushed at the very end.
         if state in (STARTING, RUNNING) and not self.results.isVisible():
             self.results.setVisible(True)
+            # THE EXPERIMENT'S PATHS FOLD AWAY WHEN THE RUN STARTS, and this is a height decision
+            # rather than a tidiness one. The measurement now sits UNDER the picture, so it takes
+            # its ~104 px from the picture rather than from the width beside it -- and on the rig
+            # laptop's 900 px desktop the picture had no 104 px to spare. Those four rows are 125
+            # px of paths that CANNOT be changed while a run is going, so they are the right thing
+            # to spend.
+            #
+            # COLLAPSE ONLY, NEVER EXPAND. If the operator has already folded or unfolded the
+            # section, a run must not fight them about it -- and the one-line summary stays either
+            # way, so nothing is hidden that was not still on screen.
+            if self.session_bar.is_expanded():
+                self.session_bar.set_expanded(False)
             self._share_width_with_results()
         # A finished run gives the picture back to the camera preview, so the next thing the
         # operator does is not done against the last frame of the last experiment.

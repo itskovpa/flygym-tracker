@@ -26,8 +26,11 @@ import os
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QSpinBox, QToolButton,
+                               QVBoxLayout, QWidget)
+
+from flygym_tracker.gui.flow_layout import FlowLayout
 
 
 class PathField(QWidget):
@@ -75,6 +78,8 @@ class SessionBar(QWidget):
     config_changed = Signal(str)
     calib_changed = Signal(str)
     output_changed = Signal(str)
+    #: The video-recording choice changed. Carried as a dict so the window can save it verbatim.
+    recording_changed = Signal(dict)
 
     def __init__(self, state: dict, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -163,8 +168,128 @@ class SessionBar(QWidget):
         self.camera_label.setProperty("role", "note")
         layout.addWidget(self.camera_label, 3, 1, 1, 2)
 
+        # RECORDING THE VIDEO, WHICH IS OFF UNLESS IT IS ASKED FOR. It lives in this section
+        # because it is a property of the experiment, chosen once with the paths, and not of the
+        # camera or the algorithm -- and because a recording switch anywhere near the live controls
+        # would be reachable mid-run, which is the one time it must not move.
+        layout.addWidget(_label("record video"), 4, 0)
+        layout.addWidget(self._build_recording_row(), 4, 1, 1, 2)
+
         layout.setColumnStretch(1, 1)
         self._refresh_summary()
+        self._on_recording_toggled(False)
+
+    def _build_recording_row(self) -> QWidget:
+        """The tick box and the two knobs that decide what recording costs.
+
+        OFF BY DEFAULT, as asked. The default has to be off for a reason beyond preference: a run
+        may last three days, and a full-rate full-size recording of three days is hundreds of
+        gigabytes. An operator who wants video will tick a box; an operator who does not must never
+        discover afterwards that the disk filled at hour 50 and took the experiment with it.
+
+        THE TWO KNOBS ARE THE COST, and they are here rather than hidden because they are the
+        difference between a recording that is free and one that is not. Every 4th frame at half
+        size is a sixteenth of the pixels -- ample for watching what the flies did, and small enough
+        that the encoder never falls behind the camera.
+        """
+        # A FLOW LAYOUT, NOT A QHBoxLayout, AND THIS WAS MEASURED. A horizontal box's minimum width
+        # is the SUM of its children, so this row of a tick box and two spin boxes pushed the
+        # window's own minimum to 1484 px on a 1440 px desktop -- the fifth time on this project
+        # that a strip of controls has been the reason a window does not fit the rig laptop, and
+        # caught here only because `test_gui_layout` measures it. A flow layout's minimum is its
+        # WIDEST SINGLE ITEM, and it grows downward, which the section above it can absorb.
+        row = QWidget()
+        line = FlowLayout(row, spacing=8)
+
+        self.record_box = QCheckBox("save a video of the run")
+        self.record_box.setChecked(False)
+        self.record_box.setToolTip(
+            "Write the run to video_<timestamp>.avi beside the results. Off by default: a "
+            "full-rate recording of a multi-day run is hundreds of gigabytes.\n\n"
+            "The video is encoded on its own thread and never delays the measurement -- if the "
+            "encoder falls behind, frames are dropped from the VIDEO and counted, and the "
+            "measurement is untouched.")
+        self.record_box.toggled.connect(self._on_recording_toggled)
+        self.record_box.toggled.connect(self._emit_recording)
+        line.addWidget(self.record_box)
+
+        self.record_every = QSpinBox()
+        self.record_every.setRange(1, 100)
+        self.record_every.setValue(2)
+        self.record_every.setPrefix("every ")
+        self.record_every.setSuffix(" frame(s)")
+        self.record_every.setToolTip(
+            "Record one frame in N. The file's frame rate is divided to match, so the video still "
+            "plays back at life speed -- it is simply sampled more coarsely.")
+        self.record_every.valueChanged.connect(self._emit_recording)
+        line.addWidget(self.record_every)
+
+        self.record_scale = QDoubleSpinBox()
+        self.record_scale.setRange(0.1, 1.0)
+        self.record_scale.setSingleStep(0.1)
+        self.record_scale.setDecimals(1)
+        self.record_scale.setValue(0.5)
+        self.record_scale.setPrefix("size ")
+        self.record_scale.setSuffix("x")
+        self.record_scale.setToolTip(
+            "Scale each recorded frame. 0.5 is a quarter of the pixels to encode and roughly a "
+            "quarter of the disk. THIS AFFECTS THE VIDEO ONLY -- the measurement always runs on "
+            "full-resolution frames.")
+        self.record_scale.valueChanged.connect(self._emit_recording)
+        line.addWidget(self.record_scale)
+
+        self.record_note = QLabel("")
+        self.record_note.setProperty("role", "note")
+        self.record_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        line.addWidget(self.record_note)
+        return row
+
+    def _on_recording_toggled(self, on: bool) -> None:
+        for widget in (self.record_every, self.record_scale):
+            widget.setEnabled(bool(on))
+        self.record_note.setText("" if on else "no video is written")
+        if on:
+            self._refresh_record_note()
+
+    def _refresh_record_note(self) -> None:
+        """Say what was chosen in the terms that matter: rate and size, not multipliers."""
+        every = self.record_every.value()
+        rate = "every frame" if every == 1 else "1 frame in %d" % every
+        self.record_note.setText("%s at %.0f%% size" % (rate, self.record_scale.value() * 100))
+
+    def _emit_recording(self, *_args) -> None:
+        if self.record_box.isChecked():
+            self._refresh_record_note()
+        self.recording_changed.emit(self.recording_settings())
+
+    def recording_settings(self) -> dict:
+        """What the run should do about video. Consumed by `video_recorder.recorder_for_run`."""
+        return {"enabled": bool(self.record_box.isChecked()),
+                "every_nth": int(self.record_every.value()),
+                "scale": float(self.record_scale.value())}
+
+    def set_recording_settings(self, settings: Optional[dict]) -> None:
+        """Restore what was chosen last time, without re-emitting it as a fresh change."""
+        settings = settings or {}
+        for widget, key, cast in ((self.record_box, "enabled", bool),
+                                  (self.record_every, "every_nth", int),
+                                  (self.record_scale, "scale", float)):
+            if key not in settings:
+                continue
+            widget.blockSignals(True)
+            try:
+                if widget is self.record_box:
+                    widget.setChecked(cast(settings[key]))
+                else:
+                    widget.setValue(cast(settings[key]))
+            except (TypeError, ValueError):
+                pass
+            widget.blockSignals(False)
+        self._on_recording_toggled(self.record_box.isChecked())
+
+    def set_recording_status(self, text: str) -> None:
+        """Live counts from the running recorder, shown where the settings are."""
+        self.record_note.setText(text or "")
 
     # -- collapsing --------------------------------------------------------------------------
     def set_expanded(self, expanded: bool) -> None:

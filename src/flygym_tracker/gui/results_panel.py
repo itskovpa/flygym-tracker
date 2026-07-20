@@ -130,8 +130,11 @@ class ResultsPanel(QWidget):
         self._rows_written = 0
         self._bins = 0
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(6)
+        # TIGHT, because this is now a band under the picture and every pixel it takes is one the
+        # drum does not get. Measured: 8/6 margins at 6 spacing put this band's minimum height at
+        # 104 px, against a picture that wants 280.
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(3)
 
         live_head = QHBoxLayout()
         title = QLabel("MEASURING NOW")
@@ -139,6 +142,12 @@ class ResultsPanel(QWidget):
         live_head.addWidget(title)
         self.live_note = QLabel("per frame, not yet binned - not in the file")
         self.live_note.setProperty("role", "note")
+        # IGNORED WIDTH, like the other two notes, and this was measured. Its text grows once a run
+        # starts posting to it ("face A - pixel threshold 15.0 - per frame, not yet binned - not in
+        # the file"), and a plain QLabel's minimum width is its whole sentence: the window's minimum
+        # went to 1740 px on a 1440 px desktop the moment a run began. The layout tests never caught
+        # it because they build the window but never push a progress payload through it.
+        self.live_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         live_head.addWidget(self.live_note, 1)
         layout.addLayout(live_head)
 
@@ -164,9 +173,25 @@ class ResultsPanel(QWidget):
         # actually growing" -- and it takes a line rather than a scrolling wall.
         self.recorded_note = QLabel("no bins finished yet")
         self.recorded_note.setProperty("role", "note")
-        self.recorded_note.setWordWrap(True)
+        # NOT WRAPPED, now that this panel is a short band UNDER the picture rather than a tall
+        # column beside it. A wrapping label's minimum height grows with its text, and these two
+        # notes between them were demanding ~150 px of minimum -- enough that on a short screen
+        # Qt gave the band its minimum and squeezed the PICTURE, which is the one thing the layout
+        # exists to protect. One line each, and the full text stays in the tooltip.
+        self.recorded_note.setWordWrap(False)
         self.recorded_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.recorded_note)
+
+        # THE RECORDING, IF THERE IS ONE. Shown HERE rather than only beside its tick box because
+        # that tick box lives in a section that collapses -- and a recorder quietly dropping frames
+        # to a slow or filling disk looks exactly like one that is keeping up unless it is asked.
+        # The answer is only worth anything while there is still time to lower the rate.
+        self.recording_note = QLabel("")
+        self.recording_note.setProperty("role", "note")
+        self.recording_note.setWordWrap(False)
+        self.recording_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.recording_note.setVisible(False)
+        layout.addWidget(self.recording_note)
         layout.addStretch(1)
 
     # -- live ------------------------------------------------------------------------------------
@@ -181,7 +206,48 @@ class ResultsPanel(QWidget):
             # decides what counts as motion at all, it is live-adjustable mid-run, and reading
             # these values without it is reading them without their units.
             bits.insert(1, "pixel threshold %.1f" % float(threshold))
-        self.live_note.setText("   -   ".join(bits))
+        text = "   -   ".join(bits)
+        self.live_note.setText(text)
+        self.live_note.setToolTip(text)
+        self.set_recording(payload.get("video"))
+
+    def set_recording(self, stats: Optional[dict]) -> None:
+        """One line about the video, or nothing at all when no video was asked for.
+
+        DROPS ARE NAMED AS DROPS, and separately from the frames deliberately skipped. They are
+        different facts: skipped frames are the sampling rate the operator chose, dropped ones are
+        the encoder failing to keep up with it. Rolling them into one "frames not recorded" figure
+        would hide a disk problem inside a setting.
+        """
+        if not stats:
+            self.recording_note.setVisible(False)
+            return
+        self.recording_note.setVisible(True)
+        error = stats.get("error")
+        if error:
+            self.recording_note.setText("VIDEO STOPPED: %s   -   the measurement is unaffected"
+                                        % error)
+            return
+        written = int(stats.get("frames_written") or 0)
+        dropped = int(stats.get("frames_dropped") or 0)
+        megabytes = float(stats.get("bytes") or 0) / (1024.0 * 1024.0)
+        bits = ["recording: %d frame(s)" % written, "%.0f MB" % megabytes]
+        # A MEASURED PROJECTION, not an estimate from the settings. How many bytes a frame costs
+        # depends entirely on what is in it -- a still drum compresses to nothing, thirty-two vials
+        # of moving flies do not -- so the only honest way to say what a three-day run will cost is
+        # to divide what THIS run has already written. It is worth saying because the answer is
+        # frequently hundreds of gigabytes, and hour 50 is a bad time to find that out.
+        fps = float(stats.get("fps") or 0.0)
+        if written > 20 and fps > 0 and megabytes > 0:
+            bits.append("about %.0f GB/day at this rate" % (
+                megabytes / written * fps * 86400.0 / 1024.0))
+        if dropped:
+            # NOT FOLDED INTO A PERCENTAGE. "1.2% dropped" reads as a rounding error; a count that
+            # keeps climbing reads as what it is.
+            bits.append("%d frame(s) DROPPED - the disk or the codec is behind the camera" % dropped)
+        text = "   -   ".join(bits)
+        self.recording_note.setText(text)
+        self.recording_note.setToolTip(text)
 
     # -- recorded --------------------------------------------------------------------------------
     def add_bin(self, payload: dict) -> None:
@@ -191,8 +257,9 @@ class ResultsPanel(QWidget):
             return
         self._bins += 1
         self._rows_written += len(records)
-        self.recorded_note.setText(
-            "%d bin(s), %d row(s) written to activity.csv" % (self._bins, self._rows_written))
+        text = "%d bin(s), %d row(s) written to activity.csv" % (self._bins, self._rows_written)
+        self.recorded_note.setText(text)
+        self.recorded_note.setToolTip(text)      # the line no longer wraps; the tooltip is the rest
 
     def clear(self) -> None:
         self.grid.clear()
@@ -200,3 +267,5 @@ class ResultsPanel(QWidget):
         self._bins = 0
         self.live_note.setText("per frame, not yet binned - not in the file")
         self.recorded_note.setText("no bins finished yet")
+        self.recording_note.setText("")
+        self.recording_note.setVisible(False)
