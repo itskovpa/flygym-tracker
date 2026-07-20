@@ -100,6 +100,8 @@ class RunWorker(QObject):
     #: NOT THROTTLED, unlike `progress`: a bin is 10 s by default, so this fires about six times a
     #: minute. Dropping one would drop a row of the actual result.
     bin_done = Signal(dict)
+    #: Completed dwells' behavioural rows, exactly as written to behaviour.csv.
+    behaviour_done = Signal(dict)
     #: `(key, applied)` for each queued change the pipeline actually took. `applied=False` means
     #: the pipeline refused it -- a start-only key, or one this run cannot route -- and the row
     #: says so instead of showing a value that never reached anything.
@@ -157,6 +159,7 @@ class RunWorker(QObject):
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
         pipeline.add_bin_observer(self._on_bin)
+        pipeline.add_behaviour_observer(self._on_behaviour)
         self.started.emit(summary_meta)
         try:
             summary = pipeline.run(max_frames=self._plan.get("max_frames"),
@@ -279,6 +282,12 @@ class RunWorker(QObject):
             "bin_end_s": float(getattr(bin_obj, "bin_end_s", 0.0) or 0.0),
         })
 
+    def _on_behaviour(self, payload: dict) -> None:
+        """Ship the behaviour rows across. Plain dicts, copied -- same rule as `_on_bin`."""
+        rows = [dict(row) for row in (payload.get("rows") or [])]
+        if rows:
+            self.behaviour_done.emit({"rows": rows})
+
     def _drain_pending(self) -> None:
         while True:
             try:
@@ -307,6 +316,8 @@ class RunController(QObject):
     setting_applied = Signal(str, bool)
     #: One completed bin's rows, exactly as written to activity.csv. See `RunWorker.bin_done`.
     bin_done = Signal(dict)
+    #: Completed dwells' behavioural rows, exactly as written to behaviour.csv.
+    behaviour_done = Signal(dict)
 
     def __init__(self, *, camera_is_open: Callable[[], bool],
                  parent: Optional[QObject] = None) -> None:
@@ -372,6 +383,7 @@ class RunController(QObject):
         self._worker.failed.connect(self._on_failed)
         self._worker.setting_applied.connect(self.setting_applied)
         self._worker.bin_done.connect(self.bin_done)
+        self._worker.behaviour_done.connect(self.behaviour_done)
         self._set_state(STARTING, "opening the camera and the output files")
         self._thread.start()
         return True

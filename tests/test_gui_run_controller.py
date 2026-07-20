@@ -32,6 +32,7 @@ class FakePipeline:
         self.refused = []
         self.observers = []
         self.bin_observers = []
+        self.behaviour_observers = []
         self._frames = frames
         self._block_geometry = block_geometry
         self.ran = False
@@ -47,6 +48,16 @@ class FakePipeline:
         when the run worker started forwarding completed bins to the results pane.
         """
         self.bin_observers.append(callback)
+
+    def add_behaviour_observer(self, callback):
+        """The real pipeline has this too. A fake that implements only yesterday's methods turns
+        red the moment the shipped code uses one more of the real interface -- which is now the
+        second time this exact fake has done so."""
+        self.behaviour_observers.append(callback)
+
+    def emit_behaviour(self, rows):
+        for callback in self.behaviour_observers:
+            callback({"rows": rows})
 
     def emit_bin(self, records):
         """Fire a completed bin, the way the pipeline does at every rollover."""

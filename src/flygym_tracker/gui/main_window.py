@@ -40,6 +40,8 @@ from flygym_tracker.gui.camera_lock_dialog import CameraLockDialog, qt_confirm
 from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERROR_OTHER,
                                                OPENING, STREAMING, CameraSession)
 from flygym_tracker.gui.camera_status import CameraStatusBar
+from flygym_tracker.gui.behaviour_series import BehaviourSeries
+from flygym_tracker.gui.plot_dock import BehaviourPlotDock
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.results_panel import ResultsPanel
 from flygym_tracker.gui.run_controller import RunController
@@ -101,6 +103,10 @@ class MainWindow(QMainWindow):
         #: A video job waiting for the camera to finish opening. See `with_camera`.
         self._camera_then = None
         self._camera_why = ""
+        #: Every behaviour row of this run, shared by every open plot dock. ONE STORE: a dock
+        #: opened at hour 40 draws the whole run rather than only what arrives after it opened.
+        self.behaviour = BehaviourSeries()
+        self._plot_docks = {}
         self._build()
         self._connect()
         self.refresh_readiness()
@@ -230,6 +236,7 @@ class MainWindow(QMainWindow):
         self.run_panel.start_requested.connect(self.start_run)
         self.run_panel.stop_requested.connect(self.run.stop)
         self.run_panel.tool_requested.connect(self._on_tool)
+        self.run_panel.plot_requested.connect(self.show_plot)
         self.stage.job_finished.connect(self._on_job_finished)
         self.stage.mode_changed.connect(self._on_stage_mode)
         self.run.state_changed.connect(self._on_run_state)
@@ -237,6 +244,7 @@ class MainWindow(QMainWindow):
         self.run.progress.connect(self.results.set_progress)
         self.run.progress.connect(self._on_run_progress)
         self.run.bin_done.connect(self.results.add_bin)
+        self.run.behaviour_done.connect(self._on_behaviour_rows)
         self.run.setting_applied.connect(self._on_run_setting_applied)
         self.session_bar.config_changed.connect(self._on_config_changed)
         self.session_bar.calib_changed.connect(self._on_calib_changed)
@@ -498,6 +506,9 @@ class MainWindow(QMainWindow):
             "config_path": self.controller.config_path,
         }
         self.results.clear()
+        self.behaviour.clear()
+        for dock in self._plot_docks.values():
+            dock.refresh()
         self._show_run_vials()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
@@ -619,6 +630,34 @@ class MainWindow(QMainWindow):
         # refresh that puts it on screen the moment the run starts and takes it off when it ends.
         self.settings_view.refresh()
         self.refresh_readiness()
+
+    def _on_behaviour_rows(self, payload: dict) -> None:
+        """Completed dwells arrived: store them and redraw whatever plots are open."""
+        if not self.behaviour.add(payload.get("rows") or []):
+            return
+        for dock in self._plot_docks.values():
+            dock.refresh()
+
+    def show_plot(self, field: str) -> None:
+        """Open (or raise) the dock for one behavioural parameter.
+
+        RAISED RATHER THAN DUPLICATED: two docks of the same parameter would be two identical
+        graphs the operator then has to tell apart, and closing one would look like it had failed
+        to close the other.
+        """
+        dock = self._plot_docks.get(field)
+        if dock is None:
+            dock = BehaviourPlotDock(self.behaviour, field, self)
+            self._plot_docks[field] = dock
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            # TABBED WITH ITS SIBLINGS rather than stacked: four parameters split vertically would
+            # leave each grid too short to read, and the operator asked for a graph per parameter.
+            others = [d for key, d in self._plot_docks.items() if key != field and d.isVisible()]
+            if others:
+                self.tabifyDockWidget(others[-1], dock)
+        dock.show()
+        dock.raise_()
+        dock.refresh()
 
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
@@ -869,6 +908,9 @@ class MainWindow(QMainWindow):
             "replay_of": video,
         }
         self.results.clear()
+        self.behaviour.clear()
+        for dock in self._plot_docks.values():
+            dock.refresh()
         self._show_run_vials()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)

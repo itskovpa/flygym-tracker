@@ -33,8 +33,8 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 from flygym_tracker.gui.flow_layout import flow_strip
 from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, RUNNING, STARTING, STOPPING
@@ -59,6 +59,8 @@ class RunPanel(QWidget):
     #: A cv2 tool the operator asked for, by stable action name rather than by button label -- a
     #: button that silently stops working because a label was reworded is worse than no button.
     tool_requested = Signal(str)
+    #: A behavioural parameter to plot, by `behaviour_series` field name.
+    plot_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -97,6 +99,29 @@ class RunPanel(QWidget):
         self.readout.setProperty("role", "readout")
         controls.addWidget(self.readout)
         outer.addLayout(controls)
+
+        # THE PLOTS. A picker rather than a button per parameter: there are thirteen of them and a
+        # row of thirteen buttons would be the tool strip's width problem all over again.
+        from flygym_tracker.gui.behaviour_series import PLOTTABLE
+
+        plot_row = QHBoxLayout()
+        plot_row.setSpacing(8)
+        plot_label = QLabel("PLOT")
+        plot_label.setProperty("role", "grouptitle")
+        plot_row.addWidget(plot_label)
+        self.plot_box = QComboBox()
+        for field, label in PLOTTABLE:
+            self.plot_box.addItem(label, field)
+        self.plot_box.setToolTip(
+            "A behavioural parameter to plot as a timeseries, 8x2 vials per drum face. Each one "
+            "opens its own dock, which can be floated, tabbed or closed.")
+        plot_row.addWidget(self.plot_box, 1)
+        self.plot_button = QPushButton("Show graph")
+        self.plot_button.setProperty("role", "ghost")
+        self.plot_button.clicked.connect(
+            lambda: self.plot_requested.emit(self.plot_box.currentData()))
+        plot_row.addWidget(self.plot_button)
+        outer.addLayout(plot_row)
 
         # THE JOBS THAT WERE IN run.bat. Buttons, not a numbered menu, and each one names what it
         # opens rather than what it is called internally.

@@ -358,6 +358,10 @@ class TrackerPipeline:
         # -- observers (opt-in; see "observers" section below) --------------------------------
         self._observers: List[Callable[[dict], None]] = []
         self._bin_observers: List[Callable[[dict], None]] = []
+        #: Called with ``{"rows": [...]}`` whenever completed dwells are written. Separate from
+        #: `_bin_observers` because behaviour rows are produced per DWELL and written when a bin
+        #: rolls, so a caller that wants them cannot infer them from the activity bin.
+        self._behaviour_observers: List[Callable[[dict], None]] = []
         self.observer_failures = 0
         self._fps_times: List[float] = []
 
@@ -389,6 +393,11 @@ class TrackerPipeline:
         final, possibly-partial bin flushed at run end) with
         ``{"bin": ActivityBin, "records": [ActivityRecord, ...]}``."""
         self._bin_observers.append(callback)
+
+    def add_behaviour_observer(self, callback: Callable[[dict], None]) -> None:
+        """Register a callback for behaviour rows, called with ``{"rows": [dict, ...]}`` each time
+        completed dwells are flushed. The dicts are exactly the `behaviour.csv` rows."""
+        self._behaviour_observers.append(callback)
 
     def _notify(self, observers: List[Callable[[dict], None]], payload: dict) -> None:
         """Call every observer with `payload`, isolating (and counting) failures."""
@@ -850,6 +859,10 @@ class TrackerPipeline:
         try:
             self.logger.log_behaviour(rows)
             self.n_behaviour_records += len(rows)
+            if self._behaviour_observers:
+                # AFTER the write, so nothing is shown that is not on disk. A plot of rows that
+                # failed to be written would be a graph of data the operator does not have.
+                self._notify(self._behaviour_observers, {"rows": rows})
         except Exception as exc:
             # A behaviour write must never take down a run whose ACTIVITY is the primary result --
             # but it must never be SILENT either, and the first version of this was.
