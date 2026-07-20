@@ -32,11 +32,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
+                               QWidget)
 
-from flygym_tracker.gui import theme
 from flygym_tracker.gui.flow_layout import flow_strip
 from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, RUNNING, STARTING, STOPPING
 
@@ -46,65 +45,12 @@ VIALS_PER_FACE = 16
 N_FACES = 2
 
 
-class VialStrip(QWidget):
-    """One cell per vial, brightness by activity. The fast read of "is anything moving".
-
-    NOT A MEASUREMENT DISPLAY. The numbers that matter go to activity.csv; this is a presence
-    check an operator can take in from across the room before walking away for three days. It says
-    so in its own tooltip rather than inviting anyone to read values off it.
-    """
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        layout = QGridLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self.cells = []
-        for face in range(N_FACES):
-            for vial in range(VIALS_PER_FACE):
-                cell = QLabel("")
-                cell.setFixedSize(14, 14)
-                cell.setToolTip("face %s, vial %d" % ("AB"[face], vial + 1))
-                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                layout.addWidget(cell, face, vial)
-                self.cells.append(cell)
-        self.clear()
-
-    def clear(self) -> None:
-        for cell in self.cells:
-            cell.setStyleSheet(
-                "background: %s; border: 1px solid %s; border-radius: 2px;"
-                % (theme.INK_2, theme.RULE))
-
-    def set_activity(self, vial_results: dict) -> None:
-        """`vial_results` is ``{global_vial_id: (..., ..., activity)}`` as the pipeline emits it.
-
-        A vial the pipeline did not report is left at rest rather than drawn as zero: "no reading"
-        and "a reading of zero" are different facts, and drawing them the same way would be the
-        display inventing a measurement (invariant 6).
-        """
-        for index, cell in enumerate(self.cells):
-            result = vial_results.get(index)
-            if result is None:
-                cell.setStyleSheet("background: %s; border: 1px solid %s; border-radius: 2px;"
-                                   % (theme.INK_2, theme.RULE))
-                continue
-            try:
-                activity = float(result[-1])
-            except (TypeError, IndexError, ValueError):
-                activity = 0.0
-            # Steel blue, scaled. NOT amber: amber means "the software is imposing a value on the
-            # sensor" everywhere else in this app, and a wall of amber cells would drain the one
-            # channel that carries that meaning.
-            weight = max(0.0, min(1.0, activity / 40.0))
-            if weight <= 0.01:
-                fill = theme.INK_2
-            else:
-                fill = "rgba(127, 178, 217, %.2f)" % (0.12 + 0.88 * weight)
-            cell.setStyleSheet("background: %s; border: 1px solid %s; border-radius: 2px;"
-                               % (fill, theme.RULE))
-
-
+# `VialStrip` USED TO LIVE HERE and has been deleted rather than left beside its replacement.
+# It coloured one cell per vial by activity and its own docstring called it "NOT A MEASUREMENT
+# DISPLAY... a presence check" -- which was honest, and left the operator unable to tell 3 from 300
+# without opening the file afterwards. `results_panel.VialActivityGrid` shows the NUMBER, next to
+# the rows actually written to activity.csv. Keeping both would be two displays of one measurement,
+# updated from the same signal by different code, free to disagree.
 class RunPanel(QWidget):
     """Start/stop plus the live readout, and the four jobs that were in `run.bat`'s menu."""
 
@@ -151,16 +97,6 @@ class RunPanel(QWidget):
         self.readout.setProperty("role", "readout")
         controls.addWidget(self.readout)
         outer.addLayout(controls)
-
-        strip_row = QHBoxLayout()
-        strip_row.setSpacing(8)
-        vials_label = QLabel("VIALS")
-        vials_label.setProperty("role", "grouptitle")
-        strip_row.addWidget(vials_label)
-        self.vials = VialStrip()
-        strip_row.addWidget(self.vials)
-        strip_row.addStretch(1)
-        outer.addLayout(strip_row)
 
         # THE JOBS THAT WERE IN run.bat. Buttons, not a numbered menu, and each one names what it
         # opens rather than what it is called internally.
@@ -225,8 +161,6 @@ class RunPanel(QWidget):
         self._running = running
         self._refresh_tools()
         self.state_label.setText(_state_sentence(state, detail))
-        if state in (IDLE, DONE, FAILED):
-            self.vials.clear()
 
     def set_progress(self, payload: dict) -> None:
         """Render one throttled snapshot. Every figure here was counted by the pipeline."""
@@ -236,7 +170,6 @@ class RunPanel(QWidget):
                 _hms(elapsed), int(payload.get("frames") or 0),
                 float(payload.get("fps_est") or 0.0), int(payload.get("n_rotations") or 0),
                 payload.get("face") or "?"))
-        self.vials.set_activity(payload.get("vial_results") or {})
 
 
 def _state_sentence(state: str, detail: str) -> str:

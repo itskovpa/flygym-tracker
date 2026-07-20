@@ -41,11 +41,12 @@ from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, OPENING, STREAMI
                                                CameraSession)
 from flygym_tracker.gui.camera_status import CameraStatusBar
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
+from flygym_tracker.gui.results_panel import ResultsPanel
 from flygym_tracker.gui.run_controller import RunController
 from flygym_tracker.gui.run_panel import RunPanel
 from flygym_tracker.gui.session_bar import SessionBar
 from flygym_tracker.gui.settings_view import SettingsView
-from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, STARTING
+from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, RUNNING, STARTING
 from flygym_tracker.gui.video_stage import RUN as STAGE_RUN
 from flygym_tracker.gui.video_stage import VideoStage
 from flygym_tracker.settings_controller import (SettingsController, camera_block_reason,
@@ -122,8 +123,18 @@ class MainWindow(QMainWindow):
         #: picture. It is the same object -- there is only one picture in this window.
         self.preview = self.stage
         splitter.addWidget(self.stage)
+        # THE MEASUREMENT, BESIDE THE PICTURE. Until now the window showed frames, fps and a
+        # brightness strip -- all of which say the machine is running, none of which is a number
+        # that reaches the results. It is HIDDEN until a run starts: with nothing measuring, an
+        # empty table of result columns is a promise the window cannot keep, and it would be
+        # taking width from the picture that the picture needs for drawing vials.
+        self.results = ResultsPanel()
+        self.results.setVisible(False)
+        splitter.addWidget(self.results)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 3)
+        self._splitter = splitter
         # Explicit initial sizes, not just stretch factors: stretch alone let the settings pane
         # open narrower than its content, which pushed the value controls off the right edge (seen
         # by rendering this window offscreen). The preview still gets the larger half.
@@ -192,6 +203,8 @@ class MainWindow(QMainWindow):
         self.stage.mode_changed.connect(self._on_stage_mode)
         self.run.state_changed.connect(self._on_run_state)
         self.run.progress.connect(self.run_panel.set_progress)
+        self.run.progress.connect(self.results.set_progress)
+        self.run.bin_done.connect(self.results.add_bin)
         self.run.setting_applied.connect(self._on_run_setting_applied)
         self.session_bar.config_changed.connect(self._on_config_changed)
         self.session_bar.calib_changed.connect(self._on_calib_changed)
@@ -434,6 +447,7 @@ class MainWindow(QMainWindow):
                 getattr(self.config, "output", None), "dir", None),
             "config_path": self.controller.config_path,
         }
+        self.results.clear()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             self.stage.show_camera()       # the run did not begin; stop implying it did
@@ -446,6 +460,28 @@ class MainWindow(QMainWindow):
         # algorithm keys into `TrackerPipeline.apply_setting`, which applies them AND logs them as
         # `setting_change` events (invariant 4).
         self.settings_view.refresh()
+
+    #: Width shares once the results pane appears: settings, picture, results. THE PICTURE KEEPS
+    #: THE LARGEST SHARE because it is where the run is actually watched -- and it is the pane that
+    #: cannot be read by scrolling. Measured without this: showing the pane left the splitter at
+    #: [560, 320, 600], i.e. the picture squeezed to its 320 px minimum while the results table --
+    #: which scrolls perfectly well at half that -- took the most room on screen.
+    RUN_WIDTH_SHARES = (0.28, 0.42, 0.30)
+
+    def _share_width_with_results(self) -> None:
+        """Re-proportion the three panes the first time the results appear.
+
+        Set EXPLICITLY rather than left to Qt. A newly shown pane is given whatever the stretch
+        factors and minimum sizes happen to produce, which here was the picture at its minimum --
+        so the pane that matters most shrank to make room for the one that scrolls.
+        """
+        sizes = self._splitter.sizes()
+        if len(sizes) != 3:
+            return
+        total = sum(sizes) or self._splitter.width()
+        if total <= 0:
+            return
+        self._splitter.setSizes([max(300, int(total * share)) for share in self.RUN_WIDTH_SHARES])
 
     def _handover_timed_out(self) -> None:
         """The preview never reported CLOSED. Say so; do not start a run on a held camera.
@@ -505,6 +541,12 @@ class MainWindow(QMainWindow):
 
     def _on_run_state(self, state: str, detail: str) -> None:
         self.run_panel.set_run_state(state, detail)
+        # THE RESULTS PANE APPEARS WITH THE RUN AND STAYS AFTER IT ENDS. Hiding it the moment the
+        # run finishes would take the last bins off the screen at the exact moment somebody wants
+        # to read them -- and the run's final, partial bin is flushed at the very end.
+        if state in (STARTING, RUNNING) and not self.results.isVisible():
+            self.results.setVisible(True)
+            self._share_width_with_results()
         # A finished run gives the picture back to the camera preview, so the next thing the
         # operator does is not done against the last frame of the last experiment.
         if state in (DONE, FAILED, IDLE) and self.stage.mode == STAGE_RUN:
@@ -703,6 +745,7 @@ class MainWindow(QMainWindow):
             "source_factory": _video_source_factory(video),
             "replay_of": video,
         }
+        self.results.clear()
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             return

@@ -88,6 +88,18 @@ class RunWorker(QObject):
     started = Signal(dict)
     finished = Signal(dict)
     failed = Signal(str)
+    #: ONE COMPLETED BIN -- the rows that were just written to activity.csv, as plain dicts.
+    #:
+    #: THIS IS THE ANALYSIS OUTPUT, and until now nothing carried it out of the pipeline. The
+    #: window showed frames, fps and a brightness strip -- all of which say the machine is running
+    #: -- and none of which is a measurement. An operator could watch a three-day experiment
+    #: without ever seeing a number that would end up in the results, which means a threshold set
+    #: wrong, a vial that never reports, or a face never identified would all look exactly like a
+    #: healthy run until the CSV was opened afterwards.
+    #:
+    #: NOT THROTTLED, unlike `progress`: a bin is 10 s by default, so this fires about six times a
+    #: minute. Dropping one would drop a row of the actual result.
+    bin_done = Signal(dict)
     #: `(key, applied)` for each queued change the pipeline actually took. `applied=False` means
     #: the pipeline refused it -- a start-only key, or one this run cannot route -- and the row
     #: says so instead of showing a value that never reached anything.
@@ -144,6 +156,7 @@ class RunWorker(QObject):
 
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
+        pipeline.add_bin_observer(self._on_bin)
         self.started.emit(summary_meta)
         try:
             summary = pipeline.run(max_frames=self._plan.get("max_frames"),
@@ -243,6 +256,29 @@ class RunWorker(QObject):
             "vial_results": dict(vial_results),
         })
 
+    def _on_bin(self, payload: dict) -> None:
+        """A bin rolled over. Ship its ROWS across as plain dicts -- the same fields as the CSV.
+
+        `ActivityRecord.as_row()` rather than the dataclass, and a new list rather than the
+        pipeline's: this crosses a thread boundary, and the rule everywhere in this file is that a
+        signal carries data the GUI can read at its leisure, never an object the run thread is
+        still using.
+
+        THIS MUST NOT RAISE. It runs inside the pipeline's bin flush, right after the rows were
+        handed to the logger; an exception here would be counted as an observer failure every bin
+        for the rest of the run.
+        """
+        try:
+            records = [record.as_row() for record in (payload.get("records") or [])]
+        except Exception:
+            return
+        bin_obj = payload.get("bin")
+        self.bin_done.emit({
+            "records": records,
+            "bin_start_s": float(getattr(bin_obj, "bin_start_s", 0.0) or 0.0),
+            "bin_end_s": float(getattr(bin_obj, "bin_end_s", 0.0) or 0.0),
+        })
+
     def _drain_pending(self) -> None:
         while True:
             try:
@@ -269,6 +305,8 @@ class RunController(QObject):
     started = Signal(dict)
     finished = Signal(dict)
     setting_applied = Signal(str, bool)
+    #: One completed bin's rows, exactly as written to activity.csv. See `RunWorker.bin_done`.
+    bin_done = Signal(dict)
 
     def __init__(self, *, camera_is_open: Callable[[], bool],
                  parent: Optional[QObject] = None) -> None:
@@ -333,6 +371,7 @@ class RunController(QObject):
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.setting_applied.connect(self.setting_applied)
+        self._worker.bin_done.connect(self.bin_done)
         self._set_state(STARTING, "opening the camera and the output files")
         self._thread.start()
         return True

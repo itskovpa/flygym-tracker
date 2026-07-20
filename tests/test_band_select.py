@@ -51,6 +51,24 @@ def _bundle(tmp_path, *, band=False, templates=False) -> str:
     return out
 
 
+def _synthetic_frame():
+    """A frame with two lit strips at KNOWN rows and nothing strip-like anywhere else.
+
+    SYNTHETIC ON PURPOSE. The negative cases below ("this band contains no strips") were written
+    against `calib_faces/overlay_A.png`, which is a live artefact the rig owner rewrites whenever
+    they redraw the vials -- and when they did, a region that had been empty acquired something
+    bright enough to read and the tests turned red with no source change. A claim about geometry
+    should be tested against geometry the test controls.
+    """
+    frame = np.zeros((400, 600), dtype=np.uint8)
+    frame[180:200, 60:540] = 255          # upper strip
+    frame[230:250, 60:540] = 255          # lower strip
+    for x in range(80, 540, 120):         # opaque stickers, alternating between the strips
+        frame[180:200, x:x + 40] = 0
+        frame[230:250, x + 60:x + 100] = 0
+    return frame
+
+
 pytestmark = pytest.mark.skipif(not os.path.isdir(BUNDLE), reason="no calibration bundle in repo")
 
 
@@ -145,31 +163,27 @@ def test_hand_picked_rows_win_over_a_stale_stored_window(tmp_path):
 def test_a_band_that_contains_two_strips_is_reported_as_working(qapp, tmp_path):
     """The preview is the point: a band with fewer than two strips in it identifies nothing, and
     the operator is looking straight at the picture that shows why."""
-    import cv2
-
     from flygym_tracker.gui.band_select import BandSelectSession
 
     out = _bundle(tmp_path)
-    image = cv2.imread(os.path.join(BUNDLE, "overlay_A.png"), cv2.IMREAD_GRAYSCALE)
+    image = _synthetic_frame()
     session = BandSelectSession(out_dir=out, frame_height=image.shape[0])
     session.on_frame(image)
-    session.on_press(0, 410)
-    session.on_release(0, 560)
-    assert session.rows == (410, 560)
+    session.on_press(0, 160)
+    session.on_release(0, 270)
+    assert session.rows == (160, 270)
     assert len(session.strips) == 2, "the two lit strips were not found in the drawn band"
     assert "will work" in session.status()
 
 
 def test_a_band_with_no_strips_in_it_says_so_before_it_is_saved(qapp, tmp_path):
-    import cv2
-
     from flygym_tracker.gui.band_select import BandSelectSession
 
     out = _bundle(tmp_path)
-    image = cv2.imread(os.path.join(BUNDLE, "overlay_A.png"), cv2.IMREAD_GRAYSCALE)
+    image = _synthetic_frame()
     session = BandSelectSession(out_dir=out, frame_height=image.shape[0])
     session.on_frame(image)
-    session.on_press(0, 20)                       # the top of the frame: vials, no LED slots
+    session.on_press(0, 20)                       # above both strips: nothing lit up there
     session.on_release(0, 120)
     assert len(session.strips) < 2
     assert "needs two" in session.status()
@@ -178,12 +192,10 @@ def test_a_band_with_no_strips_in_it_says_so_before_it_is_saved(qapp, tmp_path):
 def test_saving_a_band_with_too_few_strips_warns_rather_than_refuses(qapp, tmp_path):
     """It is still saved -- the operator may be marking a rig whose lights are off right now --
     but the message says what it will do, because a silent save reads as success."""
-    import cv2
-
     from flygym_tracker.gui.band_select import BandSelectSession
 
     out = _bundle(tmp_path)
-    image = cv2.imread(os.path.join(BUNDLE, "overlay_A.png"), cv2.IMREAD_GRAYSCALE)
+    image = _synthetic_frame()
     session = BandSelectSession(out_dir=out, frame_height=image.shape[0])
     session.on_frame(image)
     session.on_press(0, 20)

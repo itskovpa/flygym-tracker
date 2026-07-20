@@ -31,12 +31,27 @@ class FakePipeline:
         self.applied = []
         self.refused = []
         self.observers = []
+        self.bin_observers = []
         self._frames = frames
         self._block_geometry = block_geometry
         self.ran = False
 
     def add_observer(self, callback):
         self.observers.append(callback)
+
+    def add_bin_observer(self, callback):
+        """The real `TrackerPipeline` has this, so the fake standing in for it must too.
+
+        A fake that implements only the methods yesterday's code called is a fake that turns red
+        the moment the shipped code uses one more of the real interface -- which is what happened
+        when the run worker started forwarding completed bins to the results pane.
+        """
+        self.bin_observers.append(callback)
+
+    def emit_bin(self, records):
+        """Fire a completed bin, the way the pipeline does at every rollover."""
+        for callback in self.bin_observers:
+            callback({"bin": None, "records": records})
 
     def apply_setting(self, key, value):
         # The real pipeline asks `setting_block_reason` as its BACKSTOP and returns False for a
