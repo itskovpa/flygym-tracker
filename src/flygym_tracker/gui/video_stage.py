@@ -109,12 +109,34 @@ class VideoStage(QWidget):
         self.files.progress.connect(self._on_job_progress)
         self.files.finished.connect(self._on_file_job_finished)
         self.files.failed.connect(self._on_file_job_failed)
+        # A CAMERA-BACKED JOB CAN DIE ON THE CAMERA THREAD, and until these were connected nothing
+        # in the window found out: `camera_worker` detaches a raising tap and says so, into
+        # nothing, leaving this widget showing a measurement that had already stopped. Bound
+        # methods rather than lambdas -- a lambda's slot runs on the SENDER's thread, which here
+        # is the one driving the SDK.
+        for signal, slot in (("tap_failed", self._on_tap_failed),
+                             ("tap_finished", self._on_tap_finished)):
+            source = getattr(session, signal, None)
+            if source is not None:
+                source.connect(slot)
 
         self._mode = CAMERA
         self._box = getattr(session, "latest", None)
         self._draw = None                     # the live VialDrawSession, in DRAW
+        self._job = None                      # the running FrameJob, in JOB -- see _poll_camera_job
         self._job_kind = ""                   # "noise" | "faces", in JOB
         self._job_note = ""
+        self._tap_error = ""                  # why a camera-backed job ended, if it ended badly
+        #: What the last video job produced, kept on screen until something else happens.
+        #:
+        #: BECAUSE THE CAPTION IS REWRITTEN EVERY 50 ms. `_pull` refreshes it from the current
+        #: mode, so a result written straight into the label by a finishing job survived for one
+        #: pull and was then replaced by the live camera line. That silently threw away the ONLY
+        #: place the noise floor's suggested thresholds and the face-learning outcome are reported
+        #: -- a measurement that appears to produce nothing at all. Same bug as `save_settings`
+        #: calling `refresh_titles` after `set_status`; this is the version of it that eats a
+        #: measurement rather than a confirmation.
+        self._notice = ""
         self._build()
         self._show_mode(CAMERA)
 
@@ -213,8 +235,13 @@ class VideoStage(QWidget):
         self.mode_changed.emit(mode)
 
     def show_camera(self) -> None:
-        """Back to just looking at the camera. Does NOT open or close it."""
+        """Back to just looking at the camera. Does NOT open or close it.
+
+        EVERY WAY OUT OF A JOB COMES THROUGH HERE, so this is where the job reference is dropped.
+        Leaving a finished job attached would let the next poll collect its result a second time.
+        """
         self._draw = None
+        self._job = None
         self._job_kind = ""
         self._box = getattr(self.session, "latest", None)
         self.view.placeholder = "No picture - the camera is not open"
@@ -288,7 +315,8 @@ class VideoStage(QWidget):
         self.files.stop()
         self._draw = None
         self.show_camera()
-        self.caption.setText(payload.get("message", ""))
+        self._notice = payload.get("message", "")
+        self._update_caption()
         self.job_finished.emit("draw", payload)
 
     def _draw_freeze(self) -> None:
@@ -360,8 +388,11 @@ class VideoStage(QWidget):
                 self.caption.setText("The camera is already busy with another measurement.")
                 return False
             self._box = getattr(self.session, "latest", None)
+        self._job = job
         self._job_kind = kind
         self._job_note = ""
+        self._tap_error = ""
+        self._notice = ""                     # the previous result is history now
         self.view.placeholder = "Waiting for the first frame"
         self._show_mode(JOB)
         self._update_caption()
@@ -380,15 +411,35 @@ class VideoStage(QWidget):
 
         A stop is not a cancel: a noise floor measured over 60 frames instead of 100 is a real
         measurement of 60 frames, and it reports the count it actually used.
+
+        STOP ALWAYS GETS THE OPERATOR OUT. THE BUG THIS FIXES, reported from the rig: "I select
+        Learn Drum faces, the algorithm starts and never stops, the button stop does not work."
+        This method used to `return` silently when it could not find a job to stop -- and the one
+        situation that produces exactly that is a job which RAISED: `camera_worker` detaches a
+        raising tap (so it cannot throw once per frame for the rest of a session) and reports it,
+        but nothing was listening, so the stage sat in JOB mode with the last progress line still
+        on screen, looking like a measurement that was still running, and the only control offered
+        did nothing at all.
+
+        Face learning is where that is worst, because it is ALSO the job that legitimately runs
+        forever: it ends when the drum has shown every face, and a drum that is not turning never
+        ends it. So "it never stops" is normal and "stop does nothing" was the whole failure.
+
+        There is now no path out of this method that leaves the stage in JOB mode.
         """
         if self.files.is_running:
             self.files.stop()
             return
         job = getattr(self.session, "tap", None)
-        if job is None:
+        if job is not None:
+            self.session.detach_tap()
+            self._finish_camera_job(job)
             return
-        self.session.detach_tap()
-        self._finish_camera_job(job)
+        # NOTHING TO STOP -- and the operator still asked to leave. Whatever became of the job
+        # (it raised and detached itself, or it was never attached), sitting here is not an option.
+        self.show_camera()
+        self.caption.setText(
+            self._job_note or "that measurement had already stopped - nothing was left running")
 
     def _finish_camera_job(self, job) -> None:
         """A camera-backed job has ended. Its result is computed HERE, on the GUI thread, from the
@@ -400,7 +451,8 @@ class VideoStage(QWidget):
         except Exception as exc:
             payload = {"message": "%s could not be completed: %s" % (kind, exc), "failed": True}
         self.show_camera()
-        self.caption.setText(payload.get("message", ""))
+        self._notice = payload.get("message", "")
+        self._update_caption()
         self.job_finished.emit(kind, payload)
 
     def _on_job_progress(self, snapshot: dict) -> None:
@@ -419,7 +471,8 @@ class VideoStage(QWidget):
             return
         payload.setdefault("message", _job_message(kind, payload))
         self.show_camera()
-        self.caption.setText(payload.get("message", ""))
+        self._notice = payload.get("message", "")
+        self._update_caption()
         self.job_finished.emit(kind, payload)
 
     def _on_file_job_failed(self, message: str) -> None:
@@ -428,7 +481,8 @@ class VideoStage(QWidget):
             self.caption.setText("That recording could not be read: %s" % message)
             return
         self.show_camera()
-        self.caption.setText("%s failed: %s" % (kind, message))
+        self._notice = "%s failed: %s" % (kind, message)
+        self._update_caption()
         self.job_finished.emit(kind, {"message": message, "failed": True})
 
     # -- frames ------------------------------------------------------------------------------------
@@ -451,14 +505,41 @@ class VideoStage(QWidget):
         self._update_caption()
 
     def _poll_camera_job(self) -> None:
-        """A camera-backed job reports through its own counters; nothing signals per frame."""
-        job = getattr(self.session, "tap", None)
+        """A camera-backed job reports through its own counters; nothing signals per frame.
+
+        THE JOB IS HELD HERE, NOT READ BACK OFF THE SESSION. `camera_worker` clears its tap in BOTH
+        endings -- when the job says it is done, and when the job raises -- so "the tap is gone"
+        does not distinguish success from failure, and an earlier version of this method read the
+        tap and treated a missing one as nothing to do at all. That is the state a raising job
+        leaves behind, which is how the stage came to sit in JOB mode with a dead Stop button.
+        """
+        job = self._job
         if job is None:
+            self.show_camera()
+            self.caption.setText(self._tap_error
+                                 or "that measurement stopped before it finished")
             return
         self._job_note = _job_progress_line(self._job_kind, job.snapshot() or {})
         if job.done:
             self.session.detach_tap()
             self._finish_camera_job(job)
+
+    def _on_tap_failed(self, message: str) -> None:
+        """The job raised on the camera thread; `camera_worker` already detached it."""
+        self._tap_error = "that measurement stopped: %s" % message
+        if self._mode != JOB:
+            return
+        kind = self._job_kind or "job"        # CAPTURED FIRST -- `show_camera` clears it
+        self.show_camera()
+        self._notice = self._tap_error
+        self._update_caption()
+        self.job_finished.emit(kind, {"message": self._tap_error, "failed": True})
+
+    def _on_tap_finished(self) -> None:
+        """The job reported `done` from the camera thread and was detached there. Nothing to do
+        here: `_poll_camera_job` collects the result on the next pull, which is where the result
+        is computed on the GUI thread rather than on the one driving the SDK."""
+        return
 
     def _update_caption(self) -> None:
         if self._mode == DRAW and self._draw is not None:
@@ -472,7 +553,10 @@ class VideoStage(QWidget):
         if self._mode == RUN:
             self.caption.setText("The run's own frames, as the pipeline sees them")
             return
-        self.caption.setText(_camera_caption(self.session, self.view.frame_size))
+        live = _camera_caption(self.session, self.view.frame_size)
+        # The notice FIRST: it is the result of something the operator asked for, and the
+        # live line is a status they can read any time.
+        self.caption.setText("%s   -   %s" % (self._notice, live) if self._notice else live)
 
     def shutdown(self) -> None:
         """Stop anything reading frames, before the window goes. Called from `closeEvent`."""

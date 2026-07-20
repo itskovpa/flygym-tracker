@@ -511,3 +511,108 @@ def test_a_file_job_reads_the_whole_recording_and_reports_once(qapp, pump):
     assert done, "the file job never finished"
     assert job.frames == len(frames)
     controller.shutdown()
+
+
+# =============================================================================================
+# "It starts and never stops, and the Stop button does nothing" -- reported from the rig
+# =============================================================================================
+class ExplodingJob:
+    """A job that raises, which is what `camera_worker` detaches a tap for."""
+
+    done = False
+
+    def observe(self, image):
+        raise RuntimeError("the marker band could not be read")
+
+    def snapshot(self):
+        return {"frames": 0}
+
+    def stop(self):
+        self.done = True
+
+    def result(self):
+        return {}
+
+
+def test_stop_always_gets_the_operator_out_even_when_the_job_already_died(qapp):
+    """THE REPORTED BUG. Face learning is the job that legitimately runs forever -- it ends when
+    the drum has shown every face, so a drum that is not turning never ends it. Stop is the only
+    way out, and it used to `return` silently whenever it could not find a job to stop, which is
+    exactly the state a job that RAISED leaves behind (camera_worker detaches it). The stage then
+    sat in JOB mode with the last progress line still on screen, looking like it was running.
+    """
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    assert stage.begin_face_learning()
+    assert stage.mode == JOB
+
+    session.tap = None                    # what camera_worker does to a job that raised
+    stage.stop_job()
+    qapp.processEvents()
+    assert stage.mode == CAMERA, "Stop left the stage in a mode it cannot leave"
+
+
+def test_a_job_that_dies_on_the_camera_thread_is_noticed_rather_than_shown_as_running(qapp):
+    """`camera_worker` detaches a raising tap and reports it. Nothing was listening, so a dead
+    measurement looked exactly like a live one."""
+    from PySide6.QtCore import QObject, Signal
+
+    class SignallingSession(FakeSession, QObject):
+        tap_failed = Signal(str)
+        tap_finished = Signal()
+
+        def __init__(self):
+            QObject.__init__(self)
+            FakeSession.__init__(self, is_open=True)
+
+    session = SignallingSession()
+    stage = VideoStage(session)
+    stage.resize(300, 200)
+    results = []
+    stage.job_finished.connect(lambda kind, payload: results.append((kind, payload)))
+    assert stage.begin_face_learning()
+
+    session.tap = None
+    session.tap_failed.emit("the marker band could not be read")
+    qapp.processEvents()
+    assert stage.mode == CAMERA
+    assert results and results[0][0] == "faces", "the failure was not reported as a faces job"
+    assert results[0][1]["failed"] is True
+    assert "marker band" in stage.caption.text()
+
+
+def test_a_measurements_result_survives_the_caption_refresh(qapp):
+    """SECOND BUG, same family. `_pull` rewrites the caption every 50 ms from the current mode, so
+    a result written straight into the label lasted one pull and was replaced by the live camera
+    line -- silently throwing away the only place the suggested thresholds are ever reported."""
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    assert stage.begin_noise(np.ones((8, 8), np.uint8) * 255, n_frames=1000)
+    rng = np.random.default_rng(5)
+    for _ in range(12):
+        session.tap.observe(rng.integers(0, 30, size=(8, 8), dtype=np.uint8))
+    stage.stop_job()
+    qapp.processEvents()
+    assert "pixel threshold" in stage.caption.text()
+
+    for _ in range(5):                    # the pulls that used to wipe it
+        stage._pull()
+    assert "pixel threshold" in stage.caption.text(), \
+        "the measurement's result was overwritten by the live camera line"
+
+
+def test_starting_a_new_job_clears_the_previous_result(qapp):
+    """A stale result beside a running measurement reads as that measurement's own output."""
+    session = FakeSession(is_open=True)
+    stage = _stage(qapp, session)
+    stage.begin_noise(np.ones((8, 8), np.uint8) * 255, n_frames=1000)
+    rng = np.random.default_rng(6)
+    for _ in range(12):
+        session.tap.observe(rng.integers(0, 30, size=(8, 8), dtype=np.uint8))
+    stage.stop_job()
+    qapp.processEvents()
+    assert "pixel threshold" in stage.caption.text()
+
+    stage.begin_face_learning()
+    stage._pull()
+    assert "pixel threshold" not in stage.caption.text()

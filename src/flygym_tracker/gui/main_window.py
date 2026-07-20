@@ -627,8 +627,48 @@ class MainWindow(QMainWindow):
         self.settings_view.set_status(payload.get("message", ""))
         if kind == "noise" and not payload.get("failed"):
             self._offer_noise_thresholds(payload)
+        if kind == "faces" and payload.get("complete"):
+            self._save_face_templates(payload)
         self.settings_view.refresh()
         self.refresh_readiness()
+
+    def _save_face_templates(self, payload: dict) -> None:
+        """Write what face learning just learned into the calibration bundle.
+
+        WITHOUT THIS THE STEP DID NOTHING. It watched the drum, learned a template per face, said
+        so on screen -- and dropped the templates when the job object went out of scope. The next
+        run would still start, still fill a CSV, and still record every face-B vial as face A,
+        which is the exact bug `face_learning` exists to close and the reason its own docstring
+        calls declining this step "the option that quietly produces wrong data".
+
+        The CLI has always done this (`live_vial_selector.learn_faces_for_bundle`); this is the
+        same call on the same bundle, so a session started from the window and one started from a
+        terminal leave the same thing on disk.
+        """
+        from datetime import datetime
+
+        from flygym_tracker.calibration import attach_face_templates
+
+        calib = self.state.get("calib_dir") or "calib_faces"
+        detector = payload.get("detector")
+        if detector is None:
+            return
+        try:
+            written = attach_face_templates(
+                calib, detector,
+                extra={"band_learned": datetime.now().isoformat(timespec="seconds"),
+                       "band_dwells": len(payload.get("dwells") or [])})
+        except Exception as exc:
+            # NAME THE CONSEQUENCE, not just the error. The operator has just spent 10-20 s turning
+            # the drum and is entitled to know that the run they are about to start still cannot
+            # tell the faces apart.
+            self.settings_view.set_status(
+                "the drum faces were learned but could NOT be saved to %s (%s) - a run started now "
+                "would still record every vial as one face" % (calib, exc))
+            return
+        self.settings_view.set_status(
+            "face templates saved to %s for face(s) %s - this bundle can identify faces now"
+            % (calib, ", ".join(written)))
 
     def _offer_noise_thresholds(self, payload: dict) -> None:
         suggested = {
@@ -672,10 +712,10 @@ class MainWindow(QMainWindow):
         """
         redirected = self._redirect_away_from_the_template()
         result = self.controller.save(confirm=self._confirm_unverified)
-        # ORDER MATTERS, AND IT WAS WRONG. `refresh_titles` rewrites the change line from the
-        # change COUNT alone, so calling it after `set_status` wiped the save result off the screen
-        # every time -- leaving exactly the "unable to tell a write from a silently skipped one"
-        # that `set_status`'s own docstring says it exists to prevent. Titles first, message second.
+        # The order of these two no longer matters -- `SettingsView` holds the status text as state
+        # and re-renders it, precisely so no caller has to know. It used to matter and be wrong:
+        # `refresh_titles` rewrote the change line from the change COUNT alone, wiping the save
+        # result off the screen every time.
         self.settings_view.refresh_titles()
         self.settings_view.set_status(
             "%s  -  %s" % (result.message, redirected) if redirected and result.saved

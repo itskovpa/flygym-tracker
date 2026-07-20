@@ -160,6 +160,8 @@ class SettingsView(QWidget):
         layout = QHBoxLayout(banner)
         layout.setContentsMargins(8, 4, 8, 4)
 
+        #: What the last action reported, kept so `refresh_titles` cannot wipe it. See `set_status`.
+        self._status = ""
         self.change_label = QLabel("no changes")
         # VIOLET, NOT A SECOND YELLOW. "Unsaved" and "imposed on the sensor" are different facts
         # an operator acts on differently; the retired #FFC800 sat 8 degrees from the imposed
@@ -219,22 +221,36 @@ class SettingsView(QWidget):
         """Group titles, the change count, and the save/reset enablement."""
         for group, box in self._group_boxes.items():
             box.setTitle(self.controller.group_title(group))
+        self._render_change_line()
         n = len(self.controller.changed())
-        self.change_label.setText("no changes" if not n else
-                                  "%d unsaved change%s" % (n, "" if n == 1 else "s"))
         self.save_button.setEnabled(bool(n))
         self.reset_button.setEnabled(bool(n))
 
     def set_status(self, text: str) -> None:
-        """Append the last save result to the change line, so a save leaves a visible trace.
+        """Append the last result to the change line, so an action leaves a visible trace.
 
         `save_settings_to_yaml` changes a file the operator is not looking at; a save with no
         output on screen leaves them unable to tell a write from a silently skipped one, and the
         next run becomes a mystery. The CLI's saver prints for the same reason.
+
+        THE TEXT IS KEPT, NOT JUST PAINTED, AND THAT IS THE BUG THIS FIXES. `refresh_titles`
+        rewrites this same label from the change COUNT alone, and it is called from `refresh()`,
+        from `save_settings` and from every job that finishes -- so a message written here survived
+        only until the next of those, which in practice was microseconds later in the same call
+        stack. Measured: a completed face-learning step wrote "face templates saved..." and the
+        line read "no changes" by the time the operator could look at it. Holding the text as state
+        and re-rendering it means no caller has to know the right order to do two things in.
         """
+        self._status = str(text or "")
+        self._render_change_line()
+
+    def _render_change_line(self) -> str:
+        """The change count, plus whatever the last action reported. One place, one format."""
         n = len(self.controller.changed())
         base = "no changes" if not n else "%d unsaved change%s" % (n, "" if n == 1 else "s")
-        self.change_label.setText("%s   -   %s" % (base, text) if text else base)
+        text = "%s   -   %s" % (base, self._status) if self._status else base
+        self.change_label.setText(text)
+        return text
 
     def rebuild_camera_rows(self, config, camera) -> None:
         """Re-derive the camera rows' LIMITS from `camera` (or the fallbacks when it is None).

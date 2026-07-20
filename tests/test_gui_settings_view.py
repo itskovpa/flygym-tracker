@@ -272,3 +272,39 @@ def test_a_value_outside_the_fresh_limits_stays_reachable(qapp, config):
     view.rebuild_camera_rows(config, None)
     setting = controller.model.get("source.camera.frame_rate")
     assert setting.lo <= 88.0 <= setting.hi
+
+
+def test_a_reported_result_is_not_wiped_by_the_next_refresh(qapp, tmp_path):
+    """THE BUG THIS PINS, which ate three different messages before it was found.
+
+    `refresh_titles` rewrites the change line from the change COUNT alone, and it is called from
+    `refresh()`, from `save_settings` and from every video job that finishes -- so a message
+    written by `set_status` survived only until the next of those, which in practice was
+    microseconds later in the same call stack. Measured: a completed face-learning step wrote
+    "face templates saved..." and the line read "no changes" by the time anyone could look.
+
+    The text is held as state and re-rendered, so no caller has to know the right order to do two
+    things in. That is the point: getting the order right at each of three call sites is a fix
+    that lasts until the fourth site is added.
+    """
+    from flygym_tracker.config import load_config
+    from flygym_tracker.settings_controller import SettingsController
+    from flygym_tracker.settings_model import build_app_settings
+    from flygym_tracker.gui.settings_view import SettingsView
+
+    controller = SettingsController(build_app_settings(load_config()),
+                                    block_reason=lambda key: None,
+                                    on_change=lambda key, value: True,
+                                    config_path=str(tmp_path / "c.yaml"),
+                                    camera_open=lambda: False)
+    view = SettingsView(controller)
+    view.set_status("face templates saved for face(s) A, B")
+    assert "face templates saved" in view.change_label.text()
+
+    view.refresh_titles()
+    assert "face templates saved" in view.change_label.text(), "refresh_titles wiped the result"
+    view.refresh()
+    assert "face templates saved" in view.change_label.text(), "refresh() wiped the result"
+
+    view.set_status("")                    # and it can be cleared deliberately
+    assert view.change_label.text() == "no changes"
