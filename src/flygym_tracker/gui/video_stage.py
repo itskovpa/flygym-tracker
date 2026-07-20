@@ -46,8 +46,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy, QStackedWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+                               QStackedWidget, QVBoxLayout, QWidget)
 
 from flygym_tracker.gui.preview import PULL_INTERVAL_MS, PreviewWidget
 from flygym_tracker.gui.video_jobs import FaceLearnJob, FileJobController, NoiseJob, PassiveJob
@@ -136,6 +136,11 @@ class VideoStage(QWidget):
         self._run_frames = False
         #: The vials the run is measuring, drawn on the run's picture. See `vial_overlay`.
         self._run_overlay = None
+        #: Accumulated fly trajectories. See `track_overlay` for why they accumulate across dwell
+        #: boundaries while the ANALYSIS resets at every one.
+        from flygym_tracker.gui.track_overlay import TrackOverlay
+
+        self.tracks = TrackOverlay()
         #: What the last video job produced, kept on screen until something else happens.
         #:
         #: BECAUSE THE CAPTION IS REWRITTEN EVERY 50 ms. `_pull` refreshes it from the current
@@ -180,6 +185,7 @@ class VideoStage(QWidget):
         self.bars.addWidget(self._build_draw_bar())      # index 1 -- DRAW
         self.bars.addWidget(self._build_job_bar())       # index 2 -- JOB
         self.bars.addWidget(self._build_band_bar())      # index 3 -- BAND
+        self.bars.addWidget(self._build_run_bar())       # index 4 -- RUN
         layout.addWidget(self.bars)
 
     def _build_idle_bar(self) -> QWidget:
@@ -245,6 +251,62 @@ class VideoStage(QWidget):
             layout.addWidget(button)
         return widget
 
+    def _build_run_bar(self) -> QWidget:
+        """What the operator can do to the PICTURE while a run is going. Not to the run."""
+        widget, layout = _flow_bar()
+        self.tracks_box = QCheckBox("fly tracks")
+        # OPTED IN BY DEFAULT, as asked. The tracks are the only surface that shows whether the
+        # tracker is following flies or tube edges, so the useful default is that an operator sees
+        # them without having to know the box exists.
+        self.tracks_box.setChecked(True)
+        self.tracks_box.setToolTip(
+            "Draw fly trajectories on the picture, accumulating until Clear. One colour per drum "
+            "face. This is drawing only - it never changes what is measured or recorded.")
+        self.tracks_box.toggled.connect(self._on_tracks_toggled)
+        layout.addWidget(self.tracks_box)
+
+        self.clear_tracks_button = _button(
+            "Clear tracks", "Wipe every path and start accumulating again from nothing.")
+        self.clear_tracks_button.clicked.connect(self.clear_tracks)
+        layout.addWidget(self.clear_tracks_button)
+
+        self.tracks_note = QLabel("")
+        self.tracks_note.setProperty("role", "note")
+        self.tracks_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.tracks_note)
+        return widget
+
+    def _on_tracks_toggled(self, on: bool) -> None:
+        self.tracks.enabled = bool(on)
+        self.view.update()
+        self._update_tracks_note()
+
+    def clear_tracks(self) -> None:
+        """Throw every accumulated path away. The measurement is untouched -- this is the picture."""
+        self.tracks.clear()
+        self.view.update()
+        self._update_tracks_note()
+
+    def set_run_tracks(self, payload) -> None:
+        """One `pipeline.fly_tracks()` snapshot from the run thread."""
+        self.tracks.update(payload)
+        self._update_tracks_note()
+        if self._mode == RUN and self.tracks.enabled:
+            self.view.update()
+
+    def _update_tracks_note(self) -> None:
+        if not hasattr(self, "tracks_note"):
+            return
+        if not self.tracks.enabled:
+            self.tracks_note.setText("tracks hidden - the run is unaffected")
+            return
+        text = "%d path(s) accumulated" % self.tracks.n_paths
+        if self.tracks.dropped:
+            # NEVER SILENTLY. Past the cap the oldest are dropped, and a picture that stopped
+            # accumulating without saying so would be read as a rig that stopped moving.
+            text += "   -   %d oldest dropped (display cap)" % self.tracks.dropped
+        self.tracks_note.setText(text)
+
     # -- mode -----------------------------------------------------------------------------------
     @property
     def mode(self) -> str:
@@ -256,7 +318,7 @@ class VideoStage(QWidget):
 
     def _show_mode(self, mode: str) -> None:
         self._mode = mode
-        self.bars.setCurrentIndex({CAMERA: 0, RUN: 0, DRAW: 1, JOB: 2, BAND: 3}.get(mode, 0))
+        self.bars.setCurrentIndex({CAMERA: 0, RUN: 4, DRAW: 1, JOB: 2, BAND: 3}.get(mode, 0))
         # ONLY THE DRAWING MODES TAKE THE MOUSE. A view that always held focus would swallow
         # keystrokes the settings pane is entitled to -- and this window goes out of its way to
         # keep initial focus off anything that edits a camera setting.
@@ -270,8 +332,9 @@ class VideoStage(QWidget):
             # THE VIALS STAY ON THE PICTURE WHILE THEY ARE BEING MEASURED. They are not decoration:
             # which pixels went into each row of activity.csv is decided entirely by these shapes,
             # and a run watched without them is a drum and a table of numbers with no way to see
-            # that one outline has slipped onto the tube next door.
-            overlay = self._run_overlay
+            # that one outline has slipped onto the tube next door. The TRACKS go on top of them:
+            # the outlines say where each vial is, the trajectories say what moved inside it.
+            overlay = self._run_overlay_stack()
         self.view.set_overlay(overlay)
         self.mode_changed.emit(mode)
 
@@ -290,11 +353,24 @@ class VideoStage(QWidget):
         self._show_mode(CAMERA)
 
     def set_run_overlay(self, overlay) -> None:
-        """Draw these vial shapes over the run's picture (None removes them)."""
+        """Draw these vial shapes over the run's picture (None removes them).
+
+        THE BUG THIS AVOIDS: setting the view's overlay to the vial shapes ALONE replaced the
+        composite, so the fly tracks stopped being drawn the moment the outlines arrived -- and
+        since the outlines are installed when a run starts, the tracks were never visible at all.
+        The view holds one overlay; both of these want the run's picture, so both go in through
+        `_run_overlay_stack`.
+        """
         self._run_overlay = overlay
         if self._mode == RUN:
-            self.view.set_overlay(overlay)
+            self.view.set_overlay(self._run_overlay_stack())
         self.view.update()
+
+    def _run_overlay_stack(self):
+        """The vial outlines with the fly tracks on top: where each vial is, and what moved in it."""
+        from flygym_tracker.gui.track_overlay import CompositeOverlay
+
+        return CompositeOverlay(self._run_overlay, self.tracks)
 
     def show_run(self) -> None:
         """Watch the running pipeline -- an experiment, or a replay of a recording.

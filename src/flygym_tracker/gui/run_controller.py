@@ -257,6 +257,11 @@ class RunWorker(QObject):
             # A shallow copy: the pipeline reuses its own dicts between frames, so handing the
             # live one across a queued signal would let the GUI read a half-written frame.
             "vial_results": dict(vial_results),
+            # THE FLY TRACKS ride the throttled progress signal rather than getting one of their
+            # own: they are for the picture, the picture repaints at this rate anyway, and a
+            # second per-frame signal carrying polylines would be the queue problem the frame box
+            # exists to avoid.
+            "fly_tracks": self._pipeline.fly_tracks() if self._pipeline is not None else None,
         })
 
     def _on_bin(self, payload: dict) -> None:

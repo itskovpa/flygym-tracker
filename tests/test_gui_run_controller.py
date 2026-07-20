@@ -49,6 +49,13 @@ class FakePipeline:
         """
         self.bin_observers.append(callback)
 
+    def fly_tracks(self):
+        """The real pipeline has this, and `RunWorker` asks for it on every progress emit -- so a
+        fake without it kills the progress signal entirely. THIRD time this fake has been a method
+        behind the shipped code; the fix is always to teach the fake, never to make the caller
+        defensive, because a `getattr` there would hide a genuine API mismatch."""
+        return {"dwell": 0, "face": "A", "tracks": {}}
+
     def add_behaviour_observer(self, callback):
         """The real pipeline has this too. A fake that implements only yesterday's methods turns
         red the moment the shipped code uses one more of the real interface -- which is now the

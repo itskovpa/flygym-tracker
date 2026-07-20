@@ -507,6 +507,7 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()
@@ -668,6 +669,7 @@ class MainWindow(QMainWindow):
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
         self.stage.set_run_activity(payload.get("vial_results") or {})
+        self.stage.set_run_tracks(payload.get("fly_tracks"))
 
     def _on_run_setting_applied(self, key: str, applied: bool) -> None:
         """The closed loop for a mid-run change: the row says whether it REACHED the pipeline.
@@ -915,6 +917,7 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()

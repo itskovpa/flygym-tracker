@@ -160,7 +160,12 @@ def test_the_vials_are_drawn_on_the_run(qapp):
     stage.set_run_overlay(overlay)
     stage.show_run()
     assert stage.mode == RUN
-    assert stage.view.overlay is overlay, "the vials are not on the run's picture"
+    # THE VIEW HOLDS ONE OVERLAY and two things want the run's picture: the outlines say where
+    # each vial is, the fly tracks say what moved inside it. So it is a composite, and the claim
+    # is that the vials are IN it -- an earlier version replaced the composite with the outlines
+    # alone, which is why the tracks were never visible during a run.
+    assert overlay in getattr(stage.view.overlay, "overlays", [stage.view.overlay]),         "the vials are not on the run's picture"
+    assert stage.tracks in getattr(stage.view.overlay, "overlays", []),         "the fly tracks are not on the run's picture"
 
 
 def test_the_overlay_tints_by_what_each_vial_reports(qapp):

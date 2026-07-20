@@ -34,6 +34,11 @@ from flygym_tracker.gui import theme
 from flygym_tracker.gui.behaviour_series import (BIN_CHOICES, FACES, PLOT_LABELS, PLOTTABLE,
                                                  VIALS_PER_FACE, BehaviourSeries)
 
+#: Width reserved at the left of every cell for its y-axis numbers. Without them a sparkline is a
+#: shape with no magnitude -- the operator can see that a vial went up, but not from what to what,
+#: and cannot compare it against the vial beside it or against yesterday.
+AXIS_WIDTH = 34
+
 #: Columns of the grid. 8x2 per face, as the rig is built.
 COLUMNS = 8
 ROWS = VIALS_PER_FACE // COLUMNS
@@ -58,11 +63,12 @@ class VialPlotGrid(QWidget):
         self._range = None
         self._time = None
         self._points = {}
+        self._shared = True
         self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def configure(self, *, field, bin_seconds, cumulative, value_range, time_range,
-                  points) -> None:
+                  points, shared: bool = True) -> None:
         """Adopt ONE SNAPSHOT: the points AND the range they were measured from, together.
 
         THE BUG THIS FIXES, reported from the rig: a line ran outside its cell. `paintEvent` used
@@ -78,6 +84,7 @@ class VialPlotGrid(QWidget):
         self._range = value_range
         self._time = time_range
         self._points = points or {}
+        self._shared = bool(shared)
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -101,23 +108,42 @@ class VialPlotGrid(QWidget):
             painter.setPen(QPen(QColor(theme.TEXT_FAINT), 1))
             painter.drawText(int(x0) + 4, int(y0) + 12, "%s%d" % (self.face, index + 1))
 
+            cell_points = points.get(index) or []
+            # SHARED SCALE (the default) uses the panel's range for every cell, so a tall line here
+            # and a flat one there mean what they look like they mean. Turning it off scales each
+            # cell to its OWN data, which shows the shape of a quiet vial -- at the cost that two
+            # cells are then no longer comparable, which is why the axis numbers are drawn either
+            # way and why the default is on.
+            span = self._range if self._shared else _range_of_points(cell_points)
+            plot_x = x0 + AXIS_WIDTH
+            plot_w = cell_w - AXIS_WIDTH - 4
+            self._paint_axis(painter, span, x0, y0 + 16, AXIS_WIDTH - 3, cell_h - 22)
             painter.save()
             # CLIPPED TO ITS OWN CELL. The snapshot above makes an out-of-range point impossible;
             # this makes it impossible to DRAW one, so a future bug of the same kind is visible as
             # a clipped line inside the right cell rather than a stray line across a neighbour.
             painter.setClipRect(int(x0) + 1, int(y0) + 1, int(cell_w) - 2, int(cell_h) - 2)
-            self._paint_cell(painter, points.get(index) or [], colour,
-                             x0 + 4, y0 + 16, cell_w - 8, cell_h - 22)
+            self._paint_cell(painter, cell_points, colour, span,
+                             plot_x, y0 + 16, plot_w, cell_h - 22)
             painter.restore()
 
-    def _paint_cell(self, painter, points, colour, x, y, w, h) -> None:
+    def _paint_axis(self, painter, span, x, y, w, h) -> None:
+        """The high and low of this cell's y axis, drawn small at its left edge."""
+        if span is None or w <= 6 or h <= 12:
+            return
+        low, high = span
+        painter.setPen(QPen(QColor(theme.TEXT_FAINT), 1))
+        painter.drawText(int(x) + 2, int(y) + 9, _tick(high))
+        painter.drawText(int(x) + 2, int(y + h), _tick(low))
+
+    def _paint_cell(self, painter, points, colour, span, x, y, w, h) -> None:
         if w <= 2 or h <= 2:
             return
-        if not points or self._range is None or self._time is None:
+        if not points or span is None or self._time is None:
             # NOTHING IS DRAWN FOR A VIAL WITH NO DATA. A flat line at the bottom would be this
             # panel claiming a measurement of zero where there was no measurement at all.
             return
-        low, high = self._range
+        low, high = span
         t0, t1 = self._time
         span_t = max(1e-9, t1 - t0)
         span_v = max(1e-9, high - low)
@@ -163,6 +189,15 @@ class BehaviourPlotPanel(QWidget):
             "rows in its window.")
         controls.addWidget(self.bin_box)
 
+        self.shared_box = QCheckBox("same y scale")
+        self.shared_box.setChecked(True)
+        self.shared_box.setToolTip(
+            "Scale every vial to the same y axis, driven by the busiest one. On (the default) two "
+            "cells are directly comparable. Off, each vial is scaled to its own data, which shows "
+            "the shape of a quiet vial but makes its amplitude meaningless next to its neighbour.")
+        self.shared_box.toggled.connect(self.refresh)
+        controls.addWidget(self.shared_box)
+
         self.cumulative_box = QCheckBox("cumulative")
         self.cumulative_box.setToolTip(
             "Running sum of the binned values. A genuine total-so-far for a rate-like parameter "
@@ -192,6 +227,9 @@ class BehaviourPlotPanel(QWidget):
     def cumulative(self) -> bool:
         return self.cumulative_box.isChecked()
 
+    def shared_scale(self) -> bool:
+        return self.shared_box.isChecked()
+
     def refresh(self) -> None:
         """Re-read the shared store. Cheap enough to call on every completed dwell."""
         kwargs = {"bin_seconds": self.bin_seconds(), "cumulative": self.cumulative()}
@@ -200,14 +238,17 @@ class BehaviourPlotPanel(QWidget):
         points = {face: self.series.face_series(self.field, face, **kwargs) for face in FACES}
         value_range = _range_of(points)
         time_range = self.series.time_range()
+        shared = self.shared_scale()
         for face, grid in self.grids.items():
             grid.configure(field=self.field, value_range=value_range, time_range=time_range,
-                           points=points.get(face) or {}, **kwargs)
+                           points=points.get(face) or {}, shared=shared, **kwargs)
         if value_range is None:
             self.range_label.setText("no data yet")
         else:
             low, high = value_range
-            span = "%s   -   y %.3g to %.3g" % (PLOT_LABELS.get(self.field, self.field), low, high)
+            scale_note = (("y %.3g to %.3g, same for every vial" % (low, high)) if shared
+                          else "each vial on its own y scale - amplitudes NOT comparable")
+            span = "%s   -   %s" % (PLOT_LABELS.get(self.field, self.field), scale_note)
             if time_range is not None:
                 span += "   -   %s of run" % _hms(time_range[1])
             # THE RANGE IS PRINTED because every cell shares it: without the numbers, a tall line
@@ -232,6 +273,31 @@ class BehaviourPlotDock(QDockWidget):
 
     def refresh(self) -> None:
         self.panel.refresh()
+
+
+def _range_of_points(points) -> Optional[tuple]:
+    """`(low, high)` for ONE cell's points, for per-cell scaling."""
+    values = [value for _t, value in points or ()]
+    if not values:
+        return None
+    low, high = min(values), max(values)
+    return (low - 0.5, high + 0.5) if high - low < 1e-9 else (low, high)
+
+
+def _tick(value: float) -> str:
+    """An axis number that fits in 30 px: k/M for the big ones, decimals for the small."""
+    if value is None:
+        return ""
+    magnitude = abs(value)
+    if magnitude >= 1e6:
+        return "%.1fM" % (value / 1e6)
+    if magnitude >= 1e3:
+        return "%.0fk" % (value / 1e3)
+    if magnitude >= 100:
+        return "%.0f" % value
+    if magnitude >= 1:
+        return "%.1f" % value
+    return "%.2f" % value
 
 
 def _range_of(points_by_face) -> Optional[tuple]:

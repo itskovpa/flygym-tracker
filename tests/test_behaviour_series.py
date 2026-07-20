@@ -183,3 +183,26 @@ def test_clearing_starts_a_new_run_from_nothing():
     series.clear()
     assert len(series) == 0
     assert series.series("median_path_length", "A", 0) == []
+
+
+# =============================================================================================
+# The y axis: labelled, and shared by default
+# =============================================================================================
+def test_the_axis_tick_stays_short_enough_to_fit_a_cell():
+    """A 30 px gutter cannot hold "1234567.891". An axis number nobody can read is the same as
+    no axis number, which is what the operator asked to stop having."""
+    from flygym_tracker.gui.plot_dock import _tick
+
+    for value, expected in ((0.5, "0.50"), (7.25, "7.2"), (412.0, "412"),
+                            (5400.0, "5k"), (2_500_000.0, "2.5M")):
+        assert _tick(value) == expected, "%r formatted as %r" % (value, _tick(value))
+    assert all(len(_tick(v)) <= 6 for v in (0.001, 1.0, 99.9, 1e4, 1e7))
+
+
+def test_per_cell_scaling_uses_only_that_cells_points():
+    from flygym_tracker.gui.plot_dock import _range_of_points
+
+    assert _range_of_points([(0.0, 3.0), (1.0, 9.0)]) == (3.0, 9.0)
+    assert _range_of_points([]) is None
+    low, high = _range_of_points([(0.0, 4.0), (1.0, 4.0)])
+    assert high > low, "a flat cell got no drawable band"

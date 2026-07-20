@@ -928,8 +928,22 @@ class TrackerPipeline:
         return self._pool.stats() if self._pool is not None else {}
 
     def fly_tracks(self) -> dict:
-        """`{local_vial_id: [polyline, ...]}` for the current dwell, for the live overlay."""
-        return self._pool.tracks() if self._pool is not None else {}
+        """``{"dwell": n, "face": name, "tracks": {local_vial_id: [polyline, ...]}}``.
+
+        THE DWELL NUMBER IS PART OF THE ANSWER, not a convenience. `tracks` only ever holds the
+        CURRENT dwell's fragments -- they are thrown away at each rotation, because identity is
+        lost there -- while the operator wants the paths to keep building up on screen until they
+        press Clear. The accumulator watches this number to know when the live fragments have
+        become history and should be frozen rather than replaced.
+
+        The FACE is here for the same reason: the drawn colour is per face, and which face these
+        fragments belong to is only knowable while they are being produced.
+        """
+        if self._pool is None:
+            return {"dwell": 0, "face": None, "tracks": {}}
+        return {"dwell": self._pool.dwell_index,
+                "face": self._current_face,
+                "tracks": self._pool.tracks()}
 
     # ---- per-frame processing ---------------------------------------------------------------
 
