@@ -1749,6 +1749,79 @@ def build_two_face_calibration(
     return calib
 
 
+def attach_band_rows(out_dir: str, rows: Sequence[int]) -> List[str]:
+    """Record the operator's hand-picked marker-band rows in the bundle. Adds ONLY that.
+
+    WHY THIS IS DRAWN RATHER THAN FOUND. `MarkerBandDetector` locates the band per frame from the
+    row-wise lit-pixel profile inside `params.search_frac` (20%-80% of the frame height) -- it does
+    not know where the LED slots physically are, it infers it from brightness every frame. That is
+    robust to exposure and to the drum's tilt, and it has one failure mode that matters: when the
+    picture is poor the two strips stop being two runs. Measured on this rig with the backlight
+    unplugged, the row profile collapsed into a SINGLE 141-row run, which was then rejected for
+    exceeding `max_strip_h=110`, and the band came back "not found" on 661 of 661 stationary
+    frames. Nothing in that chain is wrong; there was simply nothing to see.
+
+    Telling the detector WHERE THE BAND IS removes the inference entirely. `band_rows` is an
+    existing constructor argument that replaces the automatic search window with fixed rows, so a
+    band that is hard to find is no longer a band that has to be found.
+
+    SURGICAL, for the same reason as `attach_face_templates`: `calib_faces/` holds polygons drawn
+    by hand, one click per vertex, and they are not reproducible. This loads `calibration.json` as
+    a plain dict, writes one key per face, and dumps it back -- never constructing a `VialROI`,
+    never rewriting a mask or an overlay, never touching `faces[name]["vials"]`.
+
+    Args:
+        out_dir: the bundle directory holding `calibration.json`.
+        rows: ``(row0, row1)`` inclusive full-frame rows containing BOTH lit strips.
+
+    Returns:
+        The face names written, sorted.
+    """
+    path = os.path.join(out_dir, "calibration.json")
+    if not os.path.isfile(path):
+        raise FileNotFoundError("no calibration.json in %r to attach marker-band rows to" % out_dir)
+    r0, r1 = (int(rows[0]), int(rows[1]))
+    if r1 <= r0:
+        raise ValueError("marker band rows must be (top, bottom) with bottom > top, got %r" % (rows,))
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    written: List[str] = []
+    for name, face in (payload.get("faces") or {}).items():
+        marker = face.get("marker")
+        if not isinstance(marker, dict):
+            marker = {}
+        marker["band_rows"] = [r0, r1]
+        # Keep any detector snapshot in step: templates are only comparable to profiles extracted
+        # the same way, and the search window is part of "the same way". A stored detector left
+        # pointing at the old window would score the new rows' profiles against templates built
+        # from different pixels.
+        if isinstance(marker.get("band_detector"), dict):
+            marker["band_detector"]["band_rows"] = [r0, r1]
+        face["marker"] = marker
+        written.append(name)
+
+    if written:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    return sorted(written)
+
+
+def calibration_band_rows(calib: Calibration) -> Optional[Tuple[int, int]]:
+    """The operator's hand-picked band rows from a bundle, or None if none were picked."""
+    for fc in calib.faces.values():
+        marker = fc.marker
+        if isinstance(marker, dict):
+            rows = marker.get("band_rows")
+            if isinstance(rows, (list, tuple)) and len(rows) == 2:
+                try:
+                    return (int(rows[0]), int(rows[1]))
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
 def marker_detector_from_calibration(calib: Calibration):
     """Rebuild a `marker_band.MarkerBandDetector` from templates stored in a saved bundle.
 
@@ -1780,9 +1853,18 @@ def marker_detector_from_calibration(calib: Calibration):
                 settings = marker["band_detector"]
     if not templates:
         return None
+    # HAND-PICKED ROWS WIN over whatever window the templates happened to be learned with. The
+    # operator drew them on the actual rig picture; the stored snapshot may predate that, and a
+    # detector left searching the automatic window would re-inherit the failure the drawing was
+    # done to avoid. See `attach_band_rows`.
+    rows = calibration_band_rows(calib)
     if settings:
-        return MarkerBandDetector.from_dict(dict(settings, templates=templates))
-    return MarkerBandDetector(templates=templates)
+        snapshot = dict(settings, templates=templates)
+        if rows is not None:
+            snapshot["band_rows"] = list(rows)
+        return MarkerBandDetector.from_dict(snapshot)
+    return MarkerBandDetector(templates=templates,
+                              band_rows=rows if rows is not None else None)
 
 
 def calibration_band_faces(calib: Calibration) -> List[str]:

@@ -497,6 +497,8 @@ class MainWindow(QMainWindow):
         calib = self.state.get("calib_dir") or "calib_faces"
         if action == "draw_vials":
             self._begin_draw(calib)
+        elif action == "mark_band":
+            self._begin_band(calib)
         elif action == "noise":
             self._begin_noise(calib)
         elif action == "learn_faces":
@@ -561,6 +563,25 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is redraw
 
+    def _begin_band(self, calib: str) -> None:
+        """Mark where the marker band is, and store it beside the vial positions.
+
+        IT GOES IN THE VIAL-POSITIONS BUNDLE, which is the rig owner's own call and the right one:
+        the band's location is a fact about this rig's geometry, exactly like the vial polygons,
+        and it belongs with them rather than in a config file that travels between rigs. Anything
+        that loads the bundle -- a run, a replay, a face-learning session -- picks it up without
+        being told (`calibration.marker_detector_from_calibration`).
+        """
+        import os
+
+        if not os.path.isfile(os.path.join(calib, "calibration.json")):
+            QMessageBox.warning(
+                self, "There is nowhere to save the marker band yet",
+                "%s does not hold a calibration bundle. Draw the vial positions first - the "
+                "marker band is stored beside them." % calib)
+            return
+        self.stage.begin_band(out_dir=calib)
+
     def _begin_noise(self, calib: str) -> None:
         """Measure the noise floor here, watching the rig it is being measured on."""
         mask, problem = _illum_mask(calib)
@@ -585,7 +606,22 @@ class MainWindow(QMainWindow):
                 self.stage.caption.setText(
                     "Learning the faces needs frames: open the camera, or pick a recording.")
                 return
-        self.stage.begin_face_learning(video=video)
+        self.stage.begin_face_learning(video=video, band_rows=self._band_rows())
+
+    def _band_rows(self):
+        """The marker band the operator drew, if this bundle carries one. None means "guess it".
+
+        Read fresh from the bundle rather than cached: the band can be redrawn between a run and a
+        learning session, and a stale copy would have learning read a different region than every
+        identification afterwards.
+        """
+        from flygym_tracker.calibration import calibration_band_rows, load_calibration
+
+        calib = self.state.get("calib_dir") or "calib_faces"
+        try:
+            return calibration_band_rows(load_calibration(calib))
+        except Exception:
+            return None
 
     def _begin_replay(self, calib: str) -> None:
         """Replay a recording through the IDENTICAL pipeline, watched in this window.

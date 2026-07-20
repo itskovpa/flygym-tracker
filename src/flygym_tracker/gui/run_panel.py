@@ -181,6 +181,10 @@ class RunPanel(QWidget):
             ("noise", "Measure noise floor",
              "Measure the static-rig noise floor, watching the rig while it is measured. The "
              "suggested thresholds land on the settings rows, unsaved."),
+            ("mark_band", "Mark marker band",
+             "Drag across the two bright LED slots to tell the software where the marker band "
+             "is, instead of it guessing from brightness every frame. Saved with the vial "
+             "positions."),
             ("learn_faces", "Learn drum faces",
              "Learn one marker template per drum face while the drum turns. Without this, "
              "everything is recorded as one face."),
@@ -198,7 +202,7 @@ class RunPanel(QWidget):
         outer.addWidget(tools_widget)
 
     #: The video jobs. All of them want frames, and there is one picture to show them in.
-    VIDEO_TOOLS = ("draw_vials", "replay", "noise", "learn_faces")
+    VIDEO_TOOLS = ("draw_vials", "mark_band", "replay", "noise", "learn_faces")
 
     # -- state ----------------------------------------------------------------------------------
     def set_stage_busy(self, busy: bool) -> None:

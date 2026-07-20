@@ -106,6 +106,13 @@ class PreviewWidget(QWidget):
     #: A `handle_key` key name. Emitted only while `interactive` is on, so ordinary use of the
     #: window cannot type into a drawing session that is not happening.
     key_pressed = Signal(str)
+    #: Press / drag / release in IMAGE pixels, for the jobs that select a REGION rather than place
+    #: points. Drawing vial polygons wants clicks; marking the marker band wants a drag down the
+    #: picture. Both go through the same coordinate transform, so neither can be right while the
+    #: other is wrong.
+    pressed = Signal(float, float)
+    dragged = Signal(float, float)
+    released = Signal(float, float)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -182,7 +189,39 @@ class PreviewWidget(QWidget):
         point = self.to_image(position.x(), position.y())
         if point is not None:
             self.clicked.emit(point[0], point[1])
+            self.pressed.emit(point[0], point[1])
         event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._interactive:
+            return super().mouseMoveEvent(event)
+        point = self._clamped(event.position())
+        if point is not None:
+            self.dragged.emit(point[0], point[1])
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if not self._interactive or event.button() != Qt.MouseButton.LeftButton:
+            return super().mouseReleaseEvent(event)
+        point = self._clamped(event.position())
+        if point is not None:
+            self.released.emit(point[0], point[1])
+        event.accept()
+
+    def _clamped(self, position) -> Optional[Tuple[float, float]]:
+        """Image coordinates for a drag, CLAMPED to the picture rather than dropped outside it.
+
+        Different rule from `to_image`, on purpose. A CLICK outside the picture is not a vertex the
+        operator meant to place, so it is discarded. But a DRAG that runs past the edge is an
+        operator asking for "all the way to the bottom", and discarding it would freeze the
+        selection at wherever the pointer happened to leave the frame.
+        """
+        rect = self.image_rect()
+        if self._image is None or rect.width() <= 0 or rect.height() <= 0:
+            return None
+        x = min(max(position.x(), rect.x()), rect.x() + rect.width())
+        y = min(max(position.y(), rect.y()), rect.y() + rect.height())
+        return self.to_image(x, y)
 
     def keyPressEvent(self, event) -> None:
         if not self._interactive:

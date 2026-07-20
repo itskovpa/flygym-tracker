@@ -149,11 +149,17 @@ class FaceLearnJob(FrameJob):
     indistinguishable from a hung one.
     """
 
-    def __init__(self, n_faces: int = 2, face_names=("A", "B"), detector=None) -> None:
+    def __init__(self, n_faces: int = 2, face_names=("A", "B"), detector=None,
+                 band_rows=None) -> None:
         from flygym_tracker.face_learning import FaceLearner
         from flygym_tracker.marker_band import MarkerBandDetector
 
-        self.learner = FaceLearner(detector=detector or MarkerBandDetector(),
+        # `band_rows` IS THE OPERATOR'S DRAWN BAND, and learning has to use it or the templates
+        # would be built from a different region than every later identification reads -- profiles
+        # are only comparable to profiles extracted the same way.
+        if detector is None:
+            detector = MarkerBandDetector(band_rows=tuple(band_rows) if band_rows else None)
+        self.learner = FaceLearner(detector=detector,
                                    n_faces=int(n_faces), face_names=list(face_names))
         self.stopped = False
 

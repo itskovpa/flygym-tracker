@@ -56,6 +56,9 @@ CAMERA = "camera"
 DRAW = "draw"
 JOB = "job"
 RUN = "run"
+#: Marking WHERE THE MARKER BAND IS, so the detector stops inferring it every frame. See
+#: `band_select` for the measurement that motivates it.
+BAND = "band"
 
 
 def _bar() -> tuple:
@@ -123,6 +126,7 @@ class VideoStage(QWidget):
         self._mode = CAMERA
         self._box = getattr(session, "latest", None)
         self._draw = None                     # the live VialDrawSession, in DRAW
+        self._band = None                     # the live BandSelectSession, in BAND
         self._job = None                      # the running FrameJob, in JOB -- see _poll_camera_job
         self._job_kind = ""                   # "noise" | "faces", in JOB
         self._job_note = ""
@@ -155,6 +159,9 @@ class VideoStage(QWidget):
         self.view = PreviewWidget()
         self.view.clicked.connect(self._on_click)
         self.view.key_pressed.connect(self._on_key)
+        self.view.pressed.connect(self._on_press)
+        self.view.dragged.connect(self._on_drag)
+        self.view.released.connect(self._on_release)
         layout.addWidget(self.view, 1)
 
         self.caption = QLabel("Camera not open - nothing is being read")
@@ -167,6 +174,7 @@ class VideoStage(QWidget):
         self.bars.addWidget(self._build_idle_bar())      # index 0 -- CAMERA and RUN
         self.bars.addWidget(self._build_draw_bar())      # index 1 -- DRAW
         self.bars.addWidget(self._build_job_bar())       # index 2 -- JOB
+        self.bars.addWidget(self._build_band_bar())      # index 3 -- BAND
         layout.addWidget(self.bars)
 
     def _build_idle_bar(self) -> QWidget:
@@ -215,6 +223,20 @@ class VideoStage(QWidget):
         layout.addWidget(self.job_stop_button)
         return widget
 
+    def _build_band_bar(self) -> QWidget:
+        widget, layout = _flow_bar()
+        self.band_clear_button = _button("Clear", "Start the band again.")
+        self.band_save_button = _button(
+            "Save marker band", "Store these rows in the vial-positions folder, so every run and "
+            "every face-learning session searches exactly here.", role="primary")
+        self.band_cancel_button = _button("Cancel", "Leave the band as it was.", role="danger")
+        for button, slot in ((self.band_clear_button, self._band_clear),
+                             (self.band_save_button, self._band_save),
+                             (self.band_cancel_button, self._band_cancel)):
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+        return widget
+
     # -- mode -----------------------------------------------------------------------------------
     @property
     def mode(self) -> str:
@@ -226,12 +248,17 @@ class VideoStage(QWidget):
 
     def _show_mode(self, mode: str) -> None:
         self._mode = mode
-        self.bars.setCurrentIndex({CAMERA: 0, RUN: 0, DRAW: 1, JOB: 2}.get(mode, 0))
-        # ONLY DRAW TAKES THE KEYBOARD. A view that always held focus would swallow keystrokes the
-        # settings pane is entitled to -- and this window goes out of its way to keep initial focus
-        # off anything that edits a camera setting.
-        self.view.set_interactive(mode == DRAW)
-        self.view.set_overlay(self._draw.overlay if (mode == DRAW and self._draw) else None)
+        self.bars.setCurrentIndex({CAMERA: 0, RUN: 0, DRAW: 1, JOB: 2, BAND: 3}.get(mode, 0))
+        # ONLY THE DRAWING MODES TAKE THE MOUSE. A view that always held focus would swallow
+        # keystrokes the settings pane is entitled to -- and this window goes out of its way to
+        # keep initial focus off anything that edits a camera setting.
+        self.view.set_interactive(mode in (DRAW, BAND))
+        overlay = None
+        if mode == DRAW and self._draw is not None:
+            overlay = self._draw.overlay
+        elif mode == BAND and self._band is not None:
+            overlay = self._band.overlay
+        self.view.set_overlay(overlay)
         self.mode_changed.emit(mode)
 
     def show_camera(self) -> None:
@@ -241,6 +268,7 @@ class VideoStage(QWidget):
         Leaving a finished job attached would let the next poll collect its result a second time.
         """
         self._draw = None
+        self._band = None
         self._job = None
         self._job_kind = ""
         self._box = getattr(self.session, "latest", None)
@@ -256,6 +284,7 @@ class VideoStage(QWidget):
         meant the overlay an operator trusts was drawn by code they only see on one of the paths.
         """
         self._draw = None
+        self._band = None
         self._job_kind = ""
         self._box = getattr(self.run, "latest", None) if self.run is not None else None
         self.view.placeholder = "Waiting for the first frame of the run"
@@ -355,6 +384,68 @@ class VideoStage(QWidget):
         if self._mode == DRAW and self._draw is not None:
             self._draw.on_key(name)
 
+    # -- marking where the marker band is ----------------------------------------------------------
+    def begin_band(self, *, out_dir: str) -> bool:
+        """Mark the marker band's rows on the live picture. Returns False if there is no picture.
+
+        Needs a frame for the same reason drawing vials does: the rows are IMAGE rows, and a band
+        drawn against no picture is a number the operator never actually saw on the rig.
+        """
+        from flygym_tracker.gui.band_select import BandSelectSession
+
+        if self.view._array is None:
+            self.caption.setText(
+                "Nothing to mark the band on: open the camera first, or replay a recording. "
+                "This window will not take the camera by itself.")
+            return False
+        width, height = self.view.frame_size
+        self._band = BandSelectSession(out_dir=out_dir, frame_height=height, parent=self)
+        self._band.changed.connect(self._on_band_changed)
+        self._band.finished.connect(self._on_band_finished)
+        self._band.on_frame(self.view._array)
+        self._notice = ""
+        self._show_mode(BAND)
+        self._on_band_changed()
+        return True
+
+    def _on_band_changed(self) -> None:
+        if self._band is None:
+            return
+        self.view.update()
+        self._update_caption()
+        self.band_save_button.setEnabled(self._band.has_band)
+
+    def _on_band_finished(self, payload: dict) -> None:
+        self._band = None
+        self.show_camera()
+        self._notice = payload.get("message", "")
+        self._update_caption()
+        self.job_finished.emit("band", payload)
+
+    def _band_clear(self) -> None:
+        if self._band:
+            self._band.clear()
+
+    def _band_save(self) -> None:
+        if self._band:
+            self._band.save()
+
+    def _band_cancel(self) -> None:
+        if self._band:
+            self._band.cancel()
+
+    def _on_press(self, x: float, y: float) -> None:
+        if self._mode == BAND and self._band is not None:
+            self._band.on_press(x, y)
+
+    def _on_drag(self, x: float, y: float) -> None:
+        if self._mode == BAND and self._band is not None:
+            self._band.on_drag(x, y)
+
+    def _on_release(self, x: float, y: float) -> None:
+        if self._mode == BAND and self._band is not None:
+            self._band.on_release(x, y)
+
     # -- measurements that consume frames ----------------------------------------------------------
     def begin_noise(self, illum_mask, *, n_frames: int = 100, k: float = 5.0,
                     video: Optional[str] = None) -> bool:
@@ -368,10 +459,15 @@ class VideoStage(QWidget):
         return self._begin_job("noise", NoiseJob(illum_mask, n_frames=n_frames, k=k), video)
 
     def begin_face_learning(self, *, n_faces: int = 2, face_names=("A", "B"),
-                            video: Optional[str] = None) -> bool:
-        """Learn one marker template per drum face while the drum turns."""
-        return self._begin_job("faces", FaceLearnJob(n_faces=n_faces, face_names=face_names),
-                               video)
+                            video: Optional[str] = None, band_rows=None) -> bool:
+        """Learn one marker template per drum face while the drum turns.
+
+        `band_rows` is the operator's drawn marker band, if the bundle carries one. Learning MUST
+        use the same window every later identification will use: profiles are only comparable to
+        profiles extracted the same way.
+        """
+        return self._begin_job("faces", FaceLearnJob(n_faces=n_faces, face_names=face_names,
+                                                     band_rows=band_rows), video)
 
     def _begin_job(self, kind: str, job, video: Optional[str]) -> bool:
         if video is not None:
@@ -499,6 +595,10 @@ class VideoStage(QWidget):
                     if not self._draw.state.frozen:
                         self.view.set_frame(frame)
                 else:
+                    if self._mode == BAND and self._band is not None:
+                        # The band preview re-checks the strips against the CURRENT frame, so the
+                        # "N strips found" readout tracks the live rig rather than one still.
+                        self._band.on_frame(frame)
                     self.view.set_frame(frame)
         if self._mode == JOB:
             self._poll_camera_job()
@@ -545,6 +645,9 @@ class VideoStage(QWidget):
         if self._mode == DRAW and self._draw is not None:
             self.caption.setText("%s   -   %s" % (self._draw.state.source_label,
                                                   self._draw.status()))
+            return
+        if self._mode == BAND and self._band is not None:
+            self.caption.setText(self._band.status())
             return
         if self._mode == JOB:
             self.job_label.setText(self._job_note or "starting...")
