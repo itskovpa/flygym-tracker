@@ -357,3 +357,49 @@ def test_closing_the_window_while_it_is_still_looking_does_not_crash(qapp):
         qapp.processEvents()
         time.sleep(0.02)
     # Reaching here at all is the assertion: the process is still alive.
+
+
+def test_the_not_found_error_counts_what_it_lists_and_opens_nothing(qapp, monkeypatch):
+    """TWO BUGS IN ONE LINE, both found by running it against the real camera.
+
+    It read "Found 1 camera(s)" over a list of TWO, because the count came from the MVS device list
+    while the list came from `list_cameras()`, which also enumerates webcams. And enumerating
+    webcams OPENS them -- so reporting that a camera failed to open would have switched on the
+    operator's webcam, indicator light and all, as a side effect.
+    """
+    from flygym_tracker import frame_source as fs
+
+    probed = []
+    monkeypatch.setattr(fs, "_list_uvc_cameras",
+                        lambda *a, **k: probed.append(True) or [_webcam()])
+    monkeypatch.setattr(fs, "_list_hikrobot_cameras",
+                        lambda: [fs.CameraInfo(index=0, serial="AAA111", model="MV-CA013-A0UM")])
+
+    source = fs.HikCameraSource(serial="NOPE")
+    message = source._found(1)
+    assert "Found 1 camera(s)" in message
+    assert message.count("    ") == 1, "the count disagrees with the list:\n%s" % message
+    assert not probed, "reporting a camera failure probed (and lit up) the webcam"
+
+
+def test_the_status_line_speaks_rather_than_spelling_the_identifier(qapp, tmp_path):
+    """`uvc:0` is how the choice is STORED; "webcam 0" is what it IS. An operator-facing line
+    should never make somebody decode an internal identifier -- and this one carries a warning they
+    have to actually read."""
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+
+    local = tmp_path / "rig.local.yaml"
+    local.write_text("source:\n  camera:\n    frame_rate: 20.0\n", encoding="utf-8")
+    win = MainWindow(config=load_config(), config_path=str(local), state=gui_state.default_state(),
+                     root=str(tmp_path), camera_factory=lambda: None, confirm=lambda t: True)
+    try:
+        win._on_camera_serial_changed("uvc:0")
+        status = win.settings_view._status
+        assert "uvc:0" not in status, "the raw identifier reached the operator: %s" % status
+        assert "webcam 0" in status
+        assert "not valid for an experiment" in status.lower()
+    finally:
+        win.run.shutdown()
+        win.session.shutdown()

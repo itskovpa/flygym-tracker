@@ -656,10 +656,24 @@ class HikCameraSource(FrameSource):
                     "camera is not held by another program -- USB3 Vision allows one at a time, so "
                     "the MVS Viewer being open is enough to hide it.")
         try:
-            listed = "\n".join("    %s" % camera.label for camera in list_cameras())
+            # RIG CAMERAS ONLY, for two reasons, and the second is the serious one.
+            #
+            # It read "Found 1 camera(s)" over a list of TWO, because the count came from the MVS
+            # device list while the list came from `list_cameras()`, which also enumerates webcams.
+            # A count that disagrees with the list beneath it undermines the whole message.
+            #
+            # AND ENUMERATING WEBCAMS OPENS THEM. Reaching this line means a camera failed to open;
+            # switching on the operator's webcam -- indicator light and all -- as a side effect of
+            # reporting that failure is indefensible. Nothing here may touch a device.
+            #
+            # It is also the right content: this error is about a SERIAL, which is a GenICam idea.
+            # Listing a webcam here invites exactly the wrong conclusion -- "there IS a camera, so
+            # the software is broken" -- when a webcam could never have satisfied the request.
+            cameras = _list_hikrobot_cameras()
+            listed = "\n".join("    %s" % camera.label for camera in cameras)
         except Exception:
             return "\n\nFound %d camera(s), but they could not be described." % n_devices
-        return "\n\nFound %d camera(s):\n%s" % (n_devices, listed)
+        return "\n\nFound %d camera(s):\n%s" % (len(cameras), listed)
 
     def _find_device(self, device_list):
         """Return the MV_CC_DEVICE_INFO for the configured serial (or index)."""

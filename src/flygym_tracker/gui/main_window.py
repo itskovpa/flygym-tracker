@@ -513,7 +513,16 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.settings_view.set_status("could not save the camera choice: %s" % exc)
             return
-        chosen = ("camera %s pinned" % serial) if serial else "using whatever camera is attached"
+        # SPOKEN, NOT SPELLED. `uvc:0` is how the choice is stored; "webcam 0" is what it is. An
+        # operator-facing line should never make somebody decode an internal identifier -- and this
+        # one has to carry a warning they must actually read.
+        if not serial:
+            chosen = "using whatever camera is attached"
+        elif str(serial).startswith("uvc:"):
+            chosen = ("webcam %s selected - FOR TRYING THE SOFTWARE OUT ONLY, not valid for an "
+                      "experiment" % str(serial).split(":", 1)[1])
+        else:
+            chosen = "camera %s pinned" % serial
         saved = "%s - saved to %s" % (chosen, os.path.basename(str(path)))
 
         # AND MAKE IT TRUE FOR THIS SESSION. The camera factory is built once, from the config
