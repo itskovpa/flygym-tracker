@@ -75,6 +75,56 @@ def mvs_sdk_candidates() -> list:
     return unique
 
 
+#: Where the MVS native runtime lives, per architecture. The SDK loads `MvCameraControl.dll` by
+#: BARE NAME, leaving it to the PATH -- and on a normal MVS install BOTH the 32- and 64-bit runtime
+#: folders are on the PATH, with the 32-bit one first. A 64-bit process therefore depends on the
+#: loader skipping a wrong-architecture match, which is not something to build an instrument on.
+MVS_RUNTIME_DIRS = {
+    64: (r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win64_x64",
+         r"C:\Program Files\Common Files\MVS\Runtime\Win64_x64"),
+    32: (r"C:\Program Files (x86)\Common Files\MVS\Runtime\Win32_i86",
+         r"C:\Program Files\Common Files\MVS\Runtime\Win32_i86"),
+}
+
+
+def _preload_mvs_runtime():
+    """Load `MvCameraControl.dll` by ABSOLUTE path, for the architecture we actually are.
+
+    THE SECOND HALF OF WHY THE RIG CAMERA NEVER WORKED IN AN INSTALLED BUILD. The SDK does
+    `WinDLL("MvCameraControl.dll")` -- a bare name -- which relies on the PATH. That happens to
+    work when running from a source checkout and does NOT survive being frozen, where the failure
+    is `FileNotFoundError: Could not find module 'MvCameraControl.dll' (or one of its
+    dependencies)`.
+
+    Loading it by full path first fixes both that and a latent hazard: Windows caches a loaded
+    module by base name, so the SDK's later bare-name `WinDLL` call returns THIS handle without
+    searching the PATH at all -- and therefore cannot pick up the 32-bit copy that sits ahead of
+    the 64-bit one in a normal MVS install.
+
+    `os.add_dll_directory` covers the SIBLING DLLs `MvCameraControl.dll` itself depends on, which
+    a plain absolute-path load would not find.
+
+    Returns the loaded library, or None. Never raises: if this cannot be done the SDK import is
+    still attempted the old way, and its own error is the one reported.
+    """
+    if os.name != "nt":
+        return None
+    bits = 64 if sys.maxsize > 2 ** 32 else 32
+    for directory in MVS_RUNTIME_DIRS[bits]:
+        dll = os.path.join(directory, "MvCameraControl.dll")
+        if not os.path.isfile(dll):
+            continue
+        try:
+            import ctypes as _ctypes
+
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(directory)
+            return _ctypes.WinDLL(dll)
+        except Exception:
+            continue
+    return None
+
+
 def _registry_mvs_paths() -> list:
     """MVS install directories recorded by its own installer. `[]` off Windows or on any error."""
     if os.name != "nt":
@@ -709,6 +759,11 @@ class HikCameraSource(FrameSource):
         # machine is exactly the bug this replaces.
         present = [path for path in candidates
                    if os.path.isfile(os.path.join(path, "MvCameraControl_class.py"))]
+        # BEFORE the import, because the SDK loads its native library at IMPORT time (its module
+        # body ends with `check_sys_and_update_dll()`). Pre-loading by absolute path is what makes
+        # that work inside a frozen build -- see `_preload_mvs_runtime`.
+        _preload_mvs_runtime()
+
         last_error = None
         for sdk_dir in present:
             if sdk_dir not in sys.path:

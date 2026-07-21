@@ -532,3 +532,85 @@ def test_the_guard_does_not_disable_an_injected_fake(qapp, monkeypatch):
     picker = CameraPicker(lister=lambda: _cameras("AAA111"))
     picker.refresh(blocking=True)
     assert any("AAA111" in picker.combo.itemText(i) for i in range(picker.combo.count()))
+
+
+# =============================================================================================
+# What a FROZEN build needs, which no ordinary test run exercises
+# =============================================================================================
+def test_the_spec_bundles_every_module_the_MVS_SDK_IMPORTS():
+    """THE BUG THAT MADE THE RIG CAMERA IMPOSSIBLE TO USE IN ANY INSTALLED BUILD.
+
+    The MVS SDK is loaded at RUNTIME from the operator's MVS installation, so PyInstaller never
+    analyses it and never bundles what it imports. `MvCameraControl_class.py` opens with
+    `import platform`; nothing in this application imports `platform` itself; so the module was
+    absent from the build and the SDK import died with `ModuleNotFoundError: No module named
+    'platform'` on EVERY machine.
+
+    The symptom was perfect camouflage -- the app listed the built-in webcam (OpenCV is bundled)
+    and no rig camera, which reads as a hardware or driver problem.
+
+    This reads the SDK's own source where it is installed and asserts the spec covers it, so a new
+    HikRobot SDK that imports something new fails here rather than in a customer's lab.
+    """
+    import os
+    import re
+
+    from flygym_tracker.frame_source import mvs_sdk_candidates
+
+    sdk_dir = next((p for p in mvs_sdk_candidates()
+                    if os.path.isfile(os.path.join(p, "MvCameraControl_class.py"))), None)
+    if sdk_dir is None:
+        pytest.skip("the MVS SDK is not installed on this machine")
+
+    imported = set()
+    for name in os.listdir(sdk_dir):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                match = re.match(r"\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_.]*)", line)
+                if match:
+                    imported.add(match.group(1).split(".")[0])
+
+    # The SDK's own sibling modules come with it on sys.path; only third-party/stdlib matter.
+    siblings = {n[:-3] for n in os.listdir(sdk_dir) if n.endswith(".py")}
+    needed = {m for m in imported if m not in siblings}
+
+    spec = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "packaging", "flygym_tracker.spec")
+    with open(spec, encoding="utf-8") as f:
+        spec_text = f.read()
+    missing = [m for m in sorted(needed) if ('"%s"' % m) not in spec_text]
+    assert not missing, (
+        "the MVS SDK imports %s, which the PyInstaller spec does not bundle. An installed build "
+        "will fail to load the rig camera on every machine." % missing)
+
+
+def test_the_native_runtime_is_loaded_by_absolute_path_for_this_architecture():
+    """The SDK does `WinDLL("MvCameraControl.dll")` -- a bare name, resolved off the PATH. That
+    survives running from a checkout and does NOT survive being frozen.
+
+    It is also a latent hazard even unfrozen: a normal MVS install puts BOTH the 32- and 64-bit
+    runtime folders on the PATH, with the 32-bit one FIRST, so a 64-bit process is relying on the
+    loader to skip a wrong-architecture match. Loading by full path removes both problems, and
+    Windows then serves the SDK's later bare-name call from the already-loaded module.
+    """
+    import sys as _sys
+
+    from flygym_tracker.frame_source import MVS_RUNTIME_DIRS
+
+    bits = 64 if _sys.maxsize > 2 ** 32 else 32
+    assert bits in MVS_RUNTIME_DIRS
+    for directory in MVS_RUNTIME_DIRS[64]:
+        assert "Win64" in directory
+    for directory in MVS_RUNTIME_DIRS[32]:
+        assert "Win32" in directory
+
+
+def test_preloading_the_runtime_never_raises(monkeypatch):
+    """It runs before every SDK import. A failure here must cost the preload, not the import --
+    the SDK's own error is more informative than anything this could invent."""
+    from flygym_tracker import frame_source as fs
+
+    monkeypatch.setattr(fs, "MVS_RUNTIME_DIRS", {64: (r"C:\nope",), 32: (r"C:\nope",)})
+    assert fs._preload_mvs_runtime() is None

@@ -35,6 +35,29 @@ hiddenimports = [
     "openpyxl",
     "openpyxl.cell._writer",
     "pandas._libs.tslibs.base",
+
+    # ---- what the HikRobot MVS SDK needs, and WHY IT MUST BE LISTED BY HAND -------------------
+    # THIS IS THE BUG THAT MADE THE RIG CAMERA IMPOSSIBLE TO USE IN ANY INSTALLED BUILD.
+    #
+    # The MVS SDK is NOT bundled -- it is loaded at runtime from the operator's MVS installation
+    # (see `frame_source._import_sdk`). PyInstaller therefore never analyses it, never sees its
+    # imports, and does not bundle them. `MvCameraControl_class.py` opens with `import platform`,
+    # nothing in this application imports `platform` itself, so the module was absent from the
+    # build and the SDK import died with `ModuleNotFoundError: No module named 'platform'`.
+    #
+    # The symptom was perfect camouflage: the app listed the built-in webcam (OpenCV is bundled)
+    # and no rig camera, on every machine, which reads as "the camera is not connected properly".
+    # It was reported from a second PC and blamed first on a hard-coded SDK path -- a genuine bug,
+    # but not this one.
+    #
+    # Every module the MVS SDK's Python files import, taken from the SDK source rather than
+    # guessed. Keep this in step if HikRobot ship a new SDK; the test suite checks it.
+    "platform",
+    "copy",
+    "ctypes",
+    "ctypes.util",
+    "os",
+    "sys",
 ]
 
 excludes = [
