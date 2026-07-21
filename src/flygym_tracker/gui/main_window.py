@@ -77,7 +77,14 @@ class MainWindow(QMainWindow):
     def __init__(self, *, config, config_path, state, root, camera_factory,
                  confirm=None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("FlyGym v2 - settings and camera")
+        # THE VERSION IS IN THE TITLE BAR, and it earns its space. Five builds were handed over in
+        # one afternoon, all named `FlyGymTracker-0.1.0.dev0-Setup.exe`, and none of them said
+        # which build it was once installed -- so testing a fix on a second machine meant trusting
+        # that the right file had been double-clicked. A version somebody can READ is the cheapest
+        # way to know what they are looking at.
+        from flygym_tracker import __version__
+
+        self.setWindowTitle("FlyGym v2 %s - settings and camera" % __version__)
         self.config = config
         self.state = state
         self.root = root

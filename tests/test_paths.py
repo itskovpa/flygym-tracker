@@ -158,3 +158,38 @@ def test_the_local_file_still_finds_the_template_it_layers_on(frozen):
         assert found == template, "the local override lost the template underneath it"
     finally:
         config_module.REPO_ROOT = original
+
+
+# =============================================================================================
+# Knowing WHICH BUILD you are looking at
+# =============================================================================================
+def test_the_two_version_declarations_agree():
+    """`__init__.py` drives the installer filename and the title bar; `pyproject.toml` drives the
+    wheel. If they drift, the file somebody downloads and the version the app reports stop being
+    the same thing -- which is exactly the confusion the version exists to prevent."""
+    import re
+
+    import flygym_tracker
+
+    text = (paths.bundle_root() / "pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'(?m)^version = "([^"]+)"', text).group(1)
+    assert declared == flygym_tracker.__version__
+
+
+def test_the_window_title_names_the_version(qapp, tmp_path):
+    """FIVE BUILDS WERE HANDED OVER IN ONE AFTERNOON, all named
+    `FlyGymTracker-0.1.0.dev0-Setup.exe`, none of which said which build it was once installed. So
+    testing a fix on a second machine meant trusting that the right file had been double-clicked."""
+    import flygym_tracker
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+
+    win = MainWindow(config=load_config(), config_path=str(tmp_path / "c.yaml"),
+                     state=gui_state.default_state(), root=str(tmp_path),
+                     camera_factory=lambda: None, confirm=lambda t: True)
+    try:
+        assert flygym_tracker.__version__ in win.windowTitle()
+    finally:
+        win.run.shutdown()
+        win.session.shutdown()
