@@ -260,6 +260,7 @@ class MainWindow(QMainWindow):
         self.session_bar.calib_changed.connect(self._on_calib_changed)
         self.session_bar.output_changed.connect(self._on_output_changed)
         self.session_bar.recording_changed.connect(self._on_recording_changed)
+        self.session_bar.camera_serial_changed.connect(self._on_camera_serial_changed)
         self.readiness_strip.fix_requested.connect(self._on_fix)
 
         # The handover watchdog. A single-shot timer rather than a wait: the GUI thread must stay
@@ -288,6 +289,11 @@ class MainWindow(QMainWindow):
     def take_initial_focus(self) -> None:
         """Move focus off the first spinbox, AFTER `show()`. See the module docstring."""
         self.filter_box.setFocus(Qt.FocusReason.OtherFocusReason)
+        # LOOK FOR CAMERAS ONCE THE WINDOW IS UP, not while it is being built. Enumeration calls
+        # into the MVS SDK, which on a machine without it raises -- and a failure during
+        # construction would stop a window that opens perfectly well with no camera at all.
+        # Enumeration opens nothing, so this cannot take the device from anything.
+        self.session_bar.refresh_cameras()
 
     # -- camera --------------------------------------------------------------------------------
     def open_camera(self) -> None:
@@ -476,6 +482,58 @@ class MainWindow(QMainWindow):
         """
         self.state["recording"] = dict(settings or {})
         gui_state.save_state(self.root, self.state)
+
+    def _on_camera_serial_changed(self, serial) -> None:
+        """Write the chosen camera into THIS MACHINE'S config layer, and say what happened.
+
+        WRITTEN IMMEDIATELY, not left pending in the settings panel. Every other route to this
+        value is a dead end when it is wrong: the app cannot open the camera, so it cannot verify
+        anything, so the usual "change it, check it against the camera, save" loop has no camera in
+        it. The whole point of the picker is to be usable when nothing works yet.
+
+        REDIRECTED AWAY FROM THE SHIPPED TEMPLATE by `local_config_path`. A serial is a fact about
+        one physical bench; writing it into `flygym_rig.yaml` is the bug that caused all of this --
+        the template went out with the development rig's own camera in it and no other machine
+        could open a camera at all.
+        """
+        from flygym_tracker.config import local_config_path
+        from flygym_tracker.settings_model import apply_overrides_to_yaml_text
+
+        path = local_config_path(self.controller.config_path or None)
+        try:
+            text = ""
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    text = f.read()
+            new_text, _notes = apply_overrides_to_yaml_text(
+                text, {"source": {"camera": {"serial": serial}}})
+            os.makedirs(os.path.dirname(str(path)) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(new_text)
+        except OSError as exc:
+            self.settings_view.set_status("could not save the camera choice: %s" % exc)
+            return
+        chosen = ("camera %s pinned" % serial) if serial else "using whatever camera is attached"
+        saved = "%s - saved to %s" % (chosen, os.path.basename(str(path)))
+
+        # AND MAKE IT TRUE FOR THIS SESSION. The camera factory is built once, from the config
+        # loaded at launch, so writing the file alone would leave the app opening the OLD camera
+        # until it was restarted -- a picker that appears to work and does not, on the one screen
+        # an operator reaches precisely because nothing is working.
+        try:
+            from flygym_tracker.config import load_config
+            from flygym_tracker.gui.app import camera_factory_from_config
+
+            self.config = load_config(path=self.controller.config_path or None)
+            swapped = self.session.set_factory(camera_factory_from_config(self.config))
+        except Exception as exc:
+            self.settings_view.set_status("%s, but this session could not adopt it (%s) - restart "
+                                          "the app to use it." % (saved, exc))
+            return
+        # SAY WHICH OF THE TWO ACTUALLY HAPPENED rather than one hopeful sentence for both.
+        self.settings_view.set_status(
+            "%s. Open the camera to use it." % saved if swapped else
+            "%s. Close the camera and open it again to switch to it." % saved)
 
     def _on_filter(self, text: str) -> None:
         """Kept as the window's entry point; the filter itself now lives in the settings pane, so

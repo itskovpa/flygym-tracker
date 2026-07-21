@@ -17,7 +17,9 @@ def test_defaults_load():
     assert cfg.activity.k == 5.0
     assert cfg.rotation.debounce_frames == 8
     assert cfg.source.type == "camera"
-    assert cfg.source.camera.serial == "DA4282883"
+    # NULL, NOT A SERIAL. The templates used to pin the development rig's own camera,
+    # which made every other machine fail to open a camera at all. See test_camera_picker.
+    assert cfg.source.camera.serial is None
     assert cfg.output.format == "both"
     # dict-style access, nested
     assert cfg["binning"]["bin_seconds"] == 60
@@ -34,7 +36,7 @@ def test_every_adjustable_camera_setting_defaults_to_unset():
         assert camera.get(key) is None, "%s is forced by the packaged default config" % key
     # serial and pixel_format are NOT optional: one pins which physical camera this is, the other
     # is the format the pipeline decodes.
-    assert camera.serial == "DA4282883"
+    assert camera.serial is None
     assert camera.pixel_format == "Mono8"
 
 
@@ -75,7 +77,9 @@ def test_overrides_dict_merges_without_clobbering_siblings():
     # must survive an untouched deep-merge
     assert cfg.activity.k == 5.0
     assert cfg.rotation.debounce_frames == 8
-    assert cfg.source.camera.serial == "DA4282883"
+    # NULL, NOT A SERIAL. The templates used to pin the development rig's own camera,
+    # which made every other machine fail to open a camera at all. See test_camera_picker.
+    assert cfg.source.camera.serial is None
 
 
 def test_user_yaml_path_merges_over_defaults(tmp_path):
@@ -93,7 +97,9 @@ def test_user_yaml_path_merges_over_defaults(tmp_path):
     assert cfg.source.type == "video"
     assert cfg.source.video_path == "clip.avi"
     # untouched nested default under the same top-level "source" section
-    assert cfg.source.camera.serial == "DA4282883"
+    # NULL, NOT A SERIAL. The templates used to pin the development rig's own camera,
+    # which made every other machine fail to open a camera at all. See test_camera_picker.
+    assert cfg.source.camera.serial is None
     # untouched sibling top-level section
     assert cfg.activity.k == 5.0
 

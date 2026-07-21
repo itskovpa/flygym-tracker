@@ -761,3 +761,43 @@ def test_clamp_leaves_a_legal_float_exactly_alone():
     assert rng.clamp(29.7) == pytest.approx(29.7)
     assert rng.clamp(0.1) == pytest.approx(0.5)
     assert rng.clamp(1e6) == pytest.approx(163.0)
+
+
+# =============================================================================================
+# The error a wrong serial produces -- the failure that cost a real afternoon on a second PC
+# =============================================================================================
+def test_a_wrong_serial_names_every_camera_that_WAS_found(sdk):
+    """"no camera with serial X found among 1 device(s)" is true and useless: it does not say that
+    the one device present is a perfectly good camera with a different serial, which is the entire
+    answer. This is the message a config carrying another machine's serial produces -- and it is
+    exactly what a shipped template pinning the development rig's camera produced on every other
+    machine."""
+    source = HikCameraSource(serial="SOMEONE-ELSES-CAMERA")
+    with pytest.raises(RuntimeError) as excinfo:
+        source.open()
+    message = str(excinfo.value)
+    assert "SOMEONE-ELSES-CAMERA" in message
+    assert SERIAL in message, "the error did not name the attached camera: %s" % message
+    assert "source.camera.serial" in message, "it does not say WHERE the wrong serial came from"
+
+
+def test_the_serial_survives_an_sdk_that_reports_no_model_name(sdk):
+    """Model and vendor are decoration; the serial is what pins the camera and what the operator
+    picks by. An SDK build lacking `chModelName` must not cost the serial too -- which is exactly
+    what reading every field in one expression used to do. This fake has no chModelName at all,
+    which is how the weakness was found."""
+    from flygym_tracker.frame_source import _describe_device
+
+    described = _describe_device(sdk, sdk._device)
+    assert described["serial"] == SERIAL
+    assert described["model"] == ""
+    assert described["interface"] == "USB3"
+
+
+def test_listing_cameras_describes_what_is_attached(sdk):
+    from flygym_tracker.frame_source import list_cameras
+
+    cameras = list_cameras()
+    assert len(cameras) == 1
+    assert cameras[0].serial == SERIAL
+    assert SERIAL in cameras[0].label, "the label does not lead with the serial that pins it"

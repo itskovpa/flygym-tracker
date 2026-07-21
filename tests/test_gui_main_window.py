@@ -84,16 +84,17 @@ def test_bin_seconds_is_a_settings_row_not_an_app_path(qapp, window):
     assert "bin_seconds" not in window.state
 
 
-def test_the_camera_identity_names_whichever_selector_is_load_bearing(qapp, window):
-    """Serial wins in `_find_device`, and index is only consulted when no serial is pinned, so the
-    line names the one that decides -- rather than printing an undocumented `index` key the app
-    would otherwise inherit in silence."""
+def test_the_camera_identity_shows_what_is_pinned_and_offers_a_choice(qapp, window):
+    """IT IS A PICKER NOW, NOT A LABEL. Reporting which camera the config asked for was no help in
+    the one situation that matters -- the config naming a camera that is not attached to this
+    machine -- because the only cure was to know a YAML file somewhere pinned somebody else's
+    serial. See `test_camera_picker` for the behaviour; this checks the window wires it up."""
     window.session_bar.set_camera_identity("DA4282883", 0)
-    assert "DA4282883" in window.session_bar.camera_label.text()
-    assert "index is ignored" in window.session_bar.camera_label.text()
+    assert window.session_bar.camera_picker.serial() == "DA4282883"
+    assert "DA4282883" in window.session_bar.camera_picker.combo.currentText()
 
     window.session_bar.set_camera_identity(None, 2)
-    assert "index 2" in window.session_bar.camera_label.text()
+    assert window.session_bar.camera_picker.serial() is None
 
 
 def test_every_job_run_bat_used_to_offer_is_a_live_button_in_this_window(qapp, window):

@@ -7,7 +7,12 @@ source:
   # camera keeps whatever MVS left it at. This is the base layer every config merges onto, so a
   # number here would be imposed on every rig that did not explicitly override it back to null.
   camera:
-    serial: "DA4282883"
+    # null = use the camera at `index` (0), which is right for a single-camera bench. Pin a serial
+    # only where there is more than one camera, and pin it in the machine's own `.local.yaml`
+    # rather than here -- a serial in a shipped template is one machine's hardware imposed on
+    # every other machine. See the note in flygym_rig.yaml.
+    serial: null
+    index: 0              # which enumerated camera to use when no serial is pinned
     width: null           # sensor ROI width; start-only (needs the stream stopped)
     height: null          # sensor ROI height; start-only
     exposure_us: null     # microseconds; pin (e.g. 20000) for a hard frame-rate cap

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
                                QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QSpinBox, QToolButton,
                                QVBoxLayout, QWidget)
 
+from flygym_tracker.gui.camera_picker import CameraPicker
 from flygym_tracker.gui.flow_layout import FlowLayout
 
 
@@ -80,6 +81,8 @@ class SessionBar(QWidget):
     output_changed = Signal(str)
     #: The video-recording choice changed. Carried as a dict so the window can save it verbatim.
     recording_changed = Signal(dict)
+    #: A different physical camera was chosen. `None` means "use whatever is attached".
+    camera_serial_changed = Signal(object)
 
     def __init__(self, state: dict, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -163,10 +166,14 @@ class SessionBar(QWidget):
         # config` reads a `source.camera.index` key that no shipped YAML defines, and an
         # undocumented knob the app inherits silently is exactly the kind of thing that makes a
         # two-camera bench behave differently from a one-camera one for no visible reason.
+        # A PICKER, NOT A READ-ONLY LABEL. It used to only REPORT which camera the config asked
+        # for, which was exactly no help in the one situation that matters: the config naming a
+        # camera that is not attached to this machine. Then the app said "camera could not be
+        # opened" and the only cure was to know that a YAML file pinned somebody else's serial.
         layout.addWidget(_label("camera"), 3, 0)
-        self.camera_label = QLabel("")
-        self.camera_label.setProperty("role", "note")
-        layout.addWidget(self.camera_label, 3, 1, 1, 2)
+        self.camera_picker = CameraPicker()
+        self.camera_picker.serial_chosen.connect(self.camera_serial_changed)
+        layout.addWidget(self.camera_picker, 3, 1, 1, 2)
 
         # RECORDING THE VIDEO, WHICH IS OFF UNLESS IT IS ASKED FOR. It lives in this section
         # because it is a property of the experiment, chosen once with the paths, and not of the
@@ -320,17 +327,21 @@ class SessionBar(QWidget):
                                    self.output_field.value()))
 
     def set_camera_identity(self, serial, index) -> None:
-        """Say which camera will be opened, in the terms the config actually selects by.
+        """Show which camera the config pins, and offer the attached ones to choose from.
 
         Serial wins in `HikCameraSource._find_device` and index is only consulted when no serial is
-        pinned, so the line names whichever one is load-bearing rather than printing both.
+        pinned, so the picker is driven by the serial alone.
+
+        DOES NOT ENUMERATE. Listing cameras is a call into the MVS SDK, and this runs while the
+        window is being built -- on a machine with no MVS installed that would put a failure in
+        front of an app that opens perfectly well without a camera. The operator presses Refresh,
+        or `refresh_cameras()` is called once the window is up.
         """
-        if serial:
-            self.camera_label.setText("serial %s (pinned - index is ignored)" % serial)
-        else:
-            self.camera_label.setText(
-                "no serial pinned, so device index %s is used - pin a serial in the config if this "
-                "bench has more than one camera" % (index if index is not None else 0))
+        self.camera_picker.set_serial(serial)
+
+    def refresh_cameras(self) -> None:
+        """Look for attached cameras. Safe at any time -- enumeration opens nothing."""
+        self.camera_picker.refresh()
 
     def config_path(self) -> str:
         return self.config_combo.currentText().strip()

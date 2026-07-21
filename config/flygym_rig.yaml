@@ -11,9 +11,19 @@ source:
     # were forced to 1280x1024 @ 20 fps on every run, which meant a setting changed in MVS was
     # silently reverted by the tracker. Adjust them in the software with `run.bat` [S] (or
     # `flygym-tracker settings`), which writes explicit values back here; press d on a row there
-    # to return it to null. serial and pixel_format are NOT optional: the serial pins which
-    # physical camera this is, and the pipeline needs Mono8 frames.
-    serial: "DA4282883"
+    # to return it to null. pixel_format is NOT optional: the pipeline needs Mono8 frames.
+    #
+    # SERIAL IS NULL IN THE SHIPPED TEMPLATE, AND THIS IS A BUG THAT ALREADY BIT. It used to read
+    # "DA4282883" -- the serial of the development rig's own camera. Every other machine then
+    # searched for a camera that was not attached to it and failed with "camera could not be
+    # opened", which reads as a broken program rather than as a setting pointing at somebody
+    # else's hardware.
+    #
+    # null means "use the camera at `index`", which is 0, which is the right answer on the
+    # overwhelmingly common single-camera bench. Pin a serial ONLY on a machine with more than one
+    # camera -- and pin it in `flygym_rig.local.yaml`, which is this machine's own layer, not here
+    # in the template everybody gets. The camera picker in the window writes it there for you.
+    serial: null
     width: null               # sensor ROI width  (start-only: applies when acquisition starts)
     height: null              # sensor ROI height (start-only)
     exposure_us: null         # microseconds; live-adjustable mid-run

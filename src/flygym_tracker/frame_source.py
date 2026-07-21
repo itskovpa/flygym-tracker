@@ -277,6 +277,102 @@ class VideoFileSource(FrameSource):
         return self._frame_size
 
 
+class CameraInfo:
+    """One attached camera, as `list_cameras` reports it. Plain data, never a live handle."""
+
+    def __init__(self, index: int, serial: Optional[str], model: str = "", vendor: str = "",
+                 interface: str = "") -> None:
+        self.index = int(index)
+        self.serial = serial
+        self.model = model or ""
+        self.vendor = vendor or ""
+        self.interface = interface or ""
+
+    @property
+    def label(self) -> str:
+        """What to show in a picker. Serial FIRST, because that is what pins the choice."""
+        name = self.model or "camera"
+        if self.serial:
+            return "%s  -  %s" % (self.serial, name)
+        return "%s  -  no serial reported (index %d)" % (name, self.index)
+
+    def __repr__(self) -> str:
+        return "CameraInfo(index=%d, serial=%r, model=%r)" % (self.index, self.serial, self.model)
+
+
+def list_cameras() -> list:
+    """Every camera the MVS SDK can see, WITHOUT opening any of them.
+
+    THE POINT IS THAT IT DOES NOT OPEN THEM. USB3 Vision access is exclusive, so a "list the
+    cameras" that opened each one in turn would fight the running experiment for the device -- and
+    on this rig the thing most likely to be asked "what cameras are there?" is a machine where a
+    camera is already streaming. Enumeration is a separate SDK call and takes no handle.
+
+    Raises RuntimeError if the MVS SDK is not installed -- the caller can then say THAT, which is a
+    different problem from "no cameras found" and has a different fix.
+    """
+    mv = HikCameraSource._import_sdk()
+    try:
+        mv.MvCamera.MV_CC_Initialize()
+    except Exception:
+        pass                      # not present on all SDK builds; enumeration works either way
+
+    device_list = mv.MV_CC_DEVICE_INFO_LIST()
+    layer_type = (mv.MV_GIGE_DEVICE | mv.MV_USB_DEVICE | mv.MV_GENTL_CAMERALINK_DEVICE
+                  | mv.MV_GENTL_CXP_DEVICE | mv.MV_GENTL_XOF_DEVICE)
+    ret = mv.MvCamera.MV_CC_EnumDevices(layer_type, device_list)
+    if ret != 0:
+        raise RuntimeError("MV_CC_EnumDevices failed (ret=0x%x)" % ret)
+
+    cameras = []
+    for i in range(device_list.nDeviceNum):
+        info = ctypes.cast(device_list.pDeviceInfo[i],
+                           ctypes.POINTER(mv.MV_CC_DEVICE_INFO)).contents
+        cameras.append(CameraInfo(index=i, **_describe_device(mv, info)))
+    return cameras
+
+
+def _describe_device(mv, info) -> dict:
+    """Serial, model, vendor and interface for one enumerated device. Never raises.
+
+    A camera that reports an odd or unreadable descriptor should appear in the list as an
+    unnamed entry the operator can still SELECT, rather than making the whole list fail -- the
+    list is what somebody is looking at precisely because something is already wrong.
+    """
+    decode = HikCameraSource._decode_str
+    fields = {"serial": None, "model": "", "vendor": "", "interface": ""}
+
+    def read(struct, attr):
+        """One descriptor field, independently. Returns "" if this SDK build lacks it.
+
+        FIELD BY FIELD, NOT ALL AT ONCE. Reading them in a single expression means one missing
+        attribute on an older SDK build loses the SERIAL as well -- and the serial is the only
+        field that does any work here: it is what pins the camera and what the operator picks by.
+        Model and vendor are decoration. They must never be able to cost the thing that matters.
+        """
+        try:
+            return decode(getattr(struct, attr))
+        except Exception:
+            return ""
+
+    try:
+        if info.nTLayerType == mv.MV_USB_DEVICE:
+            usb = info.SpecialInfo.stUsb3VInfo
+            fields.update(serial=read(usb, "chSerialNumber") or None,
+                          model=read(usb, "chModelName"), vendor=read(usb, "chVendorName"),
+                          interface="USB3")
+        elif info.nTLayerType in (mv.MV_GIGE_DEVICE, getattr(mv, "MV_GENTL_GIGE_DEVICE", -1)):
+            gige = info.SpecialInfo.stGigEInfo
+            fields.update(serial=read(gige, "chSerialNumber") or None,
+                          model=read(gige, "chModelName"),
+                          vendor=read(gige, "chManufacturerName"), interface="GigE")
+        else:
+            fields["interface"] = "other"
+    except Exception:
+        pass
+    return fields
+
+
 class HikCameraSource(FrameSource):
     """Live capture from a HikRobot camera via the vendored MvImport SDK.
 
@@ -367,6 +463,18 @@ class HikCameraSource(FrameSource):
             return self._decode_str(info.SpecialInfo.stUsb3VInfo.chSerialNumber)
         return None  # CameraLink/CXP/XoF/etc - not this rig's camera type
 
+    def _found(self, n_devices: int) -> str:
+        """" Found N camera(s): ..." for an error message. Never raises -- it is already failing."""
+        if n_devices <= 0:
+            return ("\n\nNo cameras were detected at all. Check the USB cable, and check that the "
+                    "camera is not held by another program -- USB3 Vision allows one at a time, so "
+                    "the MVS Viewer being open is enough to hide it.")
+        try:
+            listed = "\n".join("    %s" % camera.label for camera in list_cameras())
+        except Exception:
+            return "\n\nFound %d camera(s), but they could not be described." % n_devices
+        return "\n\nFound %d camera(s):\n%s" % (n_devices, listed)
+
     def _find_device(self, device_list):
         """Return the MV_CC_DEVICE_INFO for the configured serial (or index)."""
         mv = self._mv
@@ -378,9 +486,17 @@ class HikCameraSource(FrameSource):
                 ).contents
                 if self._read_serial(info) == self.serial:
                     return info
-            raise RuntimeError(f"no camera with serial {self.serial!r} found among {n} device(s)")
+            # NAME WHAT WAS ACTUALLY FOUND. "no camera with serial X found among 1 device(s)" is
+            # true and useless: it does not say that the one device present is a perfectly good
+            # camera with a different serial, which is the whole answer. This exact message cost a
+            # real afternoon -- a config shipped with the development rig's serial in it, on a
+            # machine whose own camera worked fine in MVS.
+            raise RuntimeError(
+                "no camera with serial %r is attached.%s\n\nThe serial is pinned in the config "
+                "(source.camera.serial). Either set it to null to use the attached camera, or "
+                "pick the right one in the window under Camera." % (self.serial, self._found(n)))
         if self.index >= n:
-            raise RuntimeError(f"camera index {self.index} out of range ({n} device(s) found)")
+            raise RuntimeError("camera index %d out of range.%s" % (self.index, self._found(n)))
         return ctypes.cast(
             device_list.pDeviceInfo[self.index], ctypes.POINTER(mv.MV_CC_DEVICE_INFO)
         ).contents
@@ -410,7 +526,16 @@ class HikCameraSource(FrameSource):
         if ret != 0:
             raise RuntimeError(f"MV_CC_EnumDevices failed (ret=0x{ret:x})")
         if device_list.nDeviceNum == 0:
-            raise RuntimeError("no HikRobot camera devices found")
+            # THE TWO CAUSES, NAMED. "No devices found" sends people to check a cable that is
+            # usually fine; the commonest cause on this rig is the MVS Viewer holding the camera,
+            # because USB3 Vision allows exactly one program at a time and a held camera does not
+            # merely refuse to open -- it does not appear in enumeration at all.
+            raise RuntimeError(
+                "no HikRobot cameras were detected.\n\n"
+                "Two usual causes:\n"
+                "  - another program has the camera. USB3 Vision allows one at a time, and a "
+                "camera held by the MVS Viewer is invisible here, not merely busy. Close it.\n"
+                "  - the camera is unplugged, or on a port that is not USB3.")
 
         device_info = self._find_device(device_list)
 

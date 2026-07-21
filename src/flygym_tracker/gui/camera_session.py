@@ -109,6 +109,24 @@ class CameraSession(QObject):
     def is_open(self) -> bool:
         return self._state == STREAMING
 
+    def set_factory(self, factory) -> bool:
+        """Change WHICH camera the next `open()` builds. False if it cannot be changed right now.
+
+        Exists so that choosing a different camera in the window takes effect at the next open
+        rather than at the next launch. Without it the picker could write the choice to the config
+        and still open the old camera for the rest of the session -- a control that appears to work
+        and does not, on the one screen an operator reaches precisely because nothing is working.
+
+        REFUSED WHILE THE CAMERA IS IN USE. `_factory` is read on the worker thread inside `open`,
+        so swapping it mid-open would be a race, and swapping it under a live stream would leave
+        the window describing a camera that is not the one delivering frames. The caller is told
+        to close first, which is a sentence the operator can act on.
+        """
+        if self._state not in (CLOSED, ERROR_BUSY, ERROR_OTHER):
+            return False
+        self._worker._factory = factory
+        return True
+
     @property
     def source(self):
         """The live `HikCameraSource`, ONLY for asking `is_acquiring`.
