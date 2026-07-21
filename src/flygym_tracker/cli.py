@@ -91,6 +91,15 @@ def _camera_source_from_config(config) -> HikCameraSource:
     is attached; only `.open()`/`.read()` can fail.
     """
     cam = config.source.camera
+    serial = cam.get("serial")
+    if isinstance(serial, str) and serial.startswith("uvc:"):
+        # A WEBCAM WAS CHOSEN. `serial` carries the selection for both kinds of camera because it
+        # is the one field the whole app -- config, picker, error messages -- already routes; a
+        # parallel "kind" key would be a second thing to keep in step with it. The `uvc:` prefix
+        # cannot collide with a real serial, which is alphanumeric.
+        from flygym_tracker.frame_source import UvcCameraSource
+
+        return UvcCameraSource(index=int(serial.split(":", 1)[1] or 0))
     return HikCameraSource(
         serial=cam.get("serial"),
         index=cam.get("index", 0),

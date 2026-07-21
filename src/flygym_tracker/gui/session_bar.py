@@ -339,9 +339,15 @@ class SessionBar(QWidget):
         """
         self.camera_picker.set_serial(serial)
 
-    def refresh_cameras(self) -> None:
-        """Look for attached cameras. Safe at any time -- enumeration opens nothing."""
-        self.camera_picker.refresh()
+    def refresh_cameras(self, include_uvc: bool = False) -> None:
+        """Look for the rig camera. Opens nothing, so it is safe at any time, including mid-run.
+
+        WEBCAMS ARE NOT INCLUDED BY DEFAULT, and that is a privacy decision rather than a
+        performance one: the only way to discover a webcam is to open it, and opening one lights
+        its indicator. Software that switches the laptop camera on at launch without being asked is
+        software nobody should have to trust. The Refresh button in the picker asks for them.
+        """
+        self.camera_picker.refresh(include_uvc=include_uvc)
 
     def config_path(self) -> str:
         return self.config_combo.currentText().strip()

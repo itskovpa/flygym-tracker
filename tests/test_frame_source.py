@@ -797,7 +797,10 @@ def test_the_serial_survives_an_sdk_that_reports_no_model_name(sdk):
 def test_listing_cameras_describes_what_is_attached(sdk):
     from flygym_tracker.frame_source import list_cameras
 
-    cameras = list_cameras()
+    # `include_uvc=False`, or this test probes the DEVELOPER'S OWN WEBCAM and its result depends on
+    # what is plugged into the machine running it. The webcam path is covered with a fake in
+    # `test_camera_picker`.
+    cameras = list_cameras(include_uvc=False)
     assert len(cameras) == 1
     assert cameras[0].serial == SERIAL
     assert SERIAL in cameras[0].label, "the label does not lead with the serial that pins it"

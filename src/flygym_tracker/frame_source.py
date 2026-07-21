@@ -277,30 +277,95 @@ class VideoFileSource(FrameSource):
         return self._frame_size
 
 
+#: The two kinds of camera this software can open, and they are NOT interchangeable.
+#:
+#: `hikrobot`  the rig's machine-vision camera, reached through the MVS SDK. Mono8, global
+#:             shutter, exposure/gain/frame-rate all controllable. What an experiment runs on.
+#: `uvc`       an ordinary webcam, reached through OpenCV. Listed and selectable because it is the
+#:             only way to exercise the whole program on a machine with no rig attached -- and
+#:             because a picker that showed nothing on a laptop with a working built-in camera
+#:             looks broken. It is NOT suitable for the assay: see `CameraInfo.suitable`.
+KIND_HIKROBOT = "hikrobot"
+KIND_UVC = "uvc"
+
+#: How many webcam indices to probe. Probing OPENS each device briefly (there is no handle-free
+#: enumeration for UVC the way there is for GenICam), so this is deliberately small: a laptop has
+#: one or two, and every additional index costs a real open attempt.
+MAX_UVC_PROBE = 4
+
+
 class CameraInfo:
     """One attached camera, as `list_cameras` reports it. Plain data, never a live handle."""
 
     def __init__(self, index: int, serial: Optional[str], model: str = "", vendor: str = "",
-                 interface: str = "") -> None:
+                 interface: str = "", kind: str = KIND_HIKROBOT) -> None:
         self.index = int(index)
         self.serial = serial
         self.model = model or ""
         self.vendor = vendor or ""
         self.interface = interface or ""
+        self.kind = kind
+
+    @property
+    def suitable(self) -> bool:
+        """Whether an EXPERIMENT can run on this camera.
+
+        A webcam is rolling-shutter, auto-exposing, auto-white-balancing and colour. On a drum
+        rotating past an IR backlight, auto-exposure alone re-levels the whole image between frames
+        -- which is precisely the signal the activity measurement reads. It will produce numbers.
+        They will be a measurement of the camera's gain control, not of the flies.
+        """
+        return self.kind == KIND_HIKROBOT
 
     @property
     def label(self) -> str:
-        """What to show in a picker. Serial FIRST, because that is what pins the choice."""
+        """What to show in a picker. Serial FIRST for a rig camera, because that is what pins it."""
+        if self.kind == KIND_UVC:
+            # The index is ALWAYS shown, named or not: it is what actually gets opened, and the
+            # name -- when Windows offers a trustworthy one -- is only a convenience on top of it.
+            head = ("%s (webcam %d)" % (self.model, self.index)) if self.model \
+                else "webcam %d" % self.index
+            return "%s  -  NOT for experiments" % head
         name = self.model or "camera"
         if self.serial:
             return "%s  -  %s" % (self.serial, name)
         return "%s  -  no serial reported (index %d)" % (name, self.index)
 
+    #: How this camera is written into the config, and read back by `_camera_source_from_config`.
+    @property
+    def config_id(self) -> str:
+        return "uvc:%d" % self.index if self.kind == KIND_UVC else (self.serial or "")
+
     def __repr__(self) -> str:
-        return "CameraInfo(index=%d, serial=%r, model=%r)" % (self.index, self.serial, self.model)
+        return "CameraInfo(kind=%r, index=%d, serial=%r, model=%r)" % (
+            self.kind, self.index, self.serial, self.model)
 
 
-def list_cameras() -> list:
+def list_cameras(include_uvc: bool = True) -> list:
+    """Every camera on the machine: the rig's, and -- if asked -- ordinary webcams too.
+
+    TWO SEPARATE ENUMERATIONS, because they are two unrelated device stacks and the MVS SDK is
+    blind to webcams. Neither failure hides the other: a machine with no MVS installed still lists
+    its built-in camera, and a rig with MVS working still lists nothing extra if OpenCV is broken.
+    That matters because the question being asked is usually "is ANY camera visible to this
+    program?", and answering it with half the picture is how the wrong thing gets blamed.
+
+    RAISES ONLY IF NOTHING COULD BE ENUMERATED AT ALL. If the MVS SDK is missing but webcams were
+    found, that is a successful answer to "what cameras are there" -- and the caller can still see
+    from the result that no rig camera is among them.
+    """
+    hik, hik_error = [], None
+    try:
+        hik = _list_hikrobot_cameras()
+    except Exception as exc:
+        hik_error = exc
+    uvc = _list_uvc_cameras() if include_uvc else []
+    if hik_error is not None and not uvc:
+        raise hik_error
+    return hik + uvc
+
+
+def _list_hikrobot_cameras() -> list:
     """Every camera the MVS SDK can see, WITHOUT opening any of them.
 
     THE POINT IS THAT IT DOES NOT OPEN THEM. USB3 Vision access is exclusive, so a "list the
@@ -330,6 +395,127 @@ def list_cameras() -> list:
                            ctypes.POINTER(mv.MV_CC_DEVICE_INFO)).contents
         cameras.append(CameraInfo(index=i, **_describe_device(mv, info)))
     return cameras
+
+
+def _list_uvc_cameras(max_index: int = MAX_UVC_PROBE) -> list:
+    """Ordinary webcams, found by probing OpenCV device indices. Never raises.
+
+    THIS ONE DOES OPEN THE DEVICES, unavoidably: DirectShow/UVC has no handle-free enumeration the
+    way GenICam does, so the only way to know index 1 exists is to open it. That is acceptable here
+    and would NOT be for the rig camera -- a webcam is not exclusive, nothing is measuring on it,
+    and opening one cannot interrupt an experiment. It also cannot touch the HikRobot camera: a
+    USB3 Vision device is not a UVC device and never appears on this list, so probing can never
+    steal the camera a run is using.
+
+    Each probe costs a real open (a few hundred ms), which is why `MAX_UVC_PROBE` is small and why
+    the caller runs this off the GUI thread.
+    """
+    try:
+        import cv2
+    except Exception:
+        return []                     # a broken OpenCV costs the webcam list, not the rig's
+
+    found = _probe_uvc_indices(cv2, max_index)
+    if not found and os.name == "nt":
+        # DSHOW IS NOT ALWAYS USABLE BY INDEX. Measured on this machine: every DSHOW open logged
+        # "backend is generally available but can't be used to capture by index". Falling back to
+        # the default backend (MSMF) is slower per failed index, which is why it is a fallback and
+        # not the first choice -- but a slow list beats an empty one that says "no cameras".
+        found = _probe_uvc_indices(cv2, max_index, backend=0)
+
+    names = _windows_camera_names()
+    # NAMES ONLY WHEN THE PAIRING IS SOUND. Windows lists camera devices in its own order, which is
+    # not guaranteed to be OpenCV's index order -- measured here: Windows reported two ('Integrated
+    # IR Camera', 'Integrated Camera') where probing found one, so pairing by position would have
+    # put a name on a device that may not own it. A camera labelled with the wrong name is worse
+    # than one labelled "webcam 1": the operator would pick the IR camera believing it was the
+    # colour one, and only the picture would tell them, later.
+    usable_names = names if len(names) == len(found) else []
+    return [CameraInfo(index=index, serial=None,
+                       model=usable_names[position] if usable_names else "",
+                       interface="UVC", kind=KIND_UVC)
+            for position, index in enumerate(found)]
+
+
+def _probe_uvc_indices(cv2, max_index: int, backend=None) -> list:
+    """Which of indices `0..max_index-1` open. `backend=None` means DSHOW on Windows."""
+    if backend is None:
+        backend = getattr(cv2, "CAP_DSHOW", 0) if os.name == "nt" else 0
+    opened = []
+    for index in range(max_index):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(index, backend) if backend else cv2.VideoCapture(index)
+            if cap.isOpened():
+                opened.append(index)
+        except Exception:
+            continue
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+    return opened
+
+
+def _windows_camera_names() -> list:
+    """Friendly names for the webcams, in enumeration order. `[]` if they cannot be had.
+
+    Names come from Windows rather than from OpenCV because OpenCV does not expose them at all --
+    and "webcam 0" against "Integrated Camera" is the difference between a picker somebody can use
+    and a list of numbers. The order is not guaranteed to match OpenCV's indices, so a wrong pairing
+    is possible; the index is therefore ALWAYS shown alongside the name, and the index is what is
+    actually opened.
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' -or "
+             "$_.PNPClass -eq 'Image' } | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+class UvcCameraSource(VideoFileSource):
+    """An ordinary webcam, read through OpenCV. Everything `VideoFileSource` does, from a device.
+
+    Subclassed rather than rewritten because a webcam and a video file are, to everything
+    downstream, the same thing: a stream of BGR frames converted to grayscale. The parent already
+    does the conversion, the contiguity and the `Frame` construction.
+
+    IT EXISTS TO MAKE THE PROGRAM TESTABLE WITHOUT THE RIG, and for nothing else. It is not a
+    supported way to run an experiment -- see `CameraInfo.suitable` -- and the window says so
+    wherever one is selected.
+    """
+
+    def __init__(self, index: int = 0):
+        super().__init__(index)
+        self.index = int(index)
+
+    def open(self) -> None:
+        import cv2
+
+        if self._cap is not None:
+            return
+        backend = getattr(cv2, "CAP_DSHOW", 0) if os.name == "nt" else 0
+        cap = cv2.VideoCapture(self.index, backend) if backend else cv2.VideoCapture(self.index)
+        if not cap.isOpened():
+            raise RuntimeError(
+                "could not open webcam %d. It may be in use by another program (Teams, Zoom, the "
+                "Camera app), or covered by a privacy shutter." % self.index)
+        self._cap = cap
+        self._fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        self._frame_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        self._next_index = 0
 
 
 def _describe_device(mv, info) -> dict:

@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from flygym_tracker.frame_source import CameraInfo  # noqa: E402
+from flygym_tracker.frame_source import KIND_UVC, CameraInfo  # noqa: E402
 from flygym_tracker.gui.camera_picker import ANY_CAMERA, CameraPicker  # noqa: E402
 
 
@@ -45,7 +45,7 @@ def test_no_shipped_template_pins_a_serial():
 # =============================================================================================
 def test_it_offers_the_attached_cameras(qapp):
     picker = CameraPicker(lister=lambda: _cameras("AAA111", "BBB222"))
-    picker.refresh()
+    picker.refresh(blocking=True)
     labels = [picker.combo.itemText(i) for i in range(picker.combo.count())]
     assert labels[0] == ANY_CAMERA
     assert any("AAA111" in text for text in labels)
@@ -56,7 +56,7 @@ def test_any_camera_is_the_default_and_means_no_serial(qapp):
     """`serial: null` is the right answer on a single-camera bench, which is nearly every bench,
     and it is what a fresh install now does."""
     picker = CameraPicker(lister=lambda: _cameras("AAA111"))
-    picker.refresh()
+    picker.refresh(blocking=True)
     assert picker.serial() is None
     assert picker.combo.currentText() == ANY_CAMERA
 
@@ -65,7 +65,7 @@ def test_choosing_a_camera_reports_its_serial(qapp):
     chosen = []
     picker = CameraPicker(lister=lambda: _cameras("AAA111", "BBB222"))
     picker.serial_chosen.connect(chosen.append)
-    picker.refresh()
+    picker.refresh(blocking=True)
     picker.combo.setCurrentIndex(picker.combo.findData("BBB222"))
     picker._on_activated(picker.combo.currentIndex())
     assert chosen == ["BBB222"]
@@ -78,7 +78,7 @@ def test_going_back_to_any_camera_reports_None(qapp):
     chosen = []
     picker = CameraPicker(lister=lambda: _cameras("AAA111"))
     picker.set_serial("AAA111")
-    picker.refresh()
+    picker.refresh(blocking=True)
     picker.serial_chosen.connect(chosen.append)
     picker.combo.setCurrentIndex(0)
     picker._on_activated(0)
@@ -90,7 +90,7 @@ def test_re_choosing_the_same_camera_says_nothing(qapp):
     chosen = []
     picker = CameraPicker(lister=lambda: _cameras("AAA111"))
     picker.set_serial("AAA111")
-    picker.refresh()
+    picker.refresh(blocking=True)
     picker.serial_chosen.connect(chosen.append)
     picker._on_activated(picker.combo.findData("AAA111"))
     assert chosen == []
@@ -105,7 +105,7 @@ def test_a_pinned_camera_that_is_not_attached_is_shown_as_exactly_that(qapp):
     hint that the config names hardware on another machine."""
     picker = CameraPicker(lister=lambda: _cameras("BBB222"))
     picker.set_serial("AAA111")
-    picker.refresh()
+    picker.refresh(blocking=True)
     assert "AAA111" in picker.combo.currentText()
     assert "NOT ATTACHED" in picker.combo.currentText()
     assert "NOT attached" in picker.note.text()
@@ -115,7 +115,7 @@ def test_no_cameras_at_all_names_the_two_usual_causes(qapp):
     """A cable, or another program holding the device -- USB3 Vision allows one at a time, so an
     open MVS Viewer is enough to make the camera invisible."""
     picker = CameraPicker(lister=lambda: [])
-    picker.refresh()
+    picker.refresh(blocking=True)
     text = picker.note.text()
     assert "no cameras detected" in text
     assert "MVS" in text and "cable" in text
@@ -128,7 +128,7 @@ def test_a_missing_sdk_is_reported_as_a_missing_sdk(qapp):
         raise RuntimeError("HikRobot MvImport SDK is not available (looked in ...)")
 
     picker = CameraPicker(lister=explode)
-    picker.refresh()
+    picker.refresh(blocking=True)
     assert "MVS software is not installed" in picker.note.text()
 
 
@@ -137,7 +137,7 @@ def test_enumeration_failing_never_raises_into_the_window(qapp):
         raise OSError("something odd")
 
     picker = CameraPicker(lister=explode)
-    picker.refresh()                    # must not raise
+    picker.refresh(blocking=True)                    # must not raise
     assert picker.note.text()
 
 
@@ -205,3 +205,155 @@ def test_the_factory_is_not_swapped_under_a_live_camera(qapp, tmp_path):
         assert session.set_factory(lambda: "new") is True
     finally:
         session.shutdown()
+
+
+# =============================================================================================
+# Webcams are listed too -- and marked as what they are
+# =============================================================================================
+def _webcam(index=0, model="Integrated Camera"):
+    return CameraInfo(index=index, serial=None, model=model, interface="UVC", kind=KIND_UVC)
+
+
+def test_a_built_in_webcam_is_listed(qapp):
+    """A picker that showed nothing on a laptop with a working built-in camera looks broken -- and
+    the question being asked is usually "is ANY camera visible to this program?"."""
+    picker = CameraPicker(lister=lambda: [_webcam()])
+    picker.refresh(blocking=True)
+    labels = [picker.combo.itemText(i) for i in range(picker.combo.count())]
+    assert any("Integrated Camera" in text for text in labels)
+
+
+def test_a_webcam_is_labelled_as_unfit_for_an_experiment(qapp):
+    """NOT COSMETIC. A webcam auto-exposes, and on a drum turning past an IR backlight that
+    re-levels the whole image between frames -- which is exactly the signal the activity
+    measurement reads. It produces numbers that measure the camera's gain control."""
+    picker = CameraPicker(lister=lambda: [_webcam()])
+    picker.refresh(blocking=True)
+    assert "NOT for experiments" in picker.combo.itemText(1)
+
+
+def test_choosing_a_webcam_says_so_every_time_it_is_shown(qapp):
+    picker = CameraPicker(lister=lambda: [_webcam()])
+    picker.set_serial("uvc:0")
+    picker.refresh(blocking=True)
+    assert "NOT valid for an experiment" in picker.note.text()
+
+
+def test_a_webcam_is_identified_by_index_because_it_has_no_serial(qapp):
+    chosen = []
+    picker = CameraPicker(lister=lambda: [_webcam(index=1)])
+    picker.serial_chosen.connect(chosen.append)
+    picker.refresh(blocking=True)
+    picker._on_activated(picker.combo.findData("uvc:1"))
+    assert chosen == ["uvc:1"]
+
+
+def test_webcams_alone_are_reported_as_no_rig_camera(qapp):
+    """The honest answer on a machine with a working laptop camera and no rig attached: cameras
+    were found, and none of them can run an experiment."""
+    picker = CameraPicker(lister=lambda: [_webcam()])
+    picker.refresh(blocking=True)
+    assert "no rig camera" in picker.note.text()
+
+
+def test_a_chosen_webcam_builds_a_webcam_source():
+    """The selection has to actually open something, or the picker is a control that does not
+    control anything."""
+    from flygym_tracker.cli import _camera_source_from_config
+    from flygym_tracker.config import load_config
+    from flygym_tracker.frame_source import UvcCameraSource
+
+    config = load_config(overrides={"source": {"camera": {"serial": "uvc:2"}}})
+    source = _camera_source_from_config(config)
+    assert isinstance(source, UvcCameraSource)
+    assert source.index == 2
+
+
+def test_a_real_serial_still_builds_the_rig_camera():
+    from flygym_tracker.cli import _camera_source_from_config
+    from flygym_tracker.config import load_config
+    from flygym_tracker.frame_source import HikCameraSource
+
+    config = load_config(overrides={"source": {"camera": {"serial": "DA4282883"}}})
+    source = _camera_source_from_config(config)
+    assert isinstance(source, HikCameraSource)
+    assert source.serial == "DA4282883"
+
+
+def test_a_webcam_with_no_trustworthy_name_still_shows_its_index(qapp):
+    """MEASURED, AND THE REASON NAMES ARE CONDITIONAL. Windows reported two cameras on the dev
+    machine ('Integrated IR Camera', 'Integrated Camera') where probing found one, so pairing by
+    position would have put a name on a device that may not own it. The index is what is opened,
+    so the index is what must always be visible."""
+    picker = CameraPicker(lister=lambda: [_webcam(index=1, model="")])
+    picker.refresh(blocking=True)
+    assert "webcam 1" in picker.combo.itemText(1)
+
+
+def test_names_are_dropped_when_they_cannot_be_paired_with_the_probe():
+    from flygym_tracker import frame_source as fs
+
+    class FakeCv2:
+        CAP_DSHOW = 700
+
+        class VideoCapture:
+            def __init__(self, index, backend=0):
+                self._ok = index == 0        # one camera, at index 0
+
+            def isOpened(self):
+                return self._ok
+
+            def release(self):
+                pass
+
+    import sys
+    import types
+    module = types.ModuleType("cv2")
+    module.CAP_DSHOW = FakeCv2.CAP_DSHOW
+    module.VideoCapture = FakeCv2.VideoCapture
+    saved = sys.modules.get("cv2")
+    sys.modules["cv2"] = module
+    saved_names = fs._windows_camera_names
+    fs._windows_camera_names = lambda: ["Camera A", "Camera B"]   # TWO names, ONE camera probed
+    try:
+        cameras = fs._list_uvc_cameras(max_index=3)
+        assert len(cameras) == 1
+        assert cameras[0].model == "", "a name was paired with a camera it may not belong to"
+    finally:
+        fs._windows_camera_names = saved_names
+        if saved is not None:
+            sys.modules["cv2"] = saved
+        else:
+            del sys.modules["cv2"]
+
+
+def test_closing_the_window_while_it_is_still_looking_does_not_crash(qapp):
+    """A REAL CRASH, caught in the suite and reproduced here. The first version emitted a Qt signal
+    from the enumeration thread straight into this widget; if the window closed while a probe was
+    still running -- and a probe takes over a second, so closing the app shortly after launch is
+    enough -- the emit landed on a destroyed C++ object and took the whole process down, with no
+    Python traceback, just a stack dump during teardown.
+
+    The timer belongs to the widget and dies with it, so nothing on the GUI side is called again.
+    """
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def slow():
+        release.wait(5.0)
+        return [_webcam()]
+
+    picker = CameraPicker(lister=slow)
+    picker.refresh()                          # threaded; still probing
+    qapp.processEvents()
+    picker.deleteLater()
+    del picker
+    qapp.processEvents()
+    release.set()                             # the worker finishes AFTER the widget is gone
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.02)
+    # Reaching here at all is the assertion: the process is still alive.
