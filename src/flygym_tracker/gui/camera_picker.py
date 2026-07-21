@@ -32,6 +32,15 @@ from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSizePolicy, QTool
 ANY_CAMERA = "use whatever camera is attached"
 
 
+class _PartialResult(Exception):
+    """Cameras were found AND the rig-camera lookup failed. Carries both, so neither is lost."""
+
+    def __init__(self, cameras, error) -> None:
+        super().__init__(str(error))
+        self.cameras = cameras
+        self.error = error
+
+
 class CameraPicker(QWidget):
     """A dropdown of the attached cameras, a Refresh, and a line saying what is pinned."""
 
@@ -157,6 +166,9 @@ class CameraPicker(QWidget):
     def _enumerate(self):
         try:
             return list(self._list()), ""
+        except _PartialResult as partial:
+            # Cameras WERE found and the rig lookup still failed. Both facts are kept.
+            return list(partial.cameras), str(partial.error)
         except Exception as exc:
             return [], str(exc)
 
@@ -175,12 +187,13 @@ class CameraPicker(QWidget):
         self._rebuild(self._cameras)
         if not error:
             return
-        # THE TWO FAILURES ARE DIFFERENT AND HAVE DIFFERENT FIXES: "no MVS installed" is a
-        # download, "no cameras found" is a cable. Saying which one it is saves the wrong hunt.
-        if "MvImport" in error or "MVS" in error:
-            self._say("the HikRobot MVS software is not installed - the rig camera needs it")
-        else:
-            self._say("could not look for cameras: %s" % error.splitlines()[0][:120])
+        # SHOWN EVEN WHEN CAMERAS WERE FOUND. A webcam in the list does not answer "why is the rig
+        # camera missing", and that is the only question being asked on this screen.
+        first = error.strip().splitlines()[0]
+        self._say("RIG CAMERA NOT AVAILABLE: %s" % first[:160])
+        # The full text -- which names every folder searched, and what to set MVS_PYTHON_SDK to --
+        # goes in the tooltip, because it is several lines and this is one line of a settings row.
+        self.note.setToolTip(error)
 
     def _list(self):
         if self._lister is not None:
@@ -190,7 +203,15 @@ class CameraPicker(QWidget):
         # WEBCAMS ONLY WHEN ASKED. A picker that showed nothing on a laptop with a working built-in
         # camera looks broken -- but finding them means OPENING them, which lights the camera up.
         # So Refresh includes them and startup does not. See `refresh`.
-        return list_cameras(include_uvc=self._include_uvc)
+        from flygym_tracker.frame_source import list_cameras_with_error  # noqa: F811
+
+        cameras, error = list_cameras_with_error(include_uvc=self._include_uvc)
+        # THE ERROR TRAVELS WITH THE RESULT. Finding a webcam is not a reason to stop saying that
+        # the rig camera could not be looked for -- that combination is precisely what left a
+        # second PC showing its laptop camera and no explanation.
+        if error is not None:
+            raise _PartialResult(cameras, error)
+        return cameras
 
     # -- the dropdown --------------------------------------------------------------------------
     def _rebuild(self, cameras) -> None:

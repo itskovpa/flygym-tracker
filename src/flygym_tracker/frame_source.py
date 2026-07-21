@@ -33,9 +33,74 @@ import numpy as np
 
 from flygym_tracker.types import Frame
 
-#: Default install location of the HikRobot MvImport Python SDK on this rig.
-#: Override with the MVS_PYTHON_SDK env var on a machine with a different install path.
-DEFAULT_MVS_SDK_PATH = r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport"
+#: Where the HikRobot MvImport Python SDK is looked for, in order. `MVS_PYTHON_SDK` wins.
+#:
+#: A LIST, NOT ONE PATH, AND THAT WAS A REAL BUG. This was a single hard-coded
+#: `C:\Program Files (x86)\MVS\...` -- the layout of the development machine -- while the
+#: INSTALLER shipped alongside it already checked both Program Files trees. A PC with the 64-bit
+#: MVS in `C:\Program Files\MVS\...` therefore failed to import the SDK, found no rig camera, and
+#: (because the error was swallowed, see `list_cameras`) showed only the built-in webcam with no
+#: hint that anything had gone wrong. Exactly the same mistake as shipping one rig's camera serial:
+#: one machine's layout imposed on every other machine.
+MVS_SDK_SEARCH_PATHS = (
+    r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport",
+    r"C:\Program Files\MVS\Development\Samples\Python\MvImport",
+    r"C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport\..\MvImport",
+)
+
+#: Kept as a name because other modules and the docs refer to it. It is the FIRST candidate, not
+#: the only one.
+DEFAULT_MVS_SDK_PATH = MVS_SDK_SEARCH_PATHS[0]
+
+
+def mvs_sdk_candidates() -> list:
+    """Every directory that might hold `MvCameraControl_class.py`, best first.
+
+    The env var first (a deliberate override always wins), then the standard install trees, then
+    whatever the MVS installer recorded in the registry -- which is the only source that copes with
+    somebody installing to a different drive.
+    """
+    candidates = []
+    override = os.environ.get("MVS_PYTHON_SDK")
+    if override:
+        candidates.append(override)
+    candidates.extend(MVS_SDK_SEARCH_PATHS)
+    candidates.extend(_registry_mvs_paths())
+    seen, unique = set(), []
+    for path in candidates:
+        resolved = os.path.normpath(path)
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def _registry_mvs_paths() -> list:
+    """MVS install directories recorded by its own installer. `[]` off Windows or on any error."""
+    if os.name != "nt":
+        return []
+    found = []
+    try:
+        import winreg
+
+        for root, key in ((winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\MVS"),
+                          (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\MVS"),
+                          (winreg.HKEY_CURRENT_USER, r"SOFTWARE\MVS")):
+            try:
+                with winreg.OpenKey(root, key) as handle:
+                    for name in ("InstallPath", "Path", "InstallDir"):
+                        try:
+                            value = winreg.QueryValueEx(handle, name)[0]
+                        except OSError:
+                            continue
+                        if value:
+                            found.append(os.path.join(str(value), "Development", "Samples",
+                                                      "Python", "MvImport"))
+            except OSError:
+                continue
+    except Exception:
+        return []
+    return found
 
 #: GenICam node names for the five settings this software will ever impose, keyed by the
 #: `HikCameraSource` attribute (and, one level up, the `source.camera.*` config key) that carries
@@ -354,15 +419,31 @@ def list_cameras(include_uvc: bool = True) -> list:
     found, that is a successful answer to "what cameras are there" -- and the caller can still see
     from the result that no rig camera is among them.
     """
-    hik, hik_error = [], None
+    cameras, error = list_cameras_with_error(include_uvc=include_uvc)
+    if error is not None and not cameras:
+        raise error
+    return cameras
+
+
+def list_cameras_with_error(include_uvc: bool = True):
+    """`(cameras, rig_error_or_None)`. The error is REPORTED, never silently dropped.
+
+    THE BUG THIS FIXES, reported from a second PC: the rig-camera lookup failed, a webcam was
+    found, and `list_cameras` returned the webcam alone -- swallowing the reason entirely. The
+    operator saw a picker listing their laptop camera and nothing at all to say why the rig camera
+    was absent, which is the least useful possible state for the one screen they opened BECAUSE the
+    camera would not work.
+
+    Finding a webcam is not a reason to stop reporting that the rig camera could not be looked for.
+    Those are two independent facts and the caller is given both.
+    """
+    hik, error = [], None
     try:
         hik = _list_hikrobot_cameras()
     except Exception as exc:
-        hik_error = exc
+        error = exc
     uvc = _list_uvc_cameras() if include_uvc else []
-    if hik_error is not None and not uvc:
-        raise hik_error
-    return hik + uvc
+    return hik + uvc, error
 
 
 def _list_hikrobot_cameras() -> list:
@@ -622,18 +703,40 @@ class HikCameraSource(FrameSource):
         Raises RuntimeError with an actionable message if the SDK can't be found
         or its native DLL can't be loaded (e.g. the MVS runtime isn't installed).
         """
-        sdk_dir = os.environ.get("MVS_PYTHON_SDK", DEFAULT_MVS_SDK_PATH)
-        if sdk_dir not in sys.path:
-            sys.path.insert(0, sdk_dir)
-        try:
-            return importlib.import_module("MvCameraControl_class")
-        except Exception as exc:
+        candidates = mvs_sdk_candidates()
+        # THE FIRST ONE THAT EXISTS, not the first one guessed. Trying a directory that is not
+        # there costs nothing, and stopping at a hard-coded path that does not exist on this
+        # machine is exactly the bug this replaces.
+        present = [path for path in candidates
+                   if os.path.isfile(os.path.join(path, "MvCameraControl_class.py"))]
+        last_error = None
+        for sdk_dir in present:
+            if sdk_dir not in sys.path:
+                sys.path.insert(0, sdk_dir)
+            try:
+                return importlib.import_module("MvCameraControl_class")
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        # SAY WHICH IT IS: not installed at all, or installed and unloadable. They are different
+        # problems -- one is a download, the other is usually a 32/64-bit or missing-runtime issue
+        # -- and one message for both sends people on the wrong hunt.
+        looked = "\n".join("    %s" % path for path in candidates)
+        if not present:
             raise RuntimeError(
-                "HikRobot MvImport SDK is not available "
-                f"(looked in {sdk_dir!r}; override with the MVS_PYTHON_SDK env var). "
-                "Is the MVS runtime installed on this machine? "
-                f"Underlying error: {exc!r}"
-            ) from exc
+                "the HikRobot MVS software was not found on this computer.\n\n"
+                "The rig camera needs it. It is a free download from HikRobot (MVS 4.8 or newer) "
+                "and it carries the USB3 Vision drivers, so it cannot be bundled with this "
+                "program.\n\nLooked in:\n%s\n\n"
+                "If MVS is installed somewhere else, set the MVS_PYTHON_SDK environment variable "
+                "to its ...\\Development\\Samples\\Python\\MvImport folder." % looked)
+        raise RuntimeError(
+            "the HikRobot MVS software is installed but could not be loaded.\n\n"
+            "Found it in:\n    %s\n\nUnderlying error: %r\n\n"
+            "This usually means the MVS runtime is a different architecture from this program "
+            "(both must be 64-bit), or the MVS installation is incomplete -- reinstalling MVS "
+            "generally fixes it." % (present[0], last_error))
 
     @staticmethod
     def _decode_str(byte_array) -> str:

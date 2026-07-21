@@ -121,15 +121,47 @@ def test_no_cameras_at_all_names_the_two_usual_causes(qapp):
     assert "MVS" in text and "cable" in text
 
 
-def test_a_missing_sdk_is_reported_as_a_missing_sdk(qapp):
+def test_a_missing_sdk_is_reported_as_the_rig_camera_being_unavailable(qapp):
     """DIFFERENT PROBLEM, DIFFERENT FIX. "MVS is not installed" is a download; "no cameras found"
-    is a cable. Reporting one as the other sends the operator on the wrong hunt."""
+    is a cable. The line leads with RIG CAMERA NOT AVAILABLE so the operator knows which of the two
+    listed cameras is the one that is missing."""
     def explode():
-        raise RuntimeError("HikRobot MvImport SDK is not available (looked in ...)")
+        raise RuntimeError("the HikRobot MVS software was not found on this computer.")
 
     picker = CameraPicker(lister=explode)
     picker.refresh(blocking=True)
-    assert "MVS software is not installed" in picker.note.text()
+    assert "RIG CAMERA NOT AVAILABLE" in picker.note.text()
+    assert "MVS software was not found" in picker.note.text()
+
+
+def test_a_webcam_being_found_does_not_hide_the_rig_camera_failure(qapp):
+    """THE BUG REPORTED FROM A SECOND PC. The rig lookup failed, a webcam was found, and the error
+    was swallowed entirely -- so the picker listed the laptop camera and said NOTHING about why the
+    rig camera was absent. That is the least useful possible state for the one screen somebody
+    opens precisely BECAUSE the camera will not work."""
+    from flygym_tracker.gui.camera_picker import _PartialResult
+
+    def partial():
+        raise _PartialResult([_webcam()], RuntimeError("MVS was not found on this computer."))
+
+    picker = CameraPicker(lister=partial)
+    picker.refresh(blocking=True)
+    labels = [picker.combo.itemText(i) for i in range(picker.combo.count())]
+    assert any("webcam" in text for text in labels), "the webcam that WAS found got lost"
+    assert "RIG CAMERA NOT AVAILABLE" in picker.note.text(),         "a webcam in the list hid the reason the rig camera is missing"
+
+
+def test_the_full_diagnosis_is_kept_in_the_tooltip(qapp):
+    """The message names every folder searched and what to set MVS_PYTHON_SDK to. That is several
+    lines and this is one line of a settings row, so the detail lives in the tooltip rather than
+    being truncated away."""
+    def explode():
+        raise RuntimeError("MVS was not found.\n\nLooked in:\n    C:/Program Files/MVS\n\n"
+                           "Set MVS_PYTHON_SDK to its MvImport folder.")
+
+    picker = CameraPicker(lister=explode)
+    picker.refresh(blocking=True)
+    assert "MVS_PYTHON_SDK" in picker.note.toolTip()
 
 
 def test_enumeration_failing_never_raises_into_the_window(qapp):
@@ -403,3 +435,52 @@ def test_the_status_line_speaks_rather_than_spelling_the_identifier(qapp, tmp_pa
     finally:
         win.run.shutdown()
         win.session.shutdown()
+
+
+
+# =============================================================================================
+# Finding the MVS SDK wherever it is installed
+# =============================================================================================
+def test_the_sdk_is_looked_for_in_more_than_one_place():
+    r"""A REAL BUG FROM A SECOND PC. The code looked in exactly one hard-coded path --
+    `C:\Program Files (x86)\MVS\...`, the development machine's layout -- while the INSTALLER
+    shipped beside it already checked both Program Files trees. A PC with 64-bit MVS in
+    `C:\Program Files\MVS\...` therefore found no rig camera at all."""
+    from flygym_tracker.frame_source import mvs_sdk_candidates
+
+    candidates = [c.lower() for c in mvs_sdk_candidates()]
+    assert len(candidates) >= 2
+    assert any("program files (x86)" in c for c in candidates)
+    assert any(c.startswith(r"c:\program files\mvs") for c in candidates)
+
+
+def test_an_explicit_override_is_searched_first(monkeypatch, tmp_path):
+    """Somebody who sets MVS_PYTHON_SDK has said exactly where it is; nothing should outrank it."""
+    from flygym_tracker.frame_source import mvs_sdk_candidates
+
+    monkeypatch.setenv("MVS_PYTHON_SDK", str(tmp_path / "mine"))
+    assert mvs_sdk_candidates()[0] == str(tmp_path / "mine")
+
+
+def test_the_candidate_list_has_no_duplicates(monkeypatch):
+    from flygym_tracker.frame_source import MVS_SDK_SEARCH_PATHS, mvs_sdk_candidates
+
+    monkeypatch.setenv("MVS_PYTHON_SDK", MVS_SDK_SEARCH_PATHS[0])
+    candidates = mvs_sdk_candidates()
+    assert len(candidates) == len(set(candidates))
+
+
+def test_a_missing_sdk_names_every_folder_it_tried(monkeypatch, tmp_path):
+    """So the operator can see at a glance that their install is somewhere else -- and is told the
+    environment variable that fixes it."""
+    from flygym_tracker.frame_source import HikCameraSource
+
+    monkeypatch.setenv("MVS_PYTHON_SDK", str(tmp_path / "nowhere"))
+    monkeypatch.setattr("flygym_tracker.frame_source.MVS_SDK_SEARCH_PATHS",
+                        (str(tmp_path / "also-nowhere"),))
+    with pytest.raises(RuntimeError) as excinfo:
+        HikCameraSource._import_sdk()
+    message = str(excinfo.value)
+    assert "was not found" in message
+    assert "nowhere" in message and "also-nowhere" in message
+    assert "MVS_PYTHON_SDK" in message
