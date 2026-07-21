@@ -7,6 +7,19 @@ name = "flygym-tracker"
 version = "0.1.0.dev0"
 description = "Per-vial Drosophila locomotor-activity tracker for the FlyGym v2 IR-silhouette rig"
 requires-python = ">=3.9"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+# SOURCE-AVAILABLE, NOT OPEN SOURCE. A `LicenseRef-` SPDX id is the correct way to name a licence
+# the SPDX list does not carry, and it is what stops tooling reporting this as an OSI licence --
+# PolyForm Noncommercial restricts fields of use, which is exactly what the OSI does not approve.
+#
+# NO `License ::` CLASSIFIER HERE. PEP 639 supersedes them with the `license` expression above, and
+# setuptools >= 77 REFUSES TO BUILD if both are present -- caught by actually building the wheel.
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Private :: Do Not Upload",
+]
 dependencies = [
     "numpy>=1.24",
     "opencv-python>=4.8",

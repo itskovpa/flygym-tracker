@@ -58,3 +58,21 @@ middle of an experiment.
 
 Requires the HikRobot **MVS** runtime installed (for live capture); the `MvImport` Python SDK is
 loaded from the MVS install directory at runtime.
+
+## Licence
+
+**[PolyForm Noncommercial 1.0.0](LICENSE)** — free for noncommercial use.
+
+* Universities, research institutes, hospitals, government labs and other noncommercial
+  organisations may use, modify and share this freely, **whatever the source of their funding**.
+  Personal research, study and hobby use too.
+* **Commercial use requires a separate licence** from the copyright holder. A for-profit company
+  using this in its own research counts as commercial use — a pharma or biotech screen is
+  commercial even though it is science. Get in touch to arrange one.
+
+This is **source-available, not open source**: the OSI does not approve licences that restrict
+fields of use, so please don't describe it as open source.
+
+Bundled third-party components (Qt/PySide6, OpenCV, NumPy, pandas, PyYAML, openpyxl, Python) keep
+their own licences — see [LICENSE](LICENSE). The HikRobot MVS SDK is **not** redistributed; it is
+installed separately by the operator under HikRobot's own terms.
