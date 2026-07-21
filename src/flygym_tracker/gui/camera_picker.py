@@ -1,4 +1,4 @@
-"""Which physical camera to use -- chosen from the ones actually attached, not typed from memory.
+﻿"""Which physical camera to use -- chosen from the ones actually attached, not typed from memory.
 
 THE FAILURE THIS EXISTS TO END. The shipped config carried `serial: "DA4282883"`, the serial of the
 development rig's own camera. On any other machine the app searched for a camera that was not
@@ -22,6 +22,7 @@ a fact about one physical bench; putting it in the template is precisely the bug
 """
 from __future__ import annotations
 
+import os
 import threading
 from typing import List, Optional
 
@@ -120,16 +121,26 @@ class CameraPicker(QWidget):
         indices on the GUI thread would freeze the window for a second or more at launch, which on
         a scientific instrument reads as a crash.
 
-        `include_uvc=False` LOOKS ONLY FOR THE RIG CAMERA, and that is what startup uses. Two
-        reasons, and the first is not performance:
+        EVERY CAMERA, INCLUDING WEBCAMS, BY DEFAULT -- at startup as well. This was rig-only for a
+        while, on the reasoning that discovering a webcam means briefly opening it and lighting its
+        indicator. The rig owner overruled that, and they are right: a picker that offers a choice
+        from a list missing half the machine's cameras is not offering a choice, and the operator
+        who reaches this screen is usually there because a camera is already missing. The brief
+        open is disclosed on the Refresh button instead of being avoided.
 
-          * PROBING A WEBCAM OPENS IT, and opening a webcam turns its indicator light on. Software
-            that switches on the laptop camera the moment it launches, without being asked, is
-            software nobody should have to trust. The operator presses Refresh; that is the ask.
-          * it costs over a second, on the thread that draws the window.
+        `include_uvc=False` still looks only for the rig camera, which is handle-free and safe to
+        call during a run.
 
+        `FLYGYM_NO_CAMERA_SCAN=1` switches enumeration off entirely; the test suite sets it.
         `blocking=True` is for tests, which want the answer without an event loop.
         """
+        if self._lister is None and os.environ.get("FLYGYM_NO_CAMERA_SCAN"):
+            # SET BY THE TEST SUITE, and it guards REAL enumeration only -- a test that injected
+            # its own `lister` is asking for that fake to run, and is touching no hardware. Scoping
+            # the guard this way is what lets the suite forbid device access globally while the
+            # picker's own behaviour stays fully tested.
+            self._say("camera scanning is switched off (FLYGYM_NO_CAMERA_SCAN)")
+            return
         if self._loading:
             return
         self._loading = True

@@ -484,3 +484,51 @@ def test_a_missing_sdk_names_every_folder_it_tried(monkeypatch, tmp_path):
     assert "was not found" in message
     assert "nowhere" in message and "also-nowhere" in message
     assert "MVS_PYTHON_SDK" in message
+
+
+def test_the_startup_scan_offers_every_camera_not_just_the_rig_one(qapp, tmp_path):
+    """THE RIG OWNER'S CALL: "let the user choose a camera from all the enumerated cameras". A
+    picker offering a choice from a list missing half the machine's cameras is not offering a
+    choice -- and the operator who reaches this screen is usually there because a camera is
+    already missing."""
+    from flygym_tracker.config import load_config
+    from flygym_tracker.gui import gui_state
+    from flygym_tracker.gui.main_window import MainWindow
+
+    asked = {}
+    win = MainWindow(config=load_config(), config_path=str(tmp_path / "c.yaml"),
+                     state=gui_state.default_state(), root=str(tmp_path),
+                     camera_factory=lambda: None, confirm=lambda t: True)
+    try:
+        win.session_bar.camera_picker.refresh = (
+            lambda blocking=False, include_uvc=True: asked.update(include_uvc=include_uvc))
+        win.take_initial_focus()
+        assert asked.get("include_uvc") is True, "startup did not look for every camera"
+    finally:
+        win.run.shutdown()
+        win.session.shutdown()
+
+
+def test_a_test_run_never_opens_a_real_camera(qapp, monkeypatch):
+    """FLYGYM_NO_CAMERA_SCAN, set by conftest. Discovering a webcam means OPENING it, and several
+    hundred window constructions each probing real devices would be slow, dependent on whatever is
+    plugged in, and would flick the machine's camera light on throughout the run."""
+    import os
+
+    monkeypatch.setenv("FLYGYM_NO_CAMERA_SCAN", "1")
+    touched = []
+    picker = CameraPicker()                      # no injected lister -> would enumerate for real
+    monkeypatch.setattr("flygym_tracker.frame_source.list_cameras_with_error",
+                        lambda **k: touched.append(True) or ([], None))
+    picker.refresh(blocking=True)
+    assert not touched, "a test run reached the real camera enumeration"
+    assert "switched off" in picker.note.text()
+
+
+def test_the_guard_does_not_disable_an_injected_fake(qapp, monkeypatch):
+    """Scoped to REAL enumeration only, which is what lets the suite forbid device access globally
+    while every behaviour of this widget stays tested."""
+    monkeypatch.setenv("FLYGYM_NO_CAMERA_SCAN", "1")
+    picker = CameraPicker(lister=lambda: _cameras("AAA111"))
+    picker.refresh(blocking=True)
+    assert any("AAA111" in picker.combo.itemText(i) for i in range(picker.combo.count()))

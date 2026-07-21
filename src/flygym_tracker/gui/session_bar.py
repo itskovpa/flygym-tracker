@@ -339,13 +339,19 @@ class SessionBar(QWidget):
         """
         self.camera_picker.set_serial(serial)
 
-    def refresh_cameras(self, include_uvc: bool = False) -> None:
-        """Look for the rig camera. Opens nothing, so it is safe at any time, including mid-run.
+    def refresh_cameras(self, include_uvc: bool = True) -> None:
+        """Look for EVERY camera on the machine, so the operator can choose from all of them.
 
-        WEBCAMS ARE NOT INCLUDED BY DEFAULT, and that is a privacy decision rather than a
-        performance one: the only way to discover a webcam is to open it, and opening one lights
-        its indicator. Software that switches the laptop camera on at launch without being asked is
-        software nobody should have to trust. The Refresh button in the picker asks for them.
+        INCLUDING WEBCAMS, BY DEFAULT, AT STARTUP. This was rig-camera-only for a while on the
+        reasoning that discovering a webcam means briefly opening it, which lights its indicator --
+        so the app should not do that unasked. The rig owner's call overrides that: a picker
+        offering a choice from a list that is missing half the machine's cameras is not offering a
+        choice, and the operator reaching this screen is usually reaching it because a camera is
+        already missing. The brief open is documented on the Refresh button's tooltip instead.
+
+        `FLYGYM_NO_CAMERA_SCAN=1` suppresses it entirely, which is what the test suite sets: a test
+        run must never open the developer's own camera, and hundreds of window constructions each
+        probing real devices is both slow and a source of flakiness.
         """
         self.camera_picker.refresh(include_uvc=include_uvc)
 
