@@ -78,6 +78,25 @@ def camera_factory_from_config(config):
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # CRASH LOGGING ON, FIRST, before anything that could crash. Every build writes a per-session
+    # log to the user's data folder; on a native fault `faulthandler` prints each thread's stack
+    # into it. This is what turns "it closed itself on the other PC" into a file to send back.
+    # It never raises -- see `diagnostics.install`.
+    try:
+        from flygym_tracker import __version__
+        from flygym_tracker import diagnostics
+
+        diagnostics.install(__version__)
+    except Exception:
+        pass
+
+    # OPENCV SINGLE-THREADED, before any cv2 call. See `cv_setup`: calling OpenCV from the
+    # tracking workers, the pipeline and the recorder at once oversubscribed OpenCV's own internal
+    # pool and corrupted its allocator -- the heap-corruption crash the diagnostics above caught.
+    from flygym_tracker.cv_setup import configure_opencv
+
+    configure_opencv()
+
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication, QMessageBox
@@ -129,7 +148,41 @@ def main(argv: Optional[list] = None) -> int:
     # AFTER show(): Qt auto-focuses the first focusable widget when the window is shown, and
     # measured, that is the first settings spinbox. See `main_window`.
     window.take_initial_focus()
+
+    # THE LAST RUN DID NOT SHUT DOWN CLEANLY -> offer to package the report. This is the whole
+    # point of the diagnostics: the operator does not have to know where the logs are or how to
+    # zip them, they answer one question and get a single file on their Desktop to send.
+    _offer_crash_report(window)
+
     return app.exec()
+
+
+def _offer_crash_report(window) -> None:
+    try:
+        from flygym_tracker import diagnostics
+
+        crashed = diagnostics.previous_session_crashed()
+        if not crashed:
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        answer = QMessageBox.question(
+            window, "The last session did not close normally",
+            "FlyGym Tracker's previous session ended unexpectedly.\n\n"
+            "Save a diagnostics report to your Desktop? It gathers the crash logs and this "
+            "computer's details into one file you can send for troubleshooting. It contains no "
+            "experiment data.",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel)
+        if answer == QMessageBox.StandardButton.Save:
+            path = diagnostics.collect_report()
+            if path:
+                QMessageBox.information(window, "Diagnostics saved",
+                                       "Saved to:\n%s\n\nAttach this file to your report." % path)
+            else:
+                QMessageBox.warning(window, "Could not save the report",
+                                    "The logs are in your FlyGym Tracker data folder under 'logs'.")
+    except Exception:
+        pass                          # diagnostics must never be the reason the app fails to open
 
 
 def _load(path: str):

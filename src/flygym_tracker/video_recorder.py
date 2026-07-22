@@ -53,6 +53,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from flygym_tracker.cv_setup import CV_LOCK
+
 #: How many frames may be waiting to encode. Deep enough to ride out a disk hiccup, shallow enough
 #: that a sustained shortfall is visible as drops within a second or two rather than as gigabytes
 #: of RAM. At 1280x1024 grayscale this caps the queue's memory at about 21 MB.
@@ -254,17 +256,22 @@ class VideoRecorder:
     def _write(self, image: np.ndarray, elapsed_s: float) -> None:
         if self._writer is None:
             return
-        frame = image
-        if frame.shape[1] != self.frame_size[0] or frame.shape[0] != self.frame_size[1]:
-            # INTER_AREA for downscaling: it averages the pixels it removes rather than sampling
-            # one of them, which is what keeps a fly a few pixels across from disappearing between
-            # frames as it moves.
-            frame = cv2.resize(frame, self.frame_size, interpolation=cv2.INTER_AREA)
-        if not self._grayscale and frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        elif self._grayscale and frame.ndim == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self._writer.write(frame)
+        # SERIALIZED AGAINST THE TRACKING WORKERS AND THE ROTATION DETECTOR. This runs on the
+        # recorder's own thread; `resize`, `cvtColor` and especially `VideoWriter.write` are OpenCV,
+        # and VideoWriter in particular is not safe to run beside other OpenCV calls on this build.
+        # CV_LOCK keeps it out of OpenCV while anything else is inside it. See `cv_setup.CV_LOCK`.
+        with CV_LOCK:
+            frame = image
+            if frame.shape[1] != self.frame_size[0] or frame.shape[0] != self.frame_size[1]:
+                # INTER_AREA for downscaling: it averages the pixels it removes rather than sampling
+                # one of them, which keeps a fly a few pixels across from disappearing between
+                # frames as it moves.
+                frame = cv2.resize(frame, self.frame_size, interpolation=cv2.INTER_AREA)
+            if not self._grayscale and frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif self._grayscale and frame.ndim == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self._writer.write(frame)
         self.frames_written += 1
         if self._stamp_writer is not None:
             self._stamp_writer.writerow([self.frames_written - 1, "%.4f" % elapsed_s])

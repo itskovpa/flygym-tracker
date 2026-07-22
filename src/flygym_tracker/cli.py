@@ -1310,6 +1310,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list] = None) -> int:
+    # OpenCV single-threaded for every CLI path too -- see `cv_setup`.
+    from flygym_tracker.cv_setup import configure_opencv
+
+    configure_opencv()
+
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = getattr(args, "handler", None)

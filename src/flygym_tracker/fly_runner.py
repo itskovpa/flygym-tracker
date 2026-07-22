@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from flygym_tracker.cv_setup import CV_LOCK
 from flygym_tracker.fly_tracking import DetectParams, VialTracker, summarize
 
 #: Frames a worker may fall behind before `submit` starts dropping. Small on purpose: a deep queue
@@ -173,7 +174,13 @@ class _Worker(threading.Thread):
                 tracker = VialTracker(params=self._params, fps=self._fps)
                 self._trackers[gvid] = tracker
             try:
-                tracker.update(gray, mask, axis, t=t)
+                # SERIALIZED AGAINST EVERY OTHER OpenCV CALLER. `tracker.update` runs the whole
+                # per-vial detection (medianBlur, connectedComponents, ...), and holding CV_LOCK
+                # around it is what keeps this worker, the OTHER worker, the rotation detector and
+                # the video recorder from being inside OpenCV at the same instant -- the concurrency
+                # that was corrupting the allocator and crashing the app. See `cv_setup.CV_LOCK`.
+                with CV_LOCK:
+                    tracker.update(gray, mask, axis, t=t)
             except Exception:
                 # ONE VIAL'S FAILURE IS NOT THE RUN'S. Counted so it can be reported; a raise here
                 # would take the worker thread down and stop tracking every vial it owns, silently.

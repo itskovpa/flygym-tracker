@@ -26,6 +26,12 @@ config/*.local.yaml
 packaging/dist/
 packaging/build/
 
+# Diagnostic output written at runtime by `diagnostics.py` (session logs) and `debug_run.py`
+# (the crash-watch harness). These are a record of one machine's runs, regenerated every launch --
+# never the project's, exactly like the ignored gui_state/output above.
+logs/
+packaging/debug_crash*.log
+
 # `python -m build` output. It is a full copy of src/, and committing it means two versions of
 # every module in the repo -- the stale one wins in a grep and nobody notices.
 build/
