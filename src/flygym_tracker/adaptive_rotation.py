@@ -56,6 +56,7 @@ from typing import Deque, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from flygym_tracker.cv_setup import CV_LOCK
 from flygym_tracker.types import TrackState
 
 
@@ -251,9 +252,14 @@ class AdaptiveRotationDetector:
             return self.state
 
         prev = self._prev_frame
-        window = self._window_for(frame_gray)
-        disp, dx, dy, response = self.displacement(frame_gray, prev, window)
-        mean_diff = self.metric(frame_gray, prev, self.roi_mask)  # secondary cue (magnitude)
+        # SERIALIZED AGAINST THE TRACKING WORKERS AND THE RECORDER. This runs on the pipeline
+        # thread every frame; `_window_for`, `displacement` and `metric` are all OpenCV, and
+        # holding CV_LOCK across them keeps the run thread out of OpenCV while a tracking worker or
+        # the recorder is inside it. See `cv_setup.CV_LOCK`.
+        with CV_LOCK:
+            window = self._window_for(frame_gray)
+            disp, dx, dy, response = self.displacement(frame_gray, prev, window)
+            mean_diff = self.metric(frame_gray, prev, self.roi_mask)  # secondary cue (magnitude)
         self._prev_frame = frame_gray
         self._vec_buf.append((dx, dy))
 

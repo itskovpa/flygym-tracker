@@ -95,6 +95,14 @@ def _to_bool_mask(mask: np.ndarray) -> np.ndarray:
     return m if m.dtype == bool else (m > 0)
 
 
+def _as_float(value):
+    """`float(value)` or None -- for live diagnostics that may be absent on some detector types."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt_setting(value) -> str:
     """A setting value for the `setting_change` event detail: readable, and never in exponent form.
 
@@ -315,6 +323,13 @@ class TrackerPipeline:
         self._prev_stationary: Optional[np.ndarray] = None
         self._prev_state: Optional[TrackState] = None
 
+        # Rotation ROI: whole-frame (validated default) vs the marker band only. Fully set inside the
+        # adaptive branch below; defaulted here so the fixed-threshold path and any observer reading
+        # `_rotation_roi` always find them.
+        self._rotation_roi = "full"        # human-readable label for the readout / diagnostics
+        self._rotation_roi_mode = False    # True = measure rotation from the marker band only
+        self._band_roi_located = False     # has a band ROI been located and applied to the detector
+
         if self.detector_mode == "adaptive":
             try:
                 sensitivity = float(config.rotation.sensitivity)
@@ -331,10 +346,35 @@ class TrackerPipeline:
                     extra["min_consistency"] = float(config.rotation.min_consistency)
             except Exception:
                 pass
-            # whole-frame displacement (roi_mask=None) is the validated configuration; the rigid
-            # structure dominates the phase correlation regardless of which face is presented.
+            # WHERE THE ROTATION SIGNAL IS MEASURED FROM. Whole-frame (roi_mask=None) is the
+            # validated default and works when the tubes are near-empty: the rigid drum dominates
+            # the phase correlation. But at high fly density -- 30 flies per vial churning -- their
+            # collective motion pollutes a whole-frame estimate and gets misread as the drum
+            # turning, wiping the tracks. `rotation.roi: marker_band` measures instead from the
+            # marker strip: rigid drum structure, strong contrast, and NO flies, so nothing inside
+            # the tubes can fake a rotation. Falls back to whole-frame if the band rows are unknown.
+            try:
+                roi_choice = str(config.rotation.roi or "full").lower()
+            except Exception:
+                roi_choice = "full"       # older config without the key -> validated whole frame
+            band_mask = None
+            self._rotation_roi_mode = roi_choice in ("marker_band", "band", "marker")
+            if self._rotation_roi_mode:
+                # Prefer a calibrated FIXED band (stored `band_rows`). If there is none -- this rig's
+                # calibration auto-locates the band per frame instead of storing it -- start
+                # whole-frame and let the band be found LIVE from the marker detector at each dwell
+                # (`_refresh_rotation_band_roi`). That way a fresh run is never WORSE than whole-frame
+                # while the band is still unknown, and switches to band-only the moment it is located.
+                band_mask = self._marker_band_roi_mask(marker_detector)
+                if band_mask is not None:
+                    self._band_roi_located = True
+                    self._rotation_roi = "marker_band"
+                else:
+                    self._rotation_roi = "marker_band (locating)"
+            else:
+                self._rotation_roi = "full"
             self.rotation = AdaptiveRotationDetector(
-                roi_mask=None,
+                roi_mask=band_mask,
                 debounce_frames=debounce,
                 min_stationary_frames=min_stationary,
                 sensitivity=sensitivity,
@@ -446,8 +486,96 @@ class TrackerPipeline:
             "n_rotations": self.n_rotations,
             "fps_est": fps_est,
             "pixel_threshold": self.pixel_threshold,
+            # THE LIVE ROTATION SIGNAL, so a fake rotation is VISIBLE as it happens rather than only
+            # as a count that already ticked. `disp` is the per-frame displacement the whole
+            # decision rests on and `enter` is the line it must cross; watching `disp` sit just
+            # under `enter` and then jump with no drum flip is how the operator SEES the detector
+            # being fooled by fly motion at high density. `None` on a detector that has no such
+            # signal (the fixed-threshold one), which the readout renders as "n/a" rather than 0.
+            "rotation": self._rotation_signal(),
+            # WHERE that signal is measured from, so the readout can show "band" vs "full" and the
+            # operator can confirm the marker-band ROI actually engaged (it starts "locating" until
+            # the band is first found). A label, never a measurement.
+            "rotation_roi": self._rotation_roi,
         }
         self._notify(self._observers, payload)
+
+    def _marker_band_roi_mask(self, marker_detector):
+        """A full-frame bool mask over the marker-band rows, for the rotation detector's ROI.
+
+        The marker band is rigid drum structure, high-contrast, and FLY-FREE -- the ideal region to
+        measure drum rotation from, because flies inside the tubes never enter it and so cannot fake
+        a rotation. `band_rows` is an inclusive ``(row0, row1)`` the marker detector already carries
+        when the band was calibrated (drawn or auto-located and saved).
+
+        Returns None when the band rows are not known -- an uncalibrated band, or a detector that is
+        not the marker-band kind -- and the caller falls back to the whole frame rather than a mask
+        of the wrong region, which would measure rotation from nothing.
+        """
+        rows = getattr(marker_detector, "band_rows", None)
+        if not rows:
+            return None
+        try:
+            r0, r1 = int(rows[0]), int(rows[1])
+            h = int(self.calibration.image_height)
+            w = int(self.calibration.image_width)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        r0 = max(0, min(r0, h - 1))
+        r1 = max(r0 + 1, min(r1 + 1, h))       # inclusive (row0, row1) -> half-open slice
+        mask = np.zeros((h, w), dtype=bool)
+        mask[r0:r1, :] = True
+        return mask
+
+    def _refresh_rotation_band_roi(self, gray: np.ndarray) -> None:
+        """Locate the marker band in `gray` and point the rotation detector's ROI at it.
+
+        This is the auto-location path for a calibration that stores no fixed `band_rows` (the band
+        is re-found every frame for face-ID). The marker band is the drum's central rotation axis --
+        rigid, high-contrast, and FLY-FREE -- so a rotation signal taken from it alone cannot be
+        faked by flies churning inside the tubes.
+
+        WHEN it runs matters: only on a still, cleanly-lit band (a dwell, or the initial quiet
+        frames), never mid-rotation, because the sticker pattern is morphing then and the located
+        rows would be wrong. On this rig the band is fixed hardware, so one good location holds for
+        the whole run; it is nonetheless refreshed each dwell so nudging the camera self-corrects.
+
+        Runs on the pipeline thread -- the same thread that calls `rotation.update` -- so swapping
+        `roi_mask` here races with nothing. The mask is built to the ACTUAL frame shape, so it can
+        never mismatch the frames phaseCorrelate is given. A frame with no findable band is a no-op:
+        the previous ROI (band or whole-frame) simply stands.
+        """
+        find = getattr(self.marker_detector, "find_strips", None)
+        if find is None:
+            return
+        try:
+            strips = find(gray)
+        except Exception:
+            return
+        if not strips:
+            return
+        try:
+            r0 = min(int(s[0]) for s in strips)
+            r1 = max(int(s[1]) for s in strips)
+            h, w = int(gray.shape[0]), int(gray.shape[1])
+        except (TypeError, ValueError, IndexError, AttributeError):
+            return
+        r0 = max(0, min(r0, h - 1))
+        r1 = max(r0 + 1, min(r1 + 1, h))            # inclusive strip bounds -> half-open slice
+        mask = np.zeros((h, w), dtype=bool)
+        mask[r0:r1, :] = True
+        self.rotation.roi_mask = mask               # read fresh by the next update() -> takes effect
+        self._band_roi_located = True
+        self._rotation_roi = "marker_band rows=%d-%d" % (r0, r1 - 1)
+
+    def _rotation_signal(self) -> dict:
+        """The rotation detector's live diagnostics, or empty values for a detector without them."""
+        det = self.rotation
+        return {
+            "disp": _as_float(getattr(det, "last_disp", None)),
+            "enter": _as_float(getattr(det, "enter_threshold", None)),
+            "consistency": _as_float(getattr(det, "last_consistency", None)),
+        }
 
     # ---- live settings ------------------------------------------------------------------------
     #
@@ -737,6 +865,13 @@ class TrackerPipeline:
         `stop_flag` may be a callable ``() -> bool``, a ``threading.Event`` (``.is_set()``), or any
         truthy/falsey object; it is checked once per iteration for a graceful stop.
         """
+        # OPENCV SINGLE-THREADED before the tracking workers start calling it in parallel. Done
+        # here as well as at the GUI entry point so a headless run, a replay, or a test gets the
+        # same protection -- see `cv_setup` for the heap-corruption crash this prevents.
+        from flygym_tracker.cv_setup import configure_opencv
+
+        configure_opencv()
+
         self.source.open()
         try:
             fps = float(self.source.fps)
@@ -952,6 +1087,13 @@ class TrackerPipeline:
         if self._wall_start is None:
             self._init_clock(frame)
 
+        # Marker-band ROI: find the band as soon as a still frame allows, so band-only rotation is in
+        # force from near the first frame rather than only after the first flip. Skipped mid-rotation
+        # (band pattern morphing) and once already located; per-dwell refresh happens in `_handle_onset`.
+        if (self._rotation_roi_mode and not self._band_roi_located
+                and self._prev_state != TrackState.ROTATING):
+            self._refresh_rotation_band_roi(gray)
+
         state = self.rotation.update(gray)
         elapsed_s = self._elapsed(frame)
         self._last_elapsed = elapsed_s
@@ -1029,6 +1171,12 @@ class TrackerPipeline:
         it keeps the last confidently identified one, or, before there has been one, attributes
         nothing at all (see `_face_for_failed_id`).
         """
+        # The drum has just settled: the band is still and cleanly lit -- the best moment to (re)locate
+        # it for the rotation ROI. Done regardless of whether face-ID below succeeds; they are
+        # independent (the band's ROWS don't depend on which face is showing).
+        if self._rotation_roi_mode:
+            self._refresh_rotation_band_roi(gray)
+
         face = None
         if self.marker_detector is not None:
             try:

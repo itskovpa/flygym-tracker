@@ -191,10 +191,46 @@ class RunPanel(QWidget):
         """Render one throttled snapshot. Every figure here was counted by the pipeline."""
         elapsed = float(payload.get("elapsed_s") or 0.0)
         self.readout.setText(
-            "%s   %d frames   %.1f fps   %d rot   face %s" % (
+            "%s   %d frames   %.1f fps   %d rot   face %s%s" % (
                 _hms(elapsed), int(payload.get("frames") or 0),
                 float(payload.get("fps_est") or 0.0), int(payload.get("n_rotations") or 0),
-                payload.get("face") or "?"))
+                payload.get("face") or "?", _rotation_readout(payload)))
+
+
+def _rotation_readout(payload: dict) -> str:
+    """"   rot-signal 0.14 / 0.20 STATIONARY" -- the LIVE rotation signal beside its trip line.
+
+    THE POINT IS TO MAKE A FAKE ROTATION VISIBLE. The count says a rotation HAPPENED; this says how
+    close the detector is to calling one right now: `disp` is the per-frame displacement the whole
+    decision rests on, and the second number is the threshold it must cross. Watching `disp` sit
+    just under the line and then jump while the drum is still is how the operator SEES fly motion
+    being misread as rotation -- which is exactly what this readout was asked for.
+
+    Rendered only when the detector actually produces the signal (the adaptive one does; the
+    fixed-threshold one does not), so it is never a fake 0.
+    """
+    rot = payload.get("rotation") or {}
+    disp = rot.get("disp")
+    enter = rot.get("enter")
+    if disp is None or enter is None:
+        return ""
+    flag = "ROTATING" if float(disp) >= float(enter) else "stationary"
+    return "   rot-signal %.3f / %.3f %s%s" % (
+        float(disp), float(enter), flag, _roi_tag(payload.get("rotation_roi")))
+
+
+def _roi_tag(roi) -> str:
+    """" · band 485-594" / " · band?" / " · full" -- where the rotation signal is measured, so the
+    operator can see the marker-band ROI is engaged (or still locating) rather than guess. Empty
+    when the pipeline sent no label (older run) so the readout is unchanged for it."""
+    if not roi:
+        return ""
+    roi = str(roi)
+    if roi.startswith("marker_band rows="):
+        return " · band %s" % roi.split("=", 1)[1]
+    if roi.startswith("marker_band"):
+        return " · band?"          # asked for the band but still locating it
+    return " · full"
 
 
 def _state_sentence(state: str, detail: str) -> str:

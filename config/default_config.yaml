@@ -25,6 +25,11 @@ calibration:
 
 rotation:
   detector: threshold     # threshold = fixed enter/exit magnitude | adaptive = speed-independent (auto)
+  roi: full               # where the rotation signal is measured. full = whole frame (validated,
+                          #   right when the tubes are near-empty). marker_band = the marker strip
+                          #   only -- rigid drum, no flies -- so many flies churning inside the
+                          #   tubes cannot be misread as the drum turning. Needs a calibrated band;
+                          #   falls back to full if the band rows are unknown. adaptive mode only.
   sensitivity: 1.0        # adaptive mode only: higher = more sensitive
   min_consistency: 0.6    # adaptive mode only: how straight motion must be to count as the drum
                           # turning rather than flies milling about (0..1)
