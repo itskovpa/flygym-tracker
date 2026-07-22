@@ -60,9 +60,12 @@ PLOTTABLE = (
 
 PLOT_LABELS = dict(PLOTTABLE)
 
-#: Bin widths offered, in seconds. The smallest is below a dwell (~2 s), so "no binning" is
-#: available: every dwell keeps its own point.
-BIN_CHOICES = (1, 10, 30, 60, 300, 900)
+#: Bin widths offered for the DISPLAY, in seconds. 0 = "raw": every recorded row is its own point,
+#: nothing grouped. The sub-second choices exist to watch a fast transient -- e.g. the ~7 s post-flip
+#: startle -- but they only reveal detail the DATA already has: re-binning groups the rows that were
+#: written, it cannot invent finer ones than the RECORDING bin (`binning.bin_seconds`) produced. To
+#: see 200 ms structure the run must have been RECORDED at <= 200 ms, not just displayed at it.
+BIN_CHOICES = (0, 0.2, 0.5, 1, 10, 30, 60, 300, 900)
 
 VIALS_PER_FACE = 16
 FACES = ("A", "B")
@@ -145,7 +148,13 @@ class BehaviourSeries:
             value = row.get(field)
             if not _is_number(value):
                 continue
-            buckets.setdefault(int(elapsed // width), []).append(float(value))
+            # `math.floor(elapsed / width + eps)`, NOT `elapsed // width`: floor division on floats
+            # puts a value that is an exact multiple of the width into the WRONG bucket, because the
+            # multiple is not exact in binary (0.4 / 0.2 == 2.0 but 0.4 // 0.2 == 1.0). At coarse bins
+            # that never showed; at a 0.2 s display bin on 0.2 s data it silently merged every other
+            # point. The epsilon is a fraction of one bin, far below any real spacing.
+            bucket = int(math.floor(elapsed / width + 1e-9))
+            buckets.setdefault(bucket, []).append(float(value))
         if not buckets:
             return []
         points = [((index + 0.5) * width, _median(values))

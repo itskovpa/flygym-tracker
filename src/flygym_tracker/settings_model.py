@@ -889,9 +889,11 @@ def build_app_settings(config) -> SettingsModel:
     bin_seconds = Setting(
         key=BIN_SECONDS_KEY, label="bin size",
         value=float(_cfg(config, "binning.bin_seconds", 60.0)),
-        lo=1.0, hi=3600.0, step=1.0, kind="float", group="Recording", unit="s",
+        lo=0.1, hi=3600.0, step=0.1, kind="float", group="Recording", unit="s",
         live=False,
-        help="how long one row of the results covers; changing it changes what a number means",
+        help="how long one row of the results covers; changing it changes what a number means. "
+             "Go sub-second (e.g. 0.2) to record a fast transient like the post-flip startle -- but "
+             "that writes ~50x more rows than 10 s, so use it for short diagnostic runs, not multi-day ones",
     )
     tracking = [s for s in base.settings if s.group != "Camera"]
     camera = [s for s in base.settings if s.group == "Camera"]

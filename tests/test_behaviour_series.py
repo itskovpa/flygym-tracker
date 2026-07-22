@@ -83,6 +83,25 @@ def test_a_window_with_nothing_measurable_produces_no_point():
     assert len(points) == 2, "the empty windows between were filled in"
 
 
+def test_an_unobserved_activity_bin_gaps_but_an_observed_zero_stays():
+    """THE FLIP-CYCLE DILUTION FIX. `pipeline._bin_to_records` now emits active_fraction_mean=None
+    for a bin whose vial had NO stationary frames -- the OTHER drum face was up, so it was not
+    observed. That must be a GAP, or each face's curve dips to the floor every time the other face
+    is showing (the periodic oscillation the operator reported). But a bin that WAS observed and
+    whose flies simply did not move is a real 0 and must stay, or a genuinely quiet vial vanishes.
+    So None gaps; 0.0 is a point on the floor."""
+    series = BehaviourSeries()
+    series.add([
+        _row(0.0, "A", 1, None, field="active_fraction_mean"),     # other face up -> unobserved
+        _row(10.0, "A", 1, 0.0, field="active_fraction_mean"),     # observed, flies still -> real 0
+        _row(20.0, "A", 1, 0.05, field="active_fraction_mean"),
+    ])
+    points = series.series("active_fraction_mean", "A", 0, bin_seconds=10.0)
+    assert len(points) == 2, "the unobserved (None) bin was not gapped, or the observed 0 was dropped"
+    assert points[0][1] == pytest.approx(0.0), "an observed zero must stay a point on the floor"
+    assert points[1][1] == pytest.approx(0.05)
+
+
 # =============================================================================================
 # Cumulative
 # =============================================================================================

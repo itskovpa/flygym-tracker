@@ -48,6 +48,12 @@ ROWS = VIALS_PER_FACE // COLUMNS
 FACE_COLORS = {"A": QColor(theme.FOCUS), "B": QColor(theme.DEFAULT_GREEN)}
 FALLBACK_COLOR = QColor(theme.TEXT_DIM)
 
+#: How many recent points a live cell may draw. `None` = all (the default, unchanged behaviour).
+#: A cap matters once the bin is small: at 200 ms a multi-minute run would otherwise pile thousands
+#: of points into a 120 px cell, which is both slow and unreadable. Older points scroll off the
+#: left; the file keeps everything, so this is purely what the LIVE plot shows.
+SAMPLE_CAPS = (None, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
+
 
 class VialPlotGrid(QWidget):
     """8x2 sparklines for one face, sharing one y range with the rest of the panel."""
@@ -205,6 +211,19 @@ class BehaviourPlotPanel(QWidget):
         self.cumulative_box.toggled.connect(self.refresh)
         controls.addWidget(self.cumulative_box)
 
+        controls.addWidget(QLabel("show"))
+        self.samples_box = QComboBox()
+        for cap in SAMPLE_CAPS:
+            self.samples_box.addItem("all" if cap is None else "last %d" % cap, cap)
+        self.samples_box.setCurrentIndex(0)          # "all" -> unchanged default behaviour
+        self.samples_box.currentIndexChanged.connect(self.refresh)
+        self.samples_box.setToolTip(
+            "Cap how many recent points each vial's LIVE plot draws. At a small bin a long run would "
+            "otherwise pile thousands of points into a tiny cell -- slow, and too dense to read. "
+            "Older points scroll off the left; the file keeps everything, so this changes only the "
+            "picture, never the data.")
+        controls.addWidget(self.samples_box)
+
         self.range_label = QLabel("")
         self.range_label.setProperty("role", "note")
         self.range_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -222,7 +241,14 @@ class BehaviourPlotPanel(QWidget):
         self.refresh()
 
     def bin_seconds(self) -> float:
-        return float(self.bin_box.currentData() or 10)
+        # NOT `currentData() or 10`: the "raw" choice's data is 0, which is falsy, and that fallback
+        # would silently turn raw into 10 s. `series()` reads 0 as "every row its own point".
+        data = self.bin_box.currentData()
+        return float(data) if data is not None else 10.0
+
+    def max_points(self) -> Optional[int]:
+        """How many recent points each cell may draw, or None for all."""
+        return self.samples_box.currentData()
 
     def cumulative(self) -> bool:
         return self.cumulative_box.isChecked()
@@ -236,8 +262,15 @@ class BehaviourPlotPanel(QWidget):
         # ONE READ of the store for the whole panel: the points every cell draws and the range
         # every cell is scaled by come from the same snapshot. See `VialPlotGrid.configure`.
         points = {face: self.series.face_series(self.field, face, **kwargs) for face in FACES}
+        cap = self.max_points()
+        if cap:
+            # Rolling window: keep only the last `cap` points per cell. The x-axis then spans what is
+            # actually drawn (below), so the window fills the cell rather than being squeezed into
+            # its right edge against a whole-run axis.
+            points = {face: {i: (pts[-cap:] if pts else pts) for i, pts in cells.items()}
+                      for face, cells in points.items()}
         value_range = _range_of(points)
-        time_range = self.series.time_range()
+        time_range = _time_range_of(points) if cap else self.series.time_range()
         shared = self.shared_scale()
         for face, grid in self.grids.items():
             grid.configure(field=self.field, value_range=value_range, time_range=time_range,
@@ -316,9 +349,27 @@ def _range_of(points_by_face) -> Optional[tuple]:
     return (low, high)
 
 
-def _bin_label(seconds: int) -> str:
+def _time_range_of(points_by_face) -> Optional[tuple]:
+    """(min t, max t) across every drawn point -- the x-axis for a capped (windowed) view, so the
+    plot spans what it is actually showing rather than the whole run behind the scroll."""
+    lo = hi = None
+    for cells in (points_by_face or {}).values():
+        for pts in (cells or {}).values():
+            for t, _v in pts or ():
+                lo = t if lo is None else min(lo, t)
+                hi = t if hi is None else max(hi, t)
+    if lo is None:
+        return None
+    return (lo, hi) if hi > lo else (lo, lo + 1.0)
+
+
+def _bin_label(seconds) -> str:
+    if seconds <= 0:
+        return "raw"
+    if seconds < 1:
+        return "%d ms" % round(seconds * 1000)      # 0.2 -> "200 ms", 0.5 -> "500 ms"
     if seconds < 60:
-        return "%d s" % seconds
+        return "%g s" % seconds                       # 1 -> "1 s", 10 -> "10 s"
     if seconds < 3600:
         return "%d min" % (seconds // 60)
     return "%d h" % (seconds // 3600)
