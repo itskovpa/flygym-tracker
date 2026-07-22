@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flygym-tracker"
-version = "0.1.0.dev6"
+version = "0.1.0.dev7"
 description = "Per-vial Drosophila locomotor-activity tracker for the FlyGym v2 IR-silhouette rig"
 requires-python = ">=3.9"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
