@@ -763,6 +763,19 @@ class VideoStage(QWidget):
         is computed on the GUI thread rather than on the one driving the SDK."""
         return
 
+    def show_notice(self, text: str) -> None:
+        """Show a message from the WINDOW's camera manager (open / failed / busy) and KEEP it.
+
+        The caption is rewritten from live camera state every tick by `_update_caption` (driven by
+        `self._timer`), so a line set on `self.caption` from OUTSIDE this widget -- as
+        `main_window._camera_failed` used to do -- vanishes within a frame the moment the refresh
+        runs. Routing it through `_notice`, which the idle branch of `_update_caption` preserves,
+        makes it stick until the next real operation (a draw/band/job, or a successful open that
+        clears it) replaces it. Empty text clears the notice.
+        """
+        self._notice = text or ""
+        self._update_caption()
+
     def _update_caption(self) -> None:
         if self._mode == DRAW and self._draw is not None:
             self.caption.setText("%s   -   %s" % (self._draw.state.source_label,

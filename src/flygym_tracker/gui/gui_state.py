@@ -70,6 +70,12 @@ DEFAULTS: Dict[str, Any] = {
     #: knobs are remembered because they are a property of the rig and the disk it writes to,
     #: settled once and not per experiment.
     "recording": {"enabled": False, "every_nth": 2, "scale": 0.5},
+    #: Whether a run tracks individual flies. True (track) is the default so an untouched install
+    #: behaves as it always has; the "activity only" tick box writes False here for crowded tubes,
+    #: where per-fly tracks are not recoverable and the freed CPU buys a steadier frame rate.
+    #: Listed HERE for the same reason as the keys above: `save_state` writes only known keys, so a
+    #: key the window sets but this table does not carry would be dropped silently on the way to disk.
+    "track_flies": True,
 }
 
 #: How many entries the config dropdown keeps. Small: this is a shortcut, not a history feature,
@@ -125,6 +131,14 @@ def _coerce(key: str, value: Any) -> Any:
         if not isinstance(value, list):
             return list(default)
         return [str(v) for v in value if isinstance(v, str) and v.strip()][:MAX_RECENT]
+    if isinstance(default, bool):
+        # BEFORE the int branch: bool is a subclass of int, so an int check would swallow it and
+        # turn False into 0. A JSON round-trip gives a real bool; a hand-edit might leave a string.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return default
     if isinstance(default, int) and not isinstance(default, bool):
         try:
             return int(value)

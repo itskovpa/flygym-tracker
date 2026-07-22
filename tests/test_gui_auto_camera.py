@@ -130,6 +130,18 @@ def test_a_camera_that_refuses_says_so_rather_than_leaving_the_job_pending(qapp,
     assert "draw the vial positions" in text, "the message does not name the job that wanted it"
 
 
+def test_a_camera_notice_survives_the_periodic_caption_refresh(qapp, window):
+    """REGRESSION. The stage rewrites its caption from live camera state every tick, so a message
+    the window poked straight into `caption` -- 'could not open the camera' -- vanished within a
+    frame; adding a menu bar (whose deferred layout runs one more refresh) was enough to expose it.
+    Routed through `show_notice`, the refresh -- simulated here by the `_update_caption` the stage's
+    own timer calls -- must KEEP it."""
+    window.stage.show_notice("could not open the camera to draw the vial positions: busy")
+    window.stage._update_caption()          # the tick that used to wipe an externally-set caption
+    assert "could not open the camera" in window.stage.caption.text()
+    assert "draw the vial positions" in window.stage.caption.text()
+
+
 def test_a_running_experiment_keeps_the_camera_and_the_job_says_why(qapp, window):
     """Stopping the run to draw vials would end an experiment in order to change its calibration,
     and opening a second handle would fail with the SDK's culprit-free error."""

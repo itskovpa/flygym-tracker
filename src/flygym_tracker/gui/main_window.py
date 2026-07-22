@@ -115,8 +115,54 @@ class MainWindow(QMainWindow):
         self.behaviour = BehaviourSeries()
         self._plot_docks = {}
         self._build()
+        self._build_help_menu()
         self._connect()
         self.refresh_readiness()
+
+    def _build_help_menu(self) -> None:
+        """A Help menu whose one real job is to hand support a single file.
+
+        The crash report is offered automatically after a crash, but an operator also wants to send
+        it on request -- "it is behaving oddly", or to report the environment before a crash ever
+        happens. This is that door, and it is discoverable where every Windows app keeps it.
+        """
+        from PySide6.QtGui import QAction
+
+        menu = self.menuBar().addMenu("&Help")
+        save = QAction("Save diagnostics report...", self)
+        save.triggered.connect(self._save_diagnostics)
+        menu.addAction(save)
+        open_logs = QAction("Open logs folder", self)
+        open_logs.triggered.connect(self._open_logs_folder)
+        menu.addAction(open_logs)
+
+    def _save_diagnostics(self) -> None:
+        from flygym_tracker import diagnostics
+
+        path = diagnostics.collect_report()
+        if path:
+            QMessageBox.information(self, "Diagnostics saved",
+                                    "Saved to:\n%s\n\nAttach this file to your report." % path)
+        else:
+            QMessageBox.warning(self, "Could not save the report",
+                                "Could not write the report. The logs are in your FlyGym Tracker "
+                                "data folder, under 'logs'.")
+
+    def _open_logs_folder(self) -> None:
+        import os
+        import subprocess
+
+        from flygym_tracker import diagnostics
+
+        folder = str(diagnostics.log_dir())
+        try:
+            os.makedirs(folder, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(folder)                      # noqa: S606 - the app's own data folder
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not open the folder", "%s\n\n%s" % (folder, exc))
 
     # -- construction --------------------------------------------------------------------------
     def _build(self) -> None:
@@ -132,6 +178,7 @@ class MainWindow(QMainWindow):
         self.session_bar.set_camera_identity(
             _cfg(self.config, "source.camera.serial"), _cfg(self.config, "source.camera.index"))
         self.session_bar.set_recording_settings(self.state.get("recording"))
+        self.session_bar.set_tracking(self.state.get("track_flies", True))
         layout.addWidget(self.session_bar)
 
         # THE SETTINGS ARE A DOCK, NOT A COLUMN, and that is a screen-space decision the rig owner
@@ -267,6 +314,7 @@ class MainWindow(QMainWindow):
         self.session_bar.calib_changed.connect(self._on_calib_changed)
         self.session_bar.output_changed.connect(self._on_output_changed)
         self.session_bar.recording_changed.connect(self._on_recording_changed)
+        self.session_bar.tracking_changed.connect(self._on_tracking_changed)
         self.session_bar.camera_serial_changed.connect(self._on_camera_serial_changed)
         self.readiness_strip.fix_requested.connect(self._on_fix)
 
@@ -490,6 +538,13 @@ class MainWindow(QMainWindow):
         self.state["recording"] = dict(settings or {})
         gui_state.save_state(self.root, self.state)
 
+    def _on_tracking_changed(self, track_flies: bool) -> None:
+        """Remember whether to track individual flies. Like recording, it reaches a run only at
+        Start -- switching tracking on or off mid-run would change what the CSV means partway
+        through, with nothing in the file marking where."""
+        self.state["track_flies"] = bool(track_flies)
+        gui_state.save_state(self.root, self.state)
+
     def _on_camera_serial_changed(self, serial) -> None:
         """Write the chosen camera into THIS MACHINE'S config layer, and say what happened.
 
@@ -603,6 +658,9 @@ class MainWindow(QMainWindow):
             # OFF UNLESS THE TICK BOX SAYS OTHERWISE. Read here rather than held as window state so
             # what is recorded is what the box showed at the moment Start was pressed.
             "recording": self.session_bar.recording_settings(),
+            # Track individual flies (default) or measure activity only. Read at Start for the same
+            # reason as recording -- it fixes what the whole run's data means, so it is settled once.
+            "track_flies": self.session_bar.track_flies(),
         }
         self.results.clear()
         self.behaviour.clear()
@@ -871,6 +929,7 @@ class MainWindow(QMainWindow):
     def _camera_ready(self) -> None:
         """The camera reached STREAMING. Run whatever was waiting for it."""
         self._camera_timer.stop()
+        self.stage.show_notice("")            # a prior "could not open..." is history now
         then, self._camera_then = self._camera_then, None
         if then is not None:
             then()
@@ -881,7 +940,10 @@ class MainWindow(QMainWindow):
         why, self._camera_then, self._camera_why = self._camera_why, None, ""
         if not why:
             return
-        self.stage.caption.setText(
+        # Through the stage's NOTICE, not `caption` directly: the caption is rewritten from live
+        # camera state every tick, so a line poked straight in vanishes within a frame. See
+        # `video_stage.show_notice` -- this is the "could not open the camera" message disappearing.
+        self.stage.show_notice(
             "could not open the camera to %s: %s   -   try Free the camera..." % (why, detail))
         self.refresh_readiness()
 

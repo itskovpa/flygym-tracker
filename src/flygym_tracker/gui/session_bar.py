@@ -81,6 +81,8 @@ class SessionBar(QWidget):
     output_changed = Signal(str)
     #: The video-recording choice changed. Carried as a dict so the window can save it verbatim.
     recording_changed = Signal(dict)
+    #: Whether to track individual flies changed. True = track (default); False = activity only.
+    tracking_changed = Signal(bool)
     #: A different physical camera was chosen. `None` means "use whatever is attached".
     camera_serial_changed = Signal(object)
 
@@ -181,6 +183,12 @@ class SessionBar(QWidget):
         # would be reachable mid-run, which is the one time it must not move.
         layout.addWidget(_label("record video"), 4, 0)
         layout.addWidget(self._build_recording_row(), 4, 1, 1, 2)
+
+        # WHAT IS MEASURED, which is why it sits with the experiment paths and not the live
+        # controls: like recording, it is chosen once at the start and reachable mid-run would be a
+        # trap. Off (tracking on) by default so an untouched run behaves exactly as before.
+        layout.addWidget(_label("fly tracking"), 5, 0)
+        layout.addWidget(self._build_tracking_row(), 5, 1, 1, 2)
 
         layout.setColumnStretch(1, 1)
         self._refresh_summary()
@@ -297,6 +305,52 @@ class SessionBar(QWidget):
     def set_recording_status(self, text: str) -> None:
         """Live counts from the running recorder, shown where the settings are."""
         self.record_note.setText(text or "")
+
+    # -- fly tracking on/off -----------------------------------------------------------------
+    def _build_tracking_row(self) -> QWidget:
+        """A single tick box that turns OFF per-fly tracking, leaving activity monitoring only.
+
+        OFF BY DEFAULT (so flies ARE tracked), because that is the behaviour every existing run
+        already has and the default must not change silently under anyone. Ticking it drops the
+        two fly-tracking worker threads: at ~30 flies per vial the individual tracks cannot be told
+        apart anyway, so the honest, cheaper run is per-vial activity + climbing height, and the
+        freed CPU holds the frame rate steadier. Per-vial activity and rotation are untouched.
+
+        A FlowLayout for the same reason the recording row uses one: a strip of controls whose
+        QHBoxLayout minimum width would push the window past the rig laptop's screen.
+        """
+        row = QWidget()
+        line = FlowLayout(row, spacing=8)
+        self.activity_only_box = QCheckBox("activity only — don't track individual flies")
+        self.activity_only_box.setChecked(False)
+        self.activity_only_box.setToolTip(
+            "Measure per-vial activity and climbing height only, and skip tracking individual "
+            "flies.\n\nOff by default (flies are tracked). Tick it for crowded tubes -- at ~30 "
+            "flies per vial the individual tracks are not recoverable, so this drops the two "
+            "tracking threads to hold a steadier frame rate. Activity and rotation are unaffected.")
+        self.activity_only_box.toggled.connect(self._on_tracking_toggled)
+        line.addWidget(self.activity_only_box)
+
+        self.tracking_note = QLabel("")
+        self.tracking_note.setProperty("role", "note")
+        self.tracking_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        line.addWidget(self.tracking_note)
+        return row
+
+    def _on_tracking_toggled(self, activity_only: bool) -> None:
+        self.tracking_note.setText("per-fly tracking off" if activity_only else "")
+        self.tracking_changed.emit(self.track_flies())
+
+    def track_flies(self) -> bool:
+        """True = track individual flies (the default). False = activity monitoring only."""
+        return not self.activity_only_box.isChecked()
+
+    def set_tracking(self, track: bool) -> None:
+        """Restore the saved tracking choice WITHOUT re-emitting it as a fresh change."""
+        self.activity_only_box.blockSignals(True)
+        self.activity_only_box.setChecked(not bool(track))
+        self.activity_only_box.blockSignals(False)
+        self.tracking_note.setText("" if track else "per-fly tracking off")
 
     # -- collapsing --------------------------------------------------------------------------
     def set_expanded(self, expanded: bool) -> None:

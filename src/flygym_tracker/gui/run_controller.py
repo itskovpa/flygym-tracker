@@ -222,9 +222,19 @@ class RunWorker(QObject):
             meta={"config": config.to_dict(), "calibration_dir": plan["calib_dir"],
                   "started_from": "gui"},
         )
+        # WHETHER TO TRACK INDIVIDUAL FLIES. Normally the "activity only" tick box decides
+        # (`plan["track_flies"]`, default True). `FLYGYM_DISABLE_TRACKING=1` still forces it off as
+        # a debug bisect switch -- it was added to answer whether the heap-corruption crash came
+        # from the two parallel tracking workers calling OpenCV or from the core pipeline, and it
+        # stays as an env override that wins over the box. Either way activity, rotation and
+        # recording are unaffected -- only the two fly-tracking worker threads are dropped.
+        import os
+
+        track = bool(plan.get("track_flies", True)) and not os.environ.get("FLYGYM_DISABLE_TRACKING")
         pipeline = TrackerPipeline(
             config=config, calibration=calib, source=source, logger=logger,
-            marker_detector=_build_marker_detector(config, calib), clock="auto")
+            marker_detector=_build_marker_detector(config, calib), clock="auto",
+            track_flies=track)
         # OFF UNLESS ASKED FOR, and built from the LOGGER'S stamp so the video sits beside the
         # CSVs of the same run instead of carrying a time of its own. The file is not opened here:
         # its frame size comes from the first frame, because the config's width and height are what
@@ -286,6 +296,10 @@ class RunWorker(QObject):
             "n_rotations": int(payload.get("n_rotations") or 0),
             "fps_est": float(payload.get("fps_est") or 0.0),
             "pixel_threshold": payload.get("pixel_threshold"),
+            # The live rotation SIGNAL, for the readout that lets the operator watch a fake rotation
+            # fire. Plain floats already; passed straight through.
+            "rotation": payload.get("rotation"),
+            "rotation_roi": payload.get("rotation_roi"),
             # A shallow copy: the pipeline reuses its own dicts between frames, so handing the
             # live one across a queued signal would let the GUI read a half-written frame.
             "vial_results": dict(vial_results),
