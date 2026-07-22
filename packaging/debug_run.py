@@ -91,7 +91,7 @@ def main() -> int:
         stamp("main() raised: %r\n%s" % (exc, traceback.format_exc()))
         return 1
     finally:
-        faulthandler.dump_traceback_later(10 ** 9)   # cancel the repeating timer
+        faulthandler.cancel_dump_traceback_later()   # cancel the repeating heartbeat timer
         stamp("debug_run end")
         _log.flush()
         time.sleep(0.2)

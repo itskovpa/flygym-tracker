@@ -69,6 +69,33 @@ def _synthetic_frame():
     return frame
 
 
+def _band_frame(rows, height=1024, width=1280):
+    """A full-frame image whose two lit strips sit INSIDE `rows`, and nothing strip-like elsewhere.
+
+    SYNTHETIC ON PURPOSE, exactly like `_synthetic_frame`. The rebuild tests below used to register
+    faces from `calib_faces/overlay_%s.png`, but that overlay is a gitignored QA artefact the rig
+    owner regenerates whenever the vials are redrawn (`.gitignore`: "large, regenerable QA overlay").
+    A test that pins the detector's search window to fixed rows and then reads whatever band the
+    current overlay happens to contain goes red with no source change the moment the rig owner's band
+    lands off those rows -- or errors outright on a clean checkout, where the overlay is absent. What
+    is under test is that a drawn band survives the persist/rebuild round-trip, so the band the
+    templates are learned from should be geometry the test controls.
+    """
+    r0, r1 = int(rows[0]), int(rows[1])
+    frame = np.zeros((height, width), dtype=np.uint8)
+    span = r1 - r0
+    up0 = r0 + max(2, span // 6)
+    up1 = up0 + max(6, span // 4)
+    lo1 = r1 - max(2, span // 6)
+    lo0 = lo1 - max(6, span // 4)
+    frame[up0:up1, 120:width - 120] = 255      # upper strip
+    frame[lo0:lo1, 120:width - 120] = 255      # lower strip
+    for x in range(200, width - 200, 240):     # opaque stickers, alternating between the strips
+        frame[up0:up1, x:x + 80] = 0
+        frame[lo0:lo1, x + 120:x + 200] = 0
+    return frame
+
+
 pytestmark = pytest.mark.skipif(not os.path.isdir(BUNDLE), reason="no calibration bundle in repo")
 
 
@@ -118,16 +145,14 @@ def test_a_bundle_with_no_band_still_reads_as_none(tmp_path):
 def test_the_rebuilt_detector_uses_the_drawn_band(tmp_path):
     """Otherwise the operator draws a band and every run goes on guessing -- the failure this
     whole feature exists to remove, made invisible."""
-    import cv2
-
     from flygym_tracker.calibration import attach_face_templates
     from flygym_tracker.marker_band import MarkerBandDetector
 
     out = _bundle(tmp_path)
     rows = (416, 554)
     detector = MarkerBandDetector(band_rows=rows)
+    image = _band_frame(rows)                             # a band the test controls, at `rows`
     for face in ("A", "B"):
-        image = cv2.imread(os.path.join(BUNDLE, "overlay_%s.png" % face), cv2.IMREAD_GRAYSCALE)
         detector.register_face(image, face)
     attach_face_templates(out, detector)
     attach_band_rows(out, rows)
@@ -140,15 +165,13 @@ def test_the_rebuilt_detector_uses_the_drawn_band(tmp_path):
 def test_hand_picked_rows_win_over_a_stale_stored_window(tmp_path):
     """A bundle whose templates were learned BEFORE the band was drawn must still use the drawn
     band: the operator marked it on the actual rig picture, and the snapshot predates that."""
-    import cv2
-
     from flygym_tracker.calibration import attach_face_templates
     from flygym_tracker.marker_band import MarkerBandDetector
 
     out = _bundle(tmp_path)
     detector = MarkerBandDetector()                      # learned on the AUTOMATIC window
+    image = _band_frame((416, 554))                      # strips inside the 20-80% search window
     for face in ("A", "B"):
-        image = cv2.imread(os.path.join(BUNDLE, "overlay_%s.png" % face), cv2.IMREAD_GRAYSCALE)
         detector.register_face(image, face)
     attach_face_templates(out, detector)
     assert marker_detector_from_calibration(load_calibration(out)).band_rows is None
