@@ -1336,6 +1336,16 @@ class TrackerPipeline:
         for gvid in sorted(bin_obj.vials):
             vd = bin_obj.vials[gvid]
             face, vial = self._vial_meta[gvid]
+            n_stat = int(vd["n_stationary_frames"])
+            # UNOBSERVED IS NOT ZERO. A vial with no STATIONARY frames in this bin was not measured:
+            # the drum was showing the OTHER drum face, or rotating away (those frames are credited
+            # to the outgoing face only to keep n_rotating_frames/lit_area, see `_rotating_placeholder`).
+            # Emitting activity 0 there makes each face's curve dip to the floor every time the other
+            # face is up -- a periodic artefact -- and dilutes any average over bins. None is a GAP,
+            # the same way behaviour.csv already records an unobserved tracking metric as nan and
+            # `BehaviourSeries` drops it rather than plotting a dip. n_rotating_frames and lit_area_px
+            # stay because they ARE defined, so a bin straddling a rotation is still interpretable.
+            observed = n_stat > 0
             records.append(ActivityRecord(
                 run_id=self.run_id,
                 bin_start_iso=bin_start_iso,
@@ -1346,10 +1356,10 @@ class TrackerPipeline:
                 row=int(vial.row),
                 col=int(vial.col),
                 present=bool(vial.present),
-                n_stationary_frames=int(vd["n_stationary_frames"]),
+                n_stationary_frames=n_stat,
                 n_rotating_frames=int(vd["n_rotating_frames"]),
-                motion_px_sum=int(vd["motion_px_sum"]),
-                active_fraction_mean=float(vd["active_fraction_mean"]),
+                motion_px_sum=int(vd["motion_px_sum"]) if observed else None,
+                active_fraction_mean=float(vd["active_fraction_mean"]) if observed else None,
                 lit_area_px=int(vd["lit_area_px"]),
             ))
         return records

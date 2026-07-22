@@ -197,7 +197,14 @@ class ResultsPanel(QWidget):
     # -- live ------------------------------------------------------------------------------------
     def set_progress(self, payload: dict) -> None:
         """One throttled per-frame snapshot. Every figure was counted by the pipeline."""
-        self.grid.set_activity(payload.get("vial_results") or {})
+        # On a ROTATING frame the drum is mid-flip: the pipeline passes rotation placeholders
+        # (motion 0) only so the bin can count rotating frames. Drawing those as "0" makes the grid
+        # invent a reading of zero where there is none -- the very thing its own blank-vs-zero rule
+        # forbids, and the zeros the operator sees "on the flips". Blank the grid during a flip; a
+        # genuine still-fly zero on a stationary frame still shows.
+        state = str(payload.get("state") or "")
+        vial_results = {} if "ROTATING" in state else (payload.get("vial_results") or {})
+        self.grid.set_activity(vial_results)
         face = payload.get("face") or "?"
         threshold = payload.get("pixel_threshold")
         bits = ["face %s" % face, "per frame, not yet binned - not in the file"]

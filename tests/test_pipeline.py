@@ -260,10 +260,15 @@ def test_end_to_end_events_activity_and_baseline_reset(tmp_path):
     assert v1_b2["n_rotating_frames"] == 2            # idx 20,21 counted as rotating in bin 2
 
     # -- the all-rotation bin 1 is captured as rotating-only, no stationary frames -------------
+    # Motion/activity here are a GAP, not a measured zero: with zero stationary frames the vial was
+    # not observed this bin (the drum was rotating, or showing the other face). Emitting 0 made each
+    # face's curve dip to the floor every time the other face was up; None -> blank -> NaN is the
+    # honest "no measurement", and n_rotating_frames still records that the drum passed through.
     v1_b1 = _row(df, 1, BIN1_ISO)
     assert v1_b1["n_stationary_frames"] == 0
     assert v1_b1["n_rotating_frames"] == 10
-    assert v1_b1["motion_px_sum"] == 0
+    assert pd.isna(v1_b1["motion_px_sum"]), "an unobserved bin must be a gap, not a measured zero"
+    assert pd.isna(v1_b1["active_fraction_mean"])
 
 
 def test_baseline_reset_is_load_bearing(tmp_path):

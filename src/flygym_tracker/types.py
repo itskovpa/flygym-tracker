@@ -170,8 +170,11 @@ class ActivityRecord:
     present: bool
     n_stationary_frames: int
     n_rotating_frames: int
-    motion_px_sum: int
-    active_fraction_mean: float
+    #: None when the vial had NO stationary frames in the bin -- not observed this bin (the other
+    #: drum face was up, or the drum was rotating away). None is a gap, not a measured zero: it
+    #: writes blank to the CSV and `BehaviourSeries` drops it instead of plotting a dip to the floor.
+    motion_px_sum: Optional[int]
+    active_fraction_mean: Optional[float]
     lit_area_px: int
 
     def as_row(self) -> dict:

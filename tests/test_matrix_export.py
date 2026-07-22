@@ -157,11 +157,22 @@ def test_the_workbook_matches_the_csv_the_run_wrote(tmp_path):
                  [90 + 90 * i, 160], [20 + 90 * i, 160]] for i in range(3)]
 
     def frame(i):
+        # A STATIC scene with a small LOCAL flicker inside each vial. Static so the adaptive detector
+        # settles to STATIONARY (the drum is "still") and there IS observed activity to matrix; the
+        # flicker is local, so it does not shift the whole frame and read as a rotation. The old
+        # source swept a bar every frame -- 39/40 frames ROTATING, ZERO stationary frames -- so every
+        # activity cell was an unobserved bin the matrix only had numbers for because they were
+        # written as fake zeros. Now that an unobserved bin is a gap (None), that source exported
+        # nothing, which is correct; this one gives the export something real to check.
         image = np.full((H, W), 200, dtype=np.uint8)
-        image[150 - 2 * (i % 30):158 - 2 * (i % 30), 45:55] = 40
+        for k in range(3):
+            x = 45 + 90 * k
+            image[80:140, x:x + 12] = 40            # a static dark blob in each of the three vials
+            if i % 3 == 0:
+                image[80:92, x:x + 6] = 200          # a few pixels blink -> local activity signal
         return image
 
-    frames = [frame(i) for i in range(40)]
+    frames = [frame(i) for i in range(80)]
 
     class Source:
         fps = 20.0
@@ -211,7 +222,13 @@ def test_the_workbook_matches_the_csv_the_run_wrote(tmp_path):
     sheet = book["motion_px_sum"]
     times = [sheet.cell(1, c).value for c in range(2, sheet.max_column + 1)]
     labels = [sheet.cell(r, 1).value for r in range(2, sheet.max_row + 1)]
+    checked = 0
     for record in rows:
+        if not record["motion_px_sum"]:
+            # An unobserved bin (the other drum face was up, or the drum was rotating away) writes a
+            # BLANK motion_px_sum and is omitted from the matrix -- a gap, not a measured zero. There
+            # is nothing to match, so skip it rather than trying to float("") it.
+            continue
         label = vial_label(record["face"], int(record["vial_id"]))
         column = times.index(round(float(record["elapsed_s"]), 3)) + 2
         row_index = labels.index(label) + 2
@@ -220,3 +237,5 @@ def test_the_workbook_matches_the_csv_the_run_wrote(tmp_path):
             "%s at t=%s: workbook %r vs csv %r" % (label, record["elapsed_s"],
                                                    sheet.cell(row_index, column).value,
                                                    record["motion_px_sum"]))
+        checked += 1
+    assert checked, "no observed activity rows were checked against the workbook"
