@@ -60,6 +60,22 @@ PLOTTABLE = (
 
 PLOT_LABELS = dict(PLOTTABLE)
 
+#: The fields that SCALE WITH ROI AREA -- the "extensive" ones, where a bigger hand-drawn ROI
+#: inflates the number for the very same flies: a raw moving-pixel sum, a sum over every fly, and
+#: counts. Dividing these by the vial's lit area (see `_area_factor`) makes vials whose ROIs were
+#: drawn to different sizes comparable. Everything NOT listed here is left alone ON PURPOSE:
+#: `active_fraction_mean` is ALREADY motion/area; speeds, heights and `median_path_length` are
+#: per-fly or already a 0..1 fraction of the vial, so they do not depend on how big the box was
+#: drawn and dividing THEM by area would only manufacture an uninterpretable quantity (a speed per
+#: px^2, a height-fraction per px^2). The rig owner asked for "area-dependent ones only".
+AREA_NORMALIZED_FIELDS = frozenset({
+    "motion_px_sum",       # activity.csv: summed moving-pixel count over the bin
+    "total_path_length",   # behaviour.csv: summed over every fly's track
+    "n_blobs_mean",        # behaviour.csv: mean blob count per frame (more area -> more blobs)
+    "est_n_flies_mean",    # behaviour.csv: mean estimated flies per frame
+    "n_tracks",            # behaviour.csv: number of track fragments in the dwell
+})
+
 #: Bin widths offered for the DISPLAY, in seconds. 0 = "raw": every recorded row is its own point,
 #: nothing grouped. The sub-second choices exist to watch a fast transient -- e.g. the ~7 s post-flip
 #: startle -- but they only reveal detail the DATA already has: re-binning groups the rows that were
@@ -101,6 +117,11 @@ class BehaviourSeries:
         #: this is for watching, so the oldest are dropped once the cap is reached.
         self._max_rows = int(max_rows)
         self.dropped_rows = 0
+        #: ``(face, local_index) -> lit_area_px``, harvested from whatever rows carry `lit_area_px`
+        #: (the activity rows do; the tracking rows do not). The lit area of a vial is FIXED for a
+        #: run -- it is the ROI ∩ illumination mask -- so one value per vial is enough to normalise
+        #: even the tracking metrics of the SAME vial. See `_area_factor`.
+        self._vial_area: Dict[Tuple[str, int], int] = {}
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -108,6 +129,7 @@ class BehaviourSeries:
     def clear(self) -> None:
         self._rows = []
         self.dropped_rows = 0
+        self._vial_area = {}
 
     def add(self, rows: Sequence[dict]) -> int:
         """Adopt behaviour rows. Returns how many were usable."""
@@ -120,6 +142,17 @@ class BehaviourSeries:
             except (KeyError, TypeError, ValueError):
                 continue
             self._rows.append((elapsed, face, vial, dict(row)))
+            # HARVEST THE VIAL'S LIT AREA when the row carries it (activity rows do). Constant per
+            # vial, so the latest wins and one value serves the whole run -- including for this
+            # vial's tracking metrics, whose own rows have no area of their own.
+            area = row.get("lit_area_px")
+            if area is not None:
+                try:
+                    area_px = int(area)
+                except (TypeError, ValueError):
+                    area_px = 0
+                if area_px > 0:
+                    self._vial_area[(face, self.local_index(face, vial))] = area_px
             added += 1
         overflow = len(self._rows) - self._max_rows
         if overflow > 0:
@@ -132,13 +165,39 @@ class BehaviourSeries:
         """0-based position of a vial WITHIN its face. Global ids are ``face_index*16 + local``."""
         return (int(vial_id) - 1) % VIALS_PER_FACE
 
+    def area_reference(self) -> Optional[float]:
+        """The MEDIAN per-vial lit area -- the yardstick every vial is rescaled to, or None if no
+        area is known yet. Median, not mean, for the same reason the plotted points are medians:
+        one enormous or tiny hand-drawn ROI must not drag the reference the other 31 are measured
+        against."""
+        areas = [a for a in self._vial_area.values() if a > 0]
+        return _median(areas) if areas else None
+
+    def _area_factor(self, face: str, vial_index: int) -> float:
+        """``reference_area / this vial's lit area`` -- the constant a vial's EXTENSIVE metrics are
+        multiplied by so it reads as if it had the median ROI. 1.0 when either area is unknown (no
+        harm: the value is left exactly as recorded). Constant across the run, so multiplying every
+        point by it is the same as re-measuring the vial at the median area, and the median vial is
+        unchanged."""
+        area = self._vial_area.get((face, vial_index))
+        reference = self.area_reference()
+        if not area or not reference:
+            return 1.0
+        return reference / float(area)
+
     def series(self, field: str, face: str, vial_index: int, *, bin_seconds: float = 10.0,
-               cumulative: bool = False) -> List[Tuple[float, float]]:
+               cumulative: bool = False, normalize_area: bool = False) -> List[Tuple[float, float]]:
         """``[(elapsed_s, value), ...]`` for one vial, binned and optionally accumulated.
 
         Points are the MEDIAN of the rows in each bin, and rows whose value is `nan` are dropped
         rather than counted as zero -- so a bin with nothing measurable in it produces NO POINT,
         and a gap in the line reads as a gap in the data instead of a dip to the floor.
+
+        `normalize_area` (only for `field in AREA_NORMALIZED_FIELDS`) rescales every point by
+        `median_ROI_area / this vial's lit area`, so vials whose ROIs were hand-drawn to different
+        sizes are comparable. It is a pure display multiplier -- the stored rows are untouched, and
+        a metric that does not scale with area (a speed, a height, a per-fly figure) is never
+        touched even when the flag is on.
         """
         width = max(1e-6, float(bin_seconds))
         buckets: Dict[int, List[float]] = {}
@@ -159,6 +218,13 @@ class BehaviourSeries:
             return []
         points = [((index + 0.5) * width, _median(values))
                   for index, values in sorted(buckets.items())]
+        # AREA NORMALISATION is a constant per-vial factor, so median(k*v) == k*median(v): applying
+        # it to the binned medians here is identical to scaling every raw row, and cheaper. Only the
+        # extensive fields are eligible; everything else is returned exactly as measured.
+        if normalize_area and field in AREA_NORMALIZED_FIELDS:
+            factor = self._area_factor(face, vial_index)
+            if factor != 1.0:
+                points = [(t, value * factor) for t, value in points]
         if not cumulative:
             return points
         total = 0.0

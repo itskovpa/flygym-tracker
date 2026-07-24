@@ -91,6 +91,12 @@ class VialActivityGrid(QWidget):
     def set_activity(self, vial_results: dict) -> None:
         """`vial_results` is ``{global_vial_id: (motion_px, lit_area_px, active_fraction)}``.
 
+        THE CELL SHOWS `active_fraction` (motion / lit area) AS A PERCENT, not the raw motion-pixel
+        count. The raw count grows with a bigger hand-drawn ROI, so two vials at the same real
+        activity would read differently and could not be compared at a glance -- which is the whole
+        job of this strip. active_fraction is already per-area, so the cells ARE comparable across
+        vials whose ROIs were drawn to different sizes.
+
         A vial the pipeline did not report is left BLANK rather than drawn as zero: "no reading"
         and "a reading of zero" are different facts, and drawing them the same way would be the
         display inventing a measurement. On this rig that distinction is load-bearing -- only one
@@ -112,11 +118,16 @@ class VialActivityGrid(QWidget):
                 cell.setStyleSheet(self._style(theme.INK_2, theme.TEXT_FAINT))
                 continue
             try:
-                motion = float(result[0])
+                active_fraction = float(result[2])
             except (TypeError, IndexError, ValueError):
-                motion = 0.0
-            cell.setText("%d" % int(motion) if motion < 10000 else "%dk" % int(motion / 1000))
-            weight = max(0.0, min(1.0, motion / 400.0))
+                active_fraction = 0.0
+            # SHOWN AS A PERCENT OF THE VIAL'S LIT AREA that moved this frame -- the area-normalised
+            # number, so cells are comparable across differently-sized ROIs. One decimal is plenty
+            # for a live "is this vial reporting and is the threshold sane" glance; the exact,
+            # binned value is in the file and the plots.
+            percent = max(0.0, 100.0 * active_fraction)
+            cell.setText("%.1f" % percent if percent < 99.95 else "100")
+            weight = max(0.0, min(1.0, active_fraction / 0.1))
             fill = theme.INK_2 if weight <= 0.01 else "rgba(127, 178, 217, %.2f)" % (
                 0.12 + 0.88 * weight)
             cell.setStyleSheet(self._style(fill, theme.TEXT if weight > 0.35 else theme.TEXT_DIM))
@@ -158,8 +169,13 @@ class ResultsPanel(QWidget):
         grid_scroll.setWidget(self.grid)
         grid_scroll.setWidgetResizable(True)
         grid_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        grid_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        grid_scroll.setFixedHeight(56)
+        # VERTICAL SCROLLBAR AS-NEEDED, NOT ALWAYS-OFF, AND A FEW PIXELS MORE ROOM. Two 20 px rows
+        # fit 56, but when the pane is dragged narrow a HORIZONTAL scrollbar appears and eats ~15 px
+        # of that fixed height -- enough to clip the second vial row (face B) with no way to reach
+        # it. 64 px leaves room for the horizontal bar, and as-needed vertical scrolling is the
+        # backstop for a larger UI font. Still fixed and short, so it never steals from the picture.
+        grid_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        grid_scroll.setFixedHeight(64)
         layout.addWidget(grid_scroll)
 
         # THE TABLE IS GONE. It listed every row as it was written -- 32 rows per bin, scrolling
@@ -207,7 +223,8 @@ class ResultsPanel(QWidget):
         self.grid.set_activity(vial_results)
         face = payload.get("face") or "?"
         threshold = payload.get("pixel_threshold")
-        bits = ["face %s" % face, "per frame, not yet binned - not in the file"]
+        bits = ["face %s" % face, "active fraction: % of ROI area moving",
+                "per frame, not yet binned - not in the file"]
         if threshold is not None:
             # THE THRESHOLD IS SHOWN BESIDE THE NUMBERS IT PRODUCED. It is the one setting that
             # decides what counts as motion at all, it is live-adjustable mid-run, and reading

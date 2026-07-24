@@ -27,12 +27,14 @@ from typing import Optional
 
 from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QHBoxLayout, QLabel, QSizePolicy,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDockWidget, QLabel, QScrollArea, QSizePolicy,
                                QVBoxLayout, QWidget)
 
 from flygym_tracker.gui import theme
-from flygym_tracker.gui.behaviour_series import (BIN_CHOICES, FACES, PLOT_LABELS, PLOTTABLE,
-                                                 VIALS_PER_FACE, BehaviourSeries)
+from flygym_tracker.gui.behaviour_series import (AREA_NORMALIZED_FIELDS, BIN_CHOICES, FACES,
+                                                 PLOT_LABELS, PLOTTABLE, VIALS_PER_FACE,
+                                                 BehaviourSeries)
+from flygym_tracker.gui.flow_layout import FlowLayout
 
 #: Width reserved at the left of every cell for its y-axis numbers. Without them a sparkline is a
 #: shape with no magnitude -- the operator can see that a vial went up, but not from what to what,
@@ -153,17 +155,23 @@ class VialPlotGrid(QWidget):
         t0, t1 = self._time
         span_t = max(1e-9, t1 - t0)
         span_v = max(1e-9, high - low)
-        polygon = QPolygonF()
-        for t, value in points:
-            px = x + w * (t - t0) / span_t
-            py = y + h * (1.0 - (value - low) / span_v)
-            polygon.append(QPointF(px, py))
         painter.setPen(QPen(colour, 1.4))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        if len(polygon) == 1:
-            painter.drawEllipse(polygon[0], 1.6, 1.6)
-        else:
-            painter.drawPolyline(polygon)
+        # A GAP IN TIME IS A GAP IN THE LINE. While the drum shows the OTHER face this vial records
+        # nothing, so its points straddle a stretch with no measurement. One polyline through them
+        # all would bridge that stretch with a straight ramp -- activity the flies never produced,
+        # exactly the artifact reported from the rig. Each contiguous run is drawn on its own; the
+        # unfilmed stretch is left blank, which is what it is. See `_contiguous_segments`.
+        for segment in _contiguous_segments(points, self.bin_seconds):
+            polygon = QPolygonF()
+            for t, value in segment:
+                px = x + w * (t - t0) / span_t
+                py = y + h * (1.0 - (value - low) / span_v)
+                polygon.append(QPointF(px, py))
+            if len(polygon) == 1:
+                painter.drawEllipse(polygon[0], 1.6, 1.6)
+            else:
+                painter.drawPolyline(polygon)
 
 
 class BehaviourPlotPanel(QWidget):
@@ -180,8 +188,10 @@ class BehaviourPlotPanel(QWidget):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
+        # A WRAPPING STRIP, not a QHBoxLayout, so on a narrow or floated dock the right-hand controls
+        # (the "show" combo, the range note) wrap to a second line instead of clipping off the edge.
+        # Same rule the rest of the app follows (see `flow_layout`).
+        controls = FlowLayout(margin=0, spacing=8)
 
         controls.addWidget(QLabel("bin"))
         self.bin_box = QComboBox()
@@ -211,6 +221,24 @@ class BehaviourPlotPanel(QWidget):
         self.cumulative_box.toggled.connect(self.refresh)
         controls.addWidget(self.cumulative_box)
 
+        # PER-ROI-AREA NORMALISATION. ROIs are hand-drawn and vary in size, so a metric that grows
+        # with area (a pixel sum, a fly count) reads bigger for a bigger box at the same real
+        # activity. Ticking this rescales each vial by median-ROI/its-own-ROI so the vials compare.
+        # DISABLED for metrics it must not touch -- speeds, heights, per-fly path length are already
+        # area-independent, and active_fraction is already motion/area.
+        self._area_applies = self.field in AREA_NORMALIZED_FIELDS
+        self.area_box = QCheckBox("per ROI area")
+        self.area_box.setChecked(self._area_applies)
+        self.area_box.setEnabled(self._area_applies)
+        self.area_box.setToolTip(
+            "Rescale each vial by (median ROI area / this vial's lit area), so hand-drawn ROIs of "
+            "different sizes are comparable. Raw values stay in activity.csv -- this only changes "
+            "the picture." if self._area_applies else
+            "Not applicable: this metric is per-fly or already a fraction of the vial, so it does "
+            "not depend on how big the ROI was drawn.")
+        self.area_box.toggled.connect(self.refresh)
+        controls.addWidget(self.area_box)
+
         controls.addWidget(QLabel("show"))
         self.samples_box = QComboBox()
         for cap in SAMPLE_CAPS:
@@ -227,7 +255,7 @@ class BehaviourPlotPanel(QWidget):
         self.range_label = QLabel("")
         self.range_label.setProperty("role", "note")
         self.range_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        controls.addWidget(self.range_label, 1)
+        controls.addWidget(self.range_label)
         layout.addLayout(controls)
 
         self.grids = {}
@@ -258,10 +286,15 @@ class BehaviourPlotPanel(QWidget):
 
     def refresh(self) -> None:
         """Re-read the shared store. Cheap enough to call on every completed dwell."""
-        kwargs = {"bin_seconds": self.bin_seconds(), "cumulative": self.cumulative()}
+        bin_seconds, cumulative = self.bin_seconds(), self.cumulative()
+        normalize = self._area_applies and self.area_box.isChecked()
         # ONE READ of the store for the whole panel: the points every cell draws and the range
-        # every cell is scaled by come from the same snapshot. See `VialPlotGrid.configure`.
-        points = {face: self.series.face_series(self.field, face, **kwargs) for face in FACES}
+        # every cell is scaled by come from the same snapshot. See `VialPlotGrid.configure`. The
+        # area flag rides along on the READ (it changes the values), not on `configure` (which just
+        # stores the already-computed snapshot).
+        read_kwargs = {"bin_seconds": bin_seconds, "cumulative": cumulative,
+                       "normalize_area": normalize}
+        points = {face: self.series.face_series(self.field, face, **read_kwargs) for face in FACES}
         cap = self.max_points()
         if cap:
             # Rolling window: keep only the last `cap` points per cell. The x-axis then spans what is
@@ -273,8 +306,9 @@ class BehaviourPlotPanel(QWidget):
         time_range = _time_range_of(points) if cap else self.series.time_range()
         shared = self.shared_scale()
         for face, grid in self.grids.items():
-            grid.configure(field=self.field, value_range=value_range, time_range=time_range,
-                           points=points.get(face) or {}, shared=shared, **kwargs)
+            grid.configure(field=self.field, bin_seconds=bin_seconds, cumulative=cumulative,
+                           value_range=value_range, time_range=time_range,
+                           points=points.get(face) or {}, shared=shared)
         if value_range is None:
             self.range_label.setText("no data yet")
         else:
@@ -282,6 +316,10 @@ class BehaviourPlotPanel(QWidget):
             scale_note = (("y %.3g to %.3g, same for every vial" % (low, high)) if shared
                           else "each vial on its own y scale - amplitudes NOT comparable")
             span = "%s   -   %s" % (PLOT_LABELS.get(self.field, self.field), scale_note)
+            if normalize:
+                # SAY SO, because the y numbers are no longer the recorded ones -- they have been
+                # rescaled to the median ROI so the vials compare.
+                span += "   -   per ROI area (x median/area)"
             if time_range is not None:
                 span += "   -   %s of run" % _hms(time_range[1])
             # THE RANGE IS PRINTED because every cell shares it: without the numbers, a tall line
@@ -298,7 +336,15 @@ class BehaviourPlotDock(QDockWidget):
         self.field = field
         self.setObjectName("plot-%s" % field)
         self.panel = BehaviourPlotPanel(series, field)
-        self.setWidget(self.panel)
+        # SCROLLED, so a FLOATED or short dock can reach Face B's grid instead of clipping it off
+        # the bottom -- the content has a real minimum height (two 120 px grids plus the controls)
+        # and a floating dock is free to be smaller than that. `setWidgetResizable` keeps the panel
+        # at the viewport width so the cells still fill it; the scrollbar appears only when needed.
+        scroll = QScrollArea()
+        scroll.setWidget(self.panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.setWidget(scroll)
         self.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         self.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
                          | QDockWidget.DockWidgetFeature.DockWidgetFloatable
@@ -315,6 +361,42 @@ def _range_of_points(points) -> Optional[tuple]:
         return None
     low, high = min(values), max(values)
     return (low - 0.5, high + 0.5) if high - low < 1e-9 else (low, high)
+
+
+def _contiguous_segments(points, bin_seconds):
+    """Split `points` into runs a line may join, BREAKING ACROSS DATA GAPS.
+
+    While the drum shows the other face, a vial on this face records nothing, so its points sit on
+    either side of a stretch of time with no measurement. Joining them with one polyline draws a
+    straight ramp across that stretch -- activity the flies never produced, and the misleading part
+    of the graph reported from the rig. Splitting the run wherever two consecutive points are too
+    far apart in time keeps each filmed stretch its own line and leaves the unfilmed stretch blank,
+    which is what a gap actually is.
+
+    THE GAP THRESHOLD. In a binned view a point sits at the centre of its bin, so neighbours are one
+    bin-width apart and an empty bin between them is a jump of >= 2 widths; 1.5x the width splits
+    exactly there and nowhere else. The RAW view (bin 0) has no fixed bin, so the normal spacing is
+    estimated from the SHORTER inter-point gaps -- a low percentile, so a cadence that alternates
+    filmed/not-filmed does not inflate the estimate the way a median would -- and a jump well past
+    it is a break. Returns a list of point-lists; a lone point becomes a one-element run (drawn as a
+    dot). Fewer than two points is returned unchanged.
+    """
+    pts = list(points or ())
+    if len(pts) < 2:
+        return [pts] if pts else []
+    if bin_seconds and float(bin_seconds) > 0:
+        threshold = 1.5 * float(bin_seconds)
+    else:
+        gaps = sorted(b[0] - a[0] for a, b in zip(pts, pts[1:]))
+        step = gaps[len(gaps) // 5]                 # ~20th percentile of the spacings
+        threshold = max(2.5 * step, 1e-6)
+    segments = [[pts[0]]]
+    for prev, point in zip(pts, pts[1:]):
+        if point[0] - prev[0] > threshold:
+            segments.append([point])
+        else:
+            segments[-1].append(point)
+    return segments
 
 
 def _tick(value: float) -> str:
