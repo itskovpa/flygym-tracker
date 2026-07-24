@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
                                QVBoxLayout, QWidget)
 
 from flygym_tracker.gui.camera_picker import CameraPicker
-from flygym_tracker.gui.flow_layout import FlowLayout
+from flygym_tracker.gui.flow_layout import FlowContainer
 
 
 class PathField(QWidget):
@@ -213,8 +213,13 @@ class SessionBar(QWidget):
         # that a strip of controls has been the reason a window does not fit the rig laptop, and
         # caught here only because `test_gui_layout` measures it. A flow layout's minimum is its
         # WIDEST SINGLE ITEM, and it grows downward, which the section above it can absorb.
-        row = QWidget()
-        line = FlowLayout(row, spacing=8)
+        #
+        # A `FlowContainer`, NOT A PLAIN QWidget, because this row sits in a `QGridLayout` cell and a
+        # grid cell never queries `heightForWidth` -- so when the row wrapped, its second line (the
+        # "size x" spin) was clipped. `FlowContainer` sets its own minimum height to the wrapped
+        # height, which the grid does respect. See `flow_layout.FlowContainer`.
+        row = FlowContainer(spacing=8)
+        line = row.flow()
 
         self.record_box = QCheckBox("save a video of the run")
         self.record_box.setChecked(False)
@@ -317,10 +322,12 @@ class SessionBar(QWidget):
         freed CPU holds the frame rate steadier. Per-vial activity and rotation are untouched.
 
         A FlowLayout for the same reason the recording row uses one: a strip of controls whose
-        QHBoxLayout minimum width would push the window past the rig laptop's screen.
+        QHBoxLayout minimum width would push the window past the rig laptop's screen. And a
+        `FlowContainer` for the same reason too: in a grid cell a wrapped flow row is clipped
+        unless the widget declares its own wrapped height.
         """
-        row = QWidget()
-        line = FlowLayout(row, spacing=8)
+        row = FlowContainer(spacing=8)
+        line = row.flow()
         self.activity_only_box = QCheckBox("activity only — don't track individual flies")
         self.activity_only_box.setChecked(False)
         self.activity_only_box.setToolTip(

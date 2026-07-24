@@ -38,7 +38,11 @@ class CameraStatusBar(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedHeight(44)
+        # A FLOOR, NOT A CEILING. This top band carries real buttons and a 20 px status dot; a hard
+        # setFixedHeight clips them at the very top edge of the window under Windows "make text
+        # bigger" (>100% UI font, independent of display scaling). A minimum keeps the compact look
+        # while letting the row grow the few pixels a larger font needs.
+        self.setMinimumHeight(44)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(8)

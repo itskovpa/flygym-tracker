@@ -70,6 +70,39 @@ def test_the_window_has_all_five_bands(qapp, window):
     assert window.settings_view.save_button is not None
 
 
+# =============================================================================================
+# Where graphs open
+# =============================================================================================
+def test_graphs_open_left_and_tabbed_with_settings(qapp, window):
+    """AS THE RIG OWNER ARRANGED THEM AND ASKED TO HAVE BY DEFAULT: a graph opens in the LEFT dock
+    area, next to the picture, in the SAME tab group as Settings -- and each subsequent graph joins
+    that group as another tab, rather than opening as a separate pane on the right that has to be
+    dragged across every time. They remain floatable/re-dockable, so any other arrangement is a
+    drag away."""
+    from PySide6.QtCore import Qt
+
+    window.show_plot("median_path_length")
+    window.show_plot("motion_px_sum")
+    qapp.processEvents()
+
+    assert set(window._plot_docks) == {"median_path_length", "motion_px_sum"}
+    for field, dock in window._plot_docks.items():
+        assert window.dockWidgetArea(dock) == Qt.DockWidgetArea.LeftDockWidgetArea, \
+            "%s opened outside the left dock area" % field
+    group = window.tabifiedDockWidgets(window.settings_dock)
+    assert window._plot_docks["median_path_length"] in group, "first graph not tabbed with Settings"
+    assert window._plot_docks["motion_px_sum"] in group, "second graph not tabbed into the group"
+
+
+def test_asking_for_the_same_graph_twice_raises_the_one_dock(qapp, window):
+    """RAISED RATHER THAN DUPLICATED: two docks of the same parameter would be two identical graphs
+    to tell apart, and closing one would look like it failed to close the other."""
+    window.show_plot("median_path_length")
+    window.show_plot("median_path_length")
+    qapp.processEvents()
+    assert len(window._plot_docks) == 1
+
+
 def test_the_session_bar_shows_the_three_paths_run_bat_kept_in_a_batch_file(qapp, window,
                                                                            rig_config, tmp_path):
     assert window.session_bar.config_path() == rig_config

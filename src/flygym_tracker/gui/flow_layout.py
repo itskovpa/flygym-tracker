@@ -116,3 +116,37 @@ def flow_strip(parent: Optional[QWidget] = None, spacing: int = 6):
     layout = FlowLayout(widget, margin=0, spacing=spacing)
     widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
     return widget, layout
+
+
+class FlowContainer(QWidget):
+    """A widget whose height TRACKS its `FlowLayout`'s wrap, in ANY parent layout.
+
+    THE BUG THIS CLOSES. `FlowLayout` reports `heightForWidth` correctly, and a `QVBoxLayout` honours
+    it -- so the run band's tool strip wraps to a second line and grows. But a `QGridLayout` cell
+    NEVER queries `heightForWidth`: it gives the cell the one-line `sizeHint` height and CLIPS the
+    wrapped rows. The recording and fly-tracking rows live in grid cells, so their second line (the
+    "size x" spin, the notes) vanished whenever the row wrapped -- exactly the "controls not visible
+    at the edge" the operator reported, appearing only when the central column was narrow enough to
+    force a wrap.
+
+    THE FIX, FROM THE OTHER SIDE. Rather than hope the parent asks, this widget TELLS it: on every
+    resize it sets its own `minimumHeight` to the flow's height at the new width, and a grid cell
+    DOES respect a child's minimum height. So the row is given the room its wrapped lines need
+    whatever layout holds it. Converges in one step because changing the height never changes the
+    width that drove it.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._flow = FlowLayout(self, margin=0, spacing=spacing)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+
+    def flow(self) -> "FlowLayout":
+        """The `FlowLayout` to add controls to."""
+        return self._flow
+
+    def resizeEvent(self, event) -> None:                # noqa: N802 - Qt's name
+        super().resizeEvent(event)
+        wanted = self._flow.heightForWidth(self.width())
+        if wanted != self.minimumHeight():
+            self.setMinimumHeight(wanted)

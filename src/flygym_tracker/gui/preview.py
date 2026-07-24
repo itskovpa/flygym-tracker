@@ -121,7 +121,14 @@ class PreviewWidget(QWidget):
         self._interactive = False
         self.overlay = None
         self.placeholder = "No picture - the camera is not open"
-        self.setMinimumSize(320, 240)
+        # A LOWER HARD FLOOR THAN THE 240 PX THE PICTURE PREFERS. The preferred height is reserved by
+        # `main_window._share_width_with_results` (MIN_PICTURE_HEIGHT), which keeps the picture at
+        # 240 whenever the window has the room. This floor is only the point below which the picture
+        # may shrink on a genuinely short screen -- and it must be well under 240, or the picture's
+        # own minimum plus the fixed bands would make the whole window taller than a laptop's work
+        # area (the rig's is 1440x852), which is exactly the "cannot resize, bottom under the
+        # taskbar" the operator hit. 160 keeps the drum legible while letting the window fit.
+        self.setMinimumSize(320, 160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAutoFillBackground(False)
 

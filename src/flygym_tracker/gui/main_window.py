@@ -31,8 +31,8 @@ from typing import Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QDockWidget, QFileDialog, QMainWindow, QMessageBox, QSplitter,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QDockWidget, QFileDialog, QMainWindow, QMessageBox, QScrollArea,
+                               QSplitter, QVBoxLayout, QWidget)
 
 from flygym_tracker import camera_lock, readiness
 from flygym_tracker.gui import gui_state
@@ -69,6 +69,27 @@ HANDOVER_TIMEOUT_MS = 6000
 #: USB3 Vision device is not instant; a wait longer than this means something is wrong, and saying
 #: so beats a button that appears to have done nothing.
 CAMERA_OPEN_TIMEOUT_MS = 8000
+
+
+def _fit_frame_within(frame_w, frame_h, frame_x, frame_y,
+                      area_x, area_y, area_w, area_h, min_w=640, min_h=480):
+    """Clamp a window's FRAME rectangle to sit fully inside a work area.
+
+    Returns ``(w, h, x, y)`` for the frame: no larger than the work area (but never below the app's
+    own minimum), and shifted so no edge falls outside it -- the BOTTOM most of all, because that is
+    where the Windows taskbar lives and a window whose bottom lands under it hides its lowest row of
+    controls (the operator reported the run band's plot buttons vanishing there). Pure arithmetic,
+    so the taskbar-occlusion fix is tested without a real screen. A screen SHORTER than the app's
+    minimum height is the one case this cannot solve by moving alone -- there is genuinely not enough
+    room -- and it leaves the top-left pinned to the work area so at least the top controls show.
+    """
+    w = max(min_w, min(frame_w, area_w))
+    h = max(min_h, min(frame_h, area_h))
+    # `max(area_*, ...)` wins ties, so when the window is too tall to fit the top-left stays pinned
+    # inside the work area rather than being pushed up off the top to honour the bottom.
+    x = max(area_x, min(frame_x, area_x + area_w - w))
+    y = max(area_y, min(frame_y, area_y + area_h - h))
+    return w, h, x, y
 
 
 class MainWindow(QMainWindow):
@@ -114,6 +135,9 @@ class MainWindow(QMainWindow):
         #: opened at hour 40 draws the whole run rather than only what arrives after it opened.
         self.behaviour = BehaviourSeries()
         self._plot_docks = {}
+        #: One-shot guard so the after-show geometry clamp (see `showEvent`) runs on the FIRST show
+        #: only -- after that the operator is free to move or resize the window wherever they like.
+        self._geometry_clamped = False
         self._build()
         self._build_help_menu()
         self._connect()
@@ -246,7 +270,20 @@ class MainWindow(QMainWindow):
         self.run_panel = RunPanel()
         layout.addWidget(self.run_panel)
 
-        self.setCentralWidget(central)
+        # SCROLLED, so the WINDOW CAN BE MADE SMALLER THAN ITS CONTENT. Without this the central
+        # column's own minimum height (status + experiment band + video + readiness + run band) is
+        # the window's minimum, and on a short screen -- the rig laptop is 1440x852 of usable work
+        # area -- that minimum is TALLER than the screen. Qt then refuses to shrink the window, so it
+        # sits locked with its bottom row (the run controls) jammed under the taskbar and cannot be
+        # resized to reach them. A QScrollArea's own minimum is tiny, so the window is free to fit
+        # any screen; when the content is taller than the window a scrollbar appears and every
+        # control stays reachable. `setWidgetResizable` keeps the column at the viewport width and
+        # lets the video still expand to fill whatever height there is.
+        self._central_scroll = QScrollArea()
+        self._central_scroll.setWidget(central)
+        self._central_scroll.setWidgetResizable(True)
+        self._central_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.setCentralWidget(self._central_scroll)
         self.resize(*self._fitted_size(1180, 820))
 
     def _fitted_size(self, want_w: int, want_h: int) -> Tuple[int, int]:
@@ -276,6 +313,46 @@ class MainWindow(QMainWindow):
         except Exception:
             # Sizing is cosmetic; never let it stop the app opening.
             return want_w, want_h
+
+    def showEvent(self, event) -> None:                  # noqa: N802 - Qt's name
+        """Once, on the first real show, pull the whole window inside the work area.
+
+        `_fitted_size` runs during construction, when the frame margins still read 0 and Qt has not
+        placed the window yet -- so it can size the window to fit but cannot know where it will land.
+        This is the after-show correction: now the title-bar height is real and a position exists,
+        so a window that ended up with its bottom under the taskbar (opened low, restored from a
+        saved-low position, or simply centred a hair too far down) is nudged back on-screen. Guarded
+        to run ONCE, so it never fights the operator who deliberately moves the window afterwards.
+        """
+        super().showEvent(event)
+        if not self._geometry_clamped:
+            self._geometry_clamped = True
+            self._clamp_to_work_area()
+
+    def _clamp_to_work_area(self) -> None:
+        try:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            frame = self.frameGeometry()
+            w, h, x, y = _fit_frame_within(
+                frame.width(), frame.height(), frame.x(), frame.y(),
+                area.x(), area.y(), area.width(), area.height())
+            if w != frame.width() or h != frame.height():
+                # resize() sets the CLIENT area; subtract the chrome so the FRAME reaches (w, h).
+                chrome_w = max(0, frame.width() - self.width())
+                chrome_h = max(0, frame.height() - self.height())
+                self.resize(max(640, w - chrome_w), max(480, h - chrome_h))
+                frame = self.frameGeometry()
+            if x != frame.x() or y != frame.y():
+                # move() positions the CLIENT top-left; offset by the chrome so the FRAME lands at
+                # (x, y) -- otherwise the title bar would sit `chrome` pixels above the target.
+                off_x = self.geometry().x() - frame.x()
+                off_y = self.geometry().y() - frame.y()
+                self.move(x + off_x, y + off_y)
+        except Exception:
+            pass  # positioning is cosmetic; never let it stop the app opening
 
     def _connect(self) -> None:
         self.status_bar.open_requested.connect(self.open_camera)
@@ -828,12 +905,17 @@ class MainWindow(QMainWindow):
         if dock is None:
             dock = BehaviourPlotDock(self.behaviour, field, self)
             self._plot_docks[field] = dock
-            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-            # TABBED WITH ITS SIBLINGS rather than stacked: four parameters split vertically would
-            # leave each grid too short to read, and the operator asked for a graph per parameter.
+            # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
+            # on and asked to have from the start: a graph opens in the same left tab group as the
+            # Settings dock and any sibling graphs, next to the picture, rather than as a separate
+            # pane on the right that has to be dragged across every time. It is still a floatable,
+            # re-dockable QDockWidget, so anyone who prefers it elsewhere just drags it there.
+            self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+            # TABBED WITH ITS SIBLINGS (or with Settings when it is the first graph) rather than
+            # stacked: four parameters split vertically would leave each grid too short to read.
             others = [d for key, d in self._plot_docks.items() if key != field and d.isVisible()]
-            if others:
-                self.tabifyDockWidget(others[-1], dock)
+            anchor = others[-1] if others else self.settings_dock
+            self.tabifyDockWidget(anchor, dock)
         dock.show()
         dock.raise_()
         dock.refresh()

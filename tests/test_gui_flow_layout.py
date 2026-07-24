@@ -79,6 +79,29 @@ def test_an_empty_strip_is_harmless(qapp):
     assert layout.heightForWidth(100) >= 0
 
 
+def test_a_flow_container_grows_its_own_minimum_for_the_wrap(qapp):
+    """THE RECORDING-ROW BUG. `FlowLayout` reports heightForWidth and a QVBoxLayout honours it -- so
+    the run band's tool strip wraps and grows. But a QGridLayout cell never ASKS for heightForWidth:
+    it gives the cell the one-line sizeHint height and clips the wrapped second line -- which is
+    where the recording row's "size x" spin vanished. `FlowContainer` closes it from the other side,
+    setting its OWN minimum height to the wrapped height, which a grid cell DOES respect."""
+    from PySide6.QtWidgets import QPushButton
+    from flygym_tracker.gui.flow_layout import FlowContainer
+
+    row = FlowContainer(spacing=8)
+    for label in ("save a video of the run", "every 2 frame(s)", "size 0.5x"):
+        button = QPushButton(label)
+        button.setFixedSize(160, 24)
+        row.flow().addWidget(button)
+    row.show()
+    row.resize(200, 500)              # narrower than 3*160 -> the strip must wrap to more than one row
+    qapp.processEvents()
+    assert row.minimumHeight() == row.flow().heightForWidth(row.width()), \
+        "the container's minimum height is not tracking its flow's wrapped height"
+    assert row.minimumHeight() > 24, "no room was reserved for the wrapped rows -- they would clip"
+    row.hide()
+
+
 # =============================================================================================
 # The claim this exists for, measured on the real window
 # =============================================================================================
@@ -100,3 +123,45 @@ def test_the_whole_window_fits_the_rig_laptop_in_both_directions(qapp, tmp_path)
     assert hint.width() <= RIG_DESKTOP[0] - 40, "minimum width %d" % hint.width()
     # The work area is the desktop minus the taskbar (~48 px), and the frame adds a title bar.
     assert hint.height() <= RIG_DESKTOP[1] - 100, "minimum height %d" % hint.height()
+
+
+# =============================================================================================
+# The window must sit INSIDE the work area, so its bottom row cannot hide under the taskbar
+# ---------------------------------------------------------------------------------------------
+# Reported from the rig: the run band's plot buttons vanished under the Windows taskbar. The window
+# fits the screen at its fitted size, so the cause is placement -- it ended up low. `_fit_frame_
+# within` is the after-show clamp that pulls it back on-screen; tested here as pure arithmetic.
+# =============================================================================================
+def test_a_window_that_already_sits_inside_is_left_where_it_is():
+    from flygym_tracker.gui.main_window import _fit_frame_within
+    # 1080p minus a 48 px taskbar = a 1920x1032 work area; a 1316x851 window near the top-left fits.
+    assert _fit_frame_within(1316, 851, 100, 100, 0, 0, 1920, 1032) == (1316, 851, 100, 100)
+
+
+def test_a_window_whose_bottom_is_under_the_taskbar_is_lifted_clear():
+    from flygym_tracker.gui.main_window import _fit_frame_within
+    # Same window placed low: bottom would be 300 + 851 = 1151, past the 1032 work-area edge.
+    w, h, x, y = _fit_frame_within(1316, 851, 100, 300, 0, 0, 1920, 1032)
+    assert (w, h, x) == (1316, 851, 100), "only the vertical position should have changed"
+    assert y + h == 1032, "the window's bottom was not brought to rest on the work-area edge"
+
+
+def test_a_window_taller_than_the_work_area_is_shrunk_and_pinned_to_the_top():
+    from flygym_tracker.gui.main_window import _fit_frame_within
+    w, h, _x, y = _fit_frame_within(1316, 1200, 100, 60, 0, 0, 1920, 1032)
+    assert h == 1032, "a window taller than the work area must be shrunk to it"
+    assert y == 0, "a too-tall window pins to the top so its TOP controls stay reachable"
+
+
+def test_the_work_area_origin_is_respected_not_assumed_to_be_zero():
+    """A second monitor's work area does not start at (0, 0); a window just off its left edge must
+    be pulled onto the monitor, not onto the primary screen."""
+    from flygym_tracker.gui.main_window import _fit_frame_within
+    _w, _h, x, _y = _fit_frame_within(800, 600, 1900, 10, 1920, 0, 1920, 1032)
+    assert x == 1920
+
+
+def test_the_clamp_never_shrinks_below_the_apps_own_minimum():
+    from flygym_tracker.gui.main_window import _fit_frame_within
+    w, h, _x, _y = _fit_frame_within(1316, 851, 0, 0, 0, 0, 500, 400)
+    assert (w, h) == (640, 480), "a tiny work area must not force the window below its minimum"
