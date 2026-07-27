@@ -34,6 +34,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -260,7 +261,21 @@ class ActivityLogger:
             self._dirty_csvs.clear()
             return
         for csv_path in list(self._dirty_csvs):
-            self._rewrite_xlsx(csv_path)
+            # THE CSV IS THE RESULT; THE WORKBOOK IS A CONVENIENCE, and one must never be able to
+            # cost the other. A multi-day run writes a behaviour.csv far larger than the .xlsx
+            # format can hold -- the sheet ceiling is 1,048,576 rows, which this rig reaches in
+            # under two days at ~8 rows/s -- and pandas raises instead of writing. Unguarded, that
+            # exception left `close()` half-done: `stop_iso` unstamped, and (because `close()` is
+            # called from the pipeline's teardown) the camera unreleased. Every row is already
+            # durable in the CSV at this point, so the honest response is to say the workbook could
+            # not be written and let the run finish.
+            try:
+                self._rewrite_xlsx(csv_path)
+            except Exception as exc:                       # noqa: BLE001 - reported, never fatal
+                print("could not write the .xlsx copy of %s: %r" % (csv_path.name, exc),
+                      file=sys.stderr)
+                print("the CSV itself is complete -- use it, or convert it in chunks",
+                      file=sys.stderr)
         self._dirty_csvs.clear()
 
     def close(self) -> None:

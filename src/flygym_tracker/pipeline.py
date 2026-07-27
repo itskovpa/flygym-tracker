@@ -45,6 +45,7 @@ their *calibration* anchors by the estimated shift (so drift never accumulates),
 """
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
@@ -75,6 +76,21 @@ DEFAULT_MAX_SHIFT_FRAC = 0.4
 #: Retry budget + backoff for a transient `source.read()` exception (multi-day robustness).
 DEFAULT_READ_RETRIES = 3
 DEFAULT_READ_RETRY_SLEEP = 0.5
+#: How many CONSECUTIVE `_read_frame` failures end the run, instead of retrying forever.
+#:
+#: WHY A CAP EXISTS AT ALL. `_read_frame` already burns `read_retries` attempts with
+#: `read_retry_sleep` between them, which is the right answer to a hiccup. What it cannot answer is
+#: a camera that is GONE -- unplugged, USB-reset, or an SDK handle that will never be valid again.
+#: The read loop used to treat that case as another hiccup and `continue` forever: a hot loop that
+#: processes no frames, writes no rows and never returns, while the window still says the run is in
+#: progress. Unattended, that is the worst failure mode this app has -- it looks alive, so nobody
+#: intervenes, and every bin from the moment the camera died is simply missing from activity.csv.
+#:
+#: 40 consecutive failures at the 3-retry/0.5 s default is about 60 s of UNBROKEN silence. A blip
+#: costs a few frames and resets the counter; only a camera that has really stopped delivering
+#: reaches the cap, and then the run STOPS CLEANLY -- `finally` flushes the last bin and releases
+#: the camera -- with `stopped_reason="camera_lost"` and an event in events.csv saying so.
+DEFAULT_MAX_CONSECUTIVE_READ_ERRORS = 40
 #: measure_noise: enter/exit threshold heuristic multipliers on the per-frame metric std.
 DEFAULT_ENTER_K = 8.0
 DEFAULT_EXIT_K = 4.0
@@ -215,6 +231,7 @@ class TrackerPipeline:
         track_flies: bool = True,
         read_retries: int = DEFAULT_READ_RETRIES,
         read_retry_sleep: float = DEFAULT_READ_RETRY_SLEEP,
+        max_consecutive_read_errors: int = DEFAULT_MAX_CONSECUTIVE_READ_ERRORS,
     ) -> None:
         self.config = config
         self.calibration = calibration
@@ -225,6 +242,7 @@ class TrackerPipeline:
         self._max_shift_arg = max_shift  # resolved after _precompute_faces (needs vial geometry)
         self.read_retries = max(1, int(read_retries))
         self.read_retry_sleep = float(read_retry_sleep)
+        self.max_consecutive_read_errors = max(1, int(max_consecutive_read_errors))
         self.run_id = getattr(logger, "run_id", "run")
 
         # -- rotation detector mode: 'adaptive' (speed-independent, no preset thresholds) or
@@ -893,6 +911,7 @@ class TrackerPipeline:
 
         frames_processed = 0
         stopped_reason = "eof"
+        consecutive_read_errors = 0
         try:
             while True:
                 if self._should_stop(stop_flag):
@@ -906,7 +925,23 @@ class TrackerPipeline:
                     stopped_reason = "eof"
                     break
                 if status == "error":
+                    # A HICCUP IS SKIPPED; A DEAD CAMERA ENDS THE RUN. Skipping forever was the old
+                    # behaviour, and it turned "the camera was unplugged at hour 20" into a hot loop
+                    # that produced nothing and never returned while still looking like a live run.
+                    consecutive_read_errors += 1
+                    if consecutive_read_errors >= self.max_consecutive_read_errors:
+                        stopped_reason = "camera_lost"
+                        self._log_event(
+                            self._last_elapsed, None, "camera_lost",
+                            "%d consecutive read failures (~%.0f s with no frame); stopping so the "
+                            "measured data is flushed and the camera is released"
+                            % (consecutive_read_errors,
+                               consecutive_read_errors * self.read_retries * self.read_retry_sleep))
+                        break
                     continue  # transient read error already logged; skip this frame
+                # Only an ACTUAL frame clears the counter, so it measures unbroken silence rather
+                # than a total that a run of isolated blips could eventually reach.
+                consecutive_read_errors = 0
                 self._process_frame(frame)
                 frames_processed += 1
 
@@ -928,8 +963,22 @@ class TrackerPipeline:
                 self._tracking_summary = self._pool.stats()
                 self._pool.close()
                 self._pool = None
-            self.logger.close()
-            self.source.close()
+            # THE CAMERA IS RELEASED EVEN IF CLOSING THE LOG FAILS, and that ordering is the whole
+            # point of the nesting. `logger.close()` regenerates the .xlsx siblings, and that step
+            # can fail on its own terms -- most concretely, a multi-day behaviour.csv grows past the
+            # 1,048,576-row ceiling of the xlsx format, and pandas raises rather than writes. It used
+            # to raise straight through this block, past `source.close()`, and STRAND THE EXCLUSIVE
+            # USB3 HANDLE: the run that just finished looked like a failure, and the NEXT session
+            # could not open the camera at all until the process was killed. A spreadsheet export is
+            # a convenience; the camera is the instrument. The export never gets to keep it.
+            try:
+                self.logger.close()
+            except Exception as exc:                       # noqa: BLE001 - reported, never fatal
+                print("could not finish writing the results files: %r" % exc, file=sys.stderr)
+                print("the CSVs are complete on disk; the .xlsx copy may be missing or partial",
+                      file=sys.stderr)
+            finally:
+                self.source.close()
 
         return {
             "run_id": self.run_id,
