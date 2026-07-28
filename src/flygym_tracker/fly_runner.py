@@ -81,7 +81,8 @@ class _Worker(threading.Thread):
     """One thread, a fixed subset of vials, and a `VialTracker` per vial for the current dwell."""
 
     def __init__(self, name: str, vials: Dict[int, Tuple[np.ndarray, tuple]],
-                 params: DetectParams, fps: float, depth: int) -> None:
+                 params: DetectParams, fps: float, depth: int,
+                 max_dwell_frames: int = 0) -> None:
         super().__init__(name=name, daemon=True)
         self._vials = vials
         self._params = params
@@ -92,6 +93,10 @@ class _Worker(threading.Thread):
         self._tracks: Dict[int, List[List[Tuple[float, float]]]] = {}
         self._stop = threading.Event()
         self._failures = 0
+        #: 0 = unbounded, the behaviour before the cap existed.
+        self._max_dwell_frames = max(0, int(max_dwell_frames))
+        self._dwell_frames = 0
+        self.capped_dwells = 0
 
     # -- called from the pipeline thread ------------------------------------------------------
     def offer(self, item) -> bool:
@@ -164,7 +169,18 @@ class _Worker(threading.Thread):
                 with self._lock:
                     self._trackers = {}
                     self._tracks = {}
+                self._dwell_frames = 0
                 continue
+            # A DWELL THAT NEVER ENDS IS A STUCK RIG, NOT A LONG MEASUREMENT. Past the cap the
+            # trackers stop accumulating: memory stops growing, the per-frame cost stops climbing,
+            # and the activity measurement -- the primary result -- carries on untouched. Counted,
+            # never silent; the pipeline turns the count into an event. See `max_dwell_frames`.
+            if self._max_dwell_frames and self._dwell_frames >= self._max_dwell_frames:
+                if self._dwell_frames == self._max_dwell_frames:
+                    self.capped_dwells += 1
+                    self._dwell_frames += 1        # count once, then stop counting
+                continue
+            self._dwell_frames += 1
             self._observe(gray, t)
 
     def _observe(self, gray: np.ndarray, t: float) -> None:
@@ -209,13 +225,15 @@ class FlyTrackingPool:
 
     def __init__(self, vials: Dict[int, Tuple[np.ndarray, tuple]], *, fps: float,
                  params: Optional[DetectParams] = None, n_workers: int = DEFAULT_WORKERS,
-                 queue_depth: int = DEFAULT_QUEUE_DEPTH) -> None:
+                 queue_depth: int = DEFAULT_QUEUE_DEPTH,
+                 max_dwell_frames: int = 0) -> None:
         params = params or DetectParams()
         n_workers = max(1, int(n_workers))
         shards: List[Dict[int, Tuple[np.ndarray, tuple]]] = [{} for _ in range(n_workers)]
         for index, gvid in enumerate(sorted(vials)):
             shards[index % n_workers][gvid] = vials[gvid]
-        self._workers = [_Worker("flygym-track-%d" % i, shard, params, fps, queue_depth)
+        self._workers = [_Worker("flygym-track-%d" % i, shard, params, fps, queue_depth,
+                                 max_dwell_frames=max_dwell_frames)
                          for i, shard in enumerate(shards) if shard]
         self.frames_submitted = 0
         self.frames_dropped = 0
@@ -281,6 +299,10 @@ class FlyTrackingPool:
             "vial_failures": sum(worker.failures for worker in self._workers),
             "workers": len(self._workers),
             "dwells": self.dwell_index,
+            # NON-ZERO MEANS THE DRUM STALLED (or a flip went undetected) and tracking was paused
+            # for the rest of that dwell. A number worth seeing in the run summary: it says the
+            # tracking gap has a mechanical explanation rather than a biological one.
+            "capped_dwells": sum(worker.capped_dwells for worker in self._workers),
         }
 
     def close(self) -> None:

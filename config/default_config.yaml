@@ -61,5 +61,24 @@ output:
   rolling: daily          # new file per day
   snapshot_every_s: 0     # 0 = never; else periodic full-frame PNG for spot checks
 
+tracking:
+  # HOW LONG ONE DWELL MAY GET BEFORE THE TRACKERS STOP ACCUMULATING, in frames.
+  #
+  # A dwell is normally ~2 s (~40 frames at 20 fps): the drum flips, the trackers are thrown away,
+  # and the next dwell starts. Nothing in that design bounds a dwell that never ENDS -- and one
+  # will, eventually, if the motor jams, the controller misses a step, or a flip goes undetected.
+  # Then every tracked frame is appended to a list that is never cleared. Measured on real footage
+  # with a parked drum: ~0.6 objects per frame per vial, about 4 GB over a three-day run, with
+  # throughput decaying as it grew until the process died -- an unattended experiment lost to a
+  # stuck motor rather than to anything about flies.
+  #
+  # 6000 frames is five minutes at 20 fps: 150x a normal dwell, so a healthy rig never approaches
+  # it, and a stalled one stops costing memory instead of ending the run. Tracking simply pauses
+  # for the rest of that dwell (the activity measurement is untouched, and it is the primary
+  # result); a `tracking_dwell_capped` event records that it happened, so the gap is never silent.
+  #
+  # SET TO 0 (or null) TO RESTORE THE OLD, UNBOUNDED BEHAVIOUR exactly.
+  max_dwell_frames: 6000
+
 logging:
   level: INFO

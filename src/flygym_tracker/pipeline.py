@@ -1026,9 +1026,13 @@ class TrackerPipeline:
             self.track_flies = False
             return
         fps = float(getattr(self.source, "fps", 0.0) or 20.0)
+        # `tracking.max_dwell_frames` bounds a dwell that never ends (a stalled drum). 0/null keeps
+        # the old unbounded behaviour; the config comment explains the trade in full.
+        tracking_cfg = self.config.get("tracking") or {}
+        max_dwell = tracking_cfg.get("max_dwell_frames") or 0
         self._pool = FlyTrackingPool(
             {vid: (self._track_masks[vid], self._track_axes[vid]) for vid in self._track_masks},
-            fps=fps)
+            fps=fps, max_dwell_frames=int(max_dwell))
         self._pool.start()
 
     def _harvest_dwell(self, elapsed_s: float, frame) -> None:
