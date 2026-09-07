@@ -55,6 +55,7 @@ import numpy as np
 
 from flygym_tracker.activity import ActivityAccumulator, per_frame_activity
 from flygym_tracker.calibration import bbox_from_quad, quad_polygon_mask, shift_quad, vial_shape
+from flygym_tracker.cv_setup import CV_LOCK
 from flygym_tracker.frame_source import FrameSource, VideoFileSource
 from flygym_tracker.registration import apply_shift, estimate_shift
 from flygym_tracker.adaptive_rotation import AdaptiveRotationDetector
@@ -567,7 +568,12 @@ class TrackerPipeline:
         if find is None:
             return
         try:
-            strips = find(gray)
+            # UNDER THE SHARED OpenCV LOCK. `find_strips` runs medianBlur/normalize internally, and
+            # this is the pipeline thread -- so without the lock it can be inside OpenCV at the same
+            # instant as a tracking worker, which is the allocator corruption `CV_LOCK` exists to
+            # prevent. Once per dwell, so the contention it adds is not measurable.
+            with CV_LOCK:
+                strips = find(gray)
         except Exception:
             return
         if not strips:
@@ -1233,7 +1239,10 @@ class TrackerPipeline:
         face = None
         if self.marker_detector is not None:
             try:
-                face = self.marker_detector.identify_face(gray)
+                # Same reason as `_refresh_rotation_band_roi`: template matching is OpenCV work on
+                # the pipeline thread, and it must not overlap a tracking worker inside OpenCV.
+                with CV_LOCK:
+                    face = self.marker_detector.identify_face(gray)
             except Exception:
                 face = None
 
