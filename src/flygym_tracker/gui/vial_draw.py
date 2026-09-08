@@ -230,6 +230,9 @@ class VialDrawSession(QObject):
     def load(self, polygons) -> int:
         """Show saved vial positions, ready to edit. Returns how many were loaded."""
         n = self.state.load(polygons)
+        # The status line's head already says "N vial(s) loaded - drag a corner to adjust"; the
+        # note the shared state leaves behind said it again, so the caption read twice as long.
+        self.state.message = ""
         self.changed.emit()
         return n
 

@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout,
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
                                QWidget)
 
 from flygym_tracker.gui import theme
@@ -116,7 +116,7 @@ class ReadinessStrip(QWidget):
             "everything" if len(passing) == total else "%d of %d" % (len(passing), total), names))
         label.setProperty("role", "note")
         label.setWordWrap(True)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        label.setMinimumWidth(240)
         label.setToolTip("\n".join(check.sentence for check in passing))
         layout.addWidget(label, 1)
         return row
@@ -135,7 +135,7 @@ class ReadinessStrip(QWidget):
 
         sentence = QLabel(check.sentence)
         sentence.setWordWrap(True)
-        sentence.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        sentence.setMinimumWidth(240)
         if check.state != BAD:
             sentence.setProperty("role", "note")
         layout.addWidget(sentence, 1)

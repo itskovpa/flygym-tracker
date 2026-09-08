@@ -46,9 +46,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton,
                                QStackedWidget, QVBoxLayout, QWidget)
 
+from flygym_tracker.gui.elided_label import ElidedLabel
 from flygym_tracker.gui.preview import PULL_INTERVAL_MS, PreviewWidget
 from flygym_tracker.gui.video_jobs import FaceLearnJob, FileJobController, NoiseJob, PassiveJob
 
@@ -92,6 +93,10 @@ def _button(text: str, tip: str = "", role: str = "ghost") -> QPushButton:
 
 class VideoStage(QWidget):
     """The picture, its caption, and whatever controls the current video operation needs."""
+
+    #: The least height this widget will take: the picture's floor with room for its caption and
+    #: control strip under it. The window's `MIN_PICTURE_HEIGHT` is this number.
+    MIN_HEIGHT = 240
 
     #: The mode changed. The window uses it to enable/disable the things that need the picture.
     mode_changed = Signal(str)
@@ -177,7 +182,11 @@ class VideoStage(QWidget):
         self.caption = QLabel("Camera not open - nothing is being read")
         self.caption.setProperty("role", "note")
         self.caption.setWordWrap(True)
-        self.caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # A WRAPPING LABEL WITH A REAL MINIMUM WIDTH. It was `Ignored` width, and a wrapping label
+        # whose minimum width is zero reports a nonsense minimum HEIGHT (the sentence wrapped at
+        # zero width) -- measured at 1280 px the layout then placed this caption 16 px INTO the
+        # picture. A modest floor keeps the height honest; the picture above still takes the rest.
+        self.caption.setMinimumWidth(240)
         layout.addWidget(self.caption)
 
         self.bars = QStackedWidget()
@@ -187,6 +196,16 @@ class VideoStage(QWidget):
         self.bars.addWidget(self._build_band_bar())      # index 3 -- BAND
         self.bars.addWidget(self._build_run_bar())       # index 4 -- RUN
         layout.addWidget(self.bars)
+        # NO MARGINS AROUND THE STRIP. A QStackedWidget puts 9 px above and below its page by
+        # default; under the picture that is 18 px of nothing, taken from the one pane that needs it.
+        self.bars.layout().setContentsMargins(0, 0, 0, 0)
+        # AN HONEST MINIMUM HEIGHT, KEPT UP TO DATE WITH THE WIDTH. The strips wrap and the
+        # caption wraps, so what sits under the picture is taller when the pane is narrow -- and a
+        # QStackedWidget reports one bare line for a page of buttons whatever the width. Measured
+        # at 1280 x 720 the splitter took this widget at that understated minimum and the layout
+        # put the caption INTO the picture. See `_refresh_minimum_height`.
+        self._layout = layout
+        self._refresh_minimum_height()
 
     def _build_idle_bar(self) -> QWidget:
         widget, layout = _bar()
@@ -270,9 +289,8 @@ class VideoStage(QWidget):
         self.clear_tracks_button.clicked.connect(self.clear_tracks)
         layout.addWidget(self.clear_tracks_button)
 
-        self.tracks_note = QLabel("")
+        self.tracks_note = ElidedLabel("")
         self.tracks_note.setProperty("role", "note")
-        self.tracks_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.tracks_note)
         return widget
 
@@ -316,9 +334,31 @@ class VideoStage(QWidget):
     def draw_session(self):
         return self._draw
 
+    def _refresh_minimum_height(self) -> None:
+        """The least height this widget will take, at its CURRENT width and in its current mode.
+
+        The picture's own floor, plus the caption as it wraps at this width, plus the strip that is
+        showing as it wraps at this width, and never less than `MIN_HEIGHT`. Set as a real minimum
+        so the splitter and the window's scroll area both see it: below this the window scrolls,
+        and the caption and buttons are never laid over the picture.
+        """
+        width = max(self.width(), self.caption.minimumWidth())
+        caption = max(self.caption.heightForWidth(width), self.caption.minimumSizeHint().height())
+        page = self.bars.currentWidget()
+        strip = page.sizeHint().height() if page is not None else 0
+        if page is not None and page.layout() is not None and page.layout().hasHeightForWidth():
+            strip = max(strip, page.layout().heightForWidth(width))
+        need = self.view.minimumHeight() + caption + strip + 2 * self._layout.spacing()
+        self.setMinimumHeight(max(self.MIN_HEIGHT, need))
+
+    def resizeEvent(self, event) -> None:                      # noqa: N802 - Qt name
+        super().resizeEvent(event)
+        self._refresh_minimum_height()
+
     def _show_mode(self, mode: str) -> None:
         self._mode = mode
         self.bars.setCurrentIndex({CAMERA: 0, RUN: 4, DRAW: 1, JOB: 2, BAND: 3}.get(mode, 0))
+        self._refresh_minimum_height()
         # ONLY THE DRAWING MODES TAKE THE MOUSE. A view that always held focus would swallow
         # keystrokes the settings pane is entitled to -- and this window goes out of its way to
         # keep initial focus off anything that edits a camera setting.
@@ -446,7 +486,14 @@ class VideoStage(QWidget):
     def _on_draw_finished(self, payload: dict) -> None:
         self.files.stop()
         self._draw = None
-        self.show_camera()
+        # BACK TO WHATEVER THE PICTURE WAS SHOWING BEFORE THE DRAWING. A replay can be drawn on
+        # while it plays; a drawing that ended on the camera placeholder ("No picture - the camera
+        # is not open") made a replay that was still running look like it had been killed by
+        # saving the vials. The run is not touched by a drawing session, so its picture comes back.
+        if self.run is not None and getattr(self.run, "is_running", False):
+            self.show_run()
+        else:
+            self.show_camera()
         self._notice = payload.get("message", "")
         self._update_caption()
         self.job_finished.emit("draw", payload)
@@ -685,6 +732,13 @@ class VideoStage(QWidget):
             self.caption.setText("End of the recording - the last frame is held. "
                                  "Carry on drawing, or save and finish.")
             return
+        if self._mode != JOB:
+            # The reader that was only FEEDING FRAMES to a drawing session, ending after that
+            # session already did (`_on_draw_finished` stops it, and the finish arrives a beat
+            # later). It has nothing to report, and the picture has already gone back to where it
+            # belongs -- to a replay that is still running, or to the camera. Taking the picture
+            # to the camera here made a replay being drawn on look killed by saving the vials.
+            return
         payload.setdefault("message", _job_message(kind, payload))
         self.show_camera()
         self._notice = payload.get("message", "")
@@ -777,6 +831,10 @@ class VideoStage(QWidget):
         self._update_caption()
 
     def _update_caption(self) -> None:
+        self._write_caption()
+        self._refresh_minimum_height()      # a longer caption may wrap onto another line
+
+    def _write_caption(self) -> None:
         if self._mode == DRAW and self._draw is not None:
             self.caption.setText("%s   -   %s" % (self._draw.state.source_label,
                                                   self._draw.status()))

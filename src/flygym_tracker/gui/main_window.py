@@ -135,6 +135,10 @@ class MainWindow(QMainWindow):
         #: opened at hour 40 draws the whole run rather than only what arrives after it opened.
         self.behaviour = BehaviourSeries()
         self._plot_docks = {}
+        #: The recording a REPLAY is running, or None when the run is live (or nothing is running).
+        #: A replay holds no camera, so it is the one kind of run that can still be drawn on -- and
+        #: this is what says which file to draw on. See `_begin_draw`.
+        self._replay_video = None
         #: One-shot guard so the after-show geometry clamp (see `showEvent`) runs on the FIRST show
         #: only -- after that the operator is free to move or resize the window wherever they like.
         self._geometry_clamped = False
@@ -283,6 +287,11 @@ class MainWindow(QMainWindow):
         self._central_scroll.setWidget(central)
         self._central_scroll.setWidgetResizable(True)
         self._central_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # BUT NEVER NARROWER THAN THIS. A scroll area's minimum is tiny, and that let the dock area
+        # be dragged -- or grown by a graph opening -- until the central column was 0 px wide and
+        # the window was all dock. The floor is the picture's minimum width with the measurement
+        # row beside it; a graph that wants more than the rest of the window scrolls instead.
+        self._central_scroll.setMinimumWidth(self.MIN_CENTRAL_WIDTH)
         self.setCentralWidget(self._central_scroll)
         self.resize(*self._fitted_size(1180, 820))
 
@@ -764,7 +773,9 @@ class MainWindow(QMainWindow):
     #: one pane that cannot be read by scrolling.
     RESULTS_HEIGHT = 150
     #: Never leave the picture shorter than this, whatever the window is doing.
-    MIN_PICTURE_HEIGHT = 240
+    MIN_PICTURE_HEIGHT = VideoStage.MIN_HEIGHT
+    #: The least width the central column keeps against the docks (see `__init__`).
+    MIN_CENTRAL_WIDTH = 560
 
     def _share_width_with_results(self) -> None:
         """Give the measurement its band under the picture, the first time it appears.
@@ -847,11 +858,25 @@ class MainWindow(QMainWindow):
         exclusive camera, or two videos interleaving frames into one box -- which on screen looks
         exactly like a corrupted recording.
         """
-        from flygym_tracker.gui.video_stage import CAMERA
+        from flygym_tracker.gui.video_stage import CAMERA, RUN
 
-        self.run_panel.set_stage_busy(mode != CAMERA)
+        # RUN MODE IS NOT "BUSY". THE BUG THIS FIXES, reported from the rig after the draw-on-replay
+        # change: "Draw vial positions is not active while I replay a recording." The panel keeps
+        # that one button clickable for a replay -- but only while the stage is not busy, and
+        # `_begin_replay` had just called `show_run()`, which counted as busy. So the allowance was
+        # granted and vetoed in the same breath. A run's picture is the RUN'S: whether its tools
+        # are blocked is the panel's `_running` flag, decided by the run state, not by the mode of
+        # the stage. Busy means a DIFFERENT job (drawing, a noise floor, the band) holds the picture.
+        self.run_panel.set_stage_busy(mode not in (CAMERA, RUN))
 
     def _on_run_state(self, state: str, detail: str) -> None:
+        if state not in (STARTING, RUNNING):
+            # The replay is over; there is no longer a recording "currently playing" to draw on.
+            self._replay_video = None
+        # BEFORE `set_run_state`, which is what re-enables the tool buttons: the panel has to know
+        # this is a replay to keep "Draw vial positions" clickable, and a run whose tools are
+        # decided before that flag arrives would grey the button out for the first state change.
+        self.run_panel.set_replay(bool(self._replay_video))
         self.run_panel.set_run_state(state, detail)
         # THE RESULTS PANE APPEARS WITH THE RUN AND STAYS AFTER IT ENDS. Hiding it the moment the
         # run finishes would take the last bins off the screen at the exact moment somebody wants
@@ -916,6 +941,13 @@ class MainWindow(QMainWindow):
             others = [d for key, d in self._plot_docks.items() if key != field and d.isVisible()]
             anchor = others[-1] if others else self.settings_dock
             self.tabifyDockWidget(anchor, dock)
+            # AT THE WIDTH THE TAB GROUP ALREADY HAS. A graph's own size hint is a grid of sixteen
+            # cells and can be wider than the window; without this the left area grew to that hint
+            # when the graph opened and the picture, the measurement and the run controls were
+            # squeezed to nothing -- reported from the rig as "it looks like the old version",
+            # because nothing of the window was left but the graph.
+            width = anchor.width() if anchor.isVisible() and anchor.width() > 0 else 560
+            self.resizeDocks([dock], [width], Qt.Orientation.Horizontal)
         dock.show()
         dock.raise_()
         dock.refresh()
@@ -996,11 +1028,19 @@ class MainWindow(QMainWindow):
             then()
             return
         if self.run.is_running:
-            # The run owns the camera and must keep it. Saying so is the useful answer; opening
+            # A LIVE run owns the camera and must keep it. Saying so is the useful answer; opening
             # would fail with the SDK's culprit-free error, and stopping the run to draw vials
             # would end an experiment to change its calibration.
-            self.stage.caption.setText(
-                "the experiment has the camera - stop the run first, then %s" % why)
+            #
+            # A REPLAY owns nothing -- it reads a file -- so telling the operator to free a camera
+            # that was never taken sent them looking for a problem that did not exist. It still
+            # cannot have the camera opened underneath it here, but the reason is honest.
+            if self._replay_video:
+                self.stage.caption.setText(
+                    "a replay is running, not the camera - stop it first, then %s" % why)
+            else:
+                self.stage.caption.setText(
+                    "the experiment has the camera - stop the run first, then %s" % why)
             return
         self._camera_then = then
         self._camera_why = why
@@ -1063,10 +1103,26 @@ class MainWindow(QMainWindow):
         # geometry, not a preference, and it is not a config key precisely because it is the rig.
         from flygym_tracker.calibration import VIALS_PER_FACE
 
-        def draw():
+        def draw(video=None):
             if not self.stage.begin_draw(out_dir=calib, n_vials=VIALS_PER_FACE,
-                                         polygons=polygons):
+                                         polygons=polygons, video=video):
                 self.refresh_readiness()
+
+        # DRAWN ON THE RECORDING WHEN A REPLAY IS PLAYING, because a replay holds no camera. This
+        # used to route through `with_camera` like every other job, which answered "the experiment
+        # has the camera - stop the run first" -- a sentence that is true of a live run and simply
+        # false of a replay, and which left the operator unable to draw vials on a recording at all
+        # even though `VideoStage.begin_draw` has always been able to.
+        #
+        # THE RUNNING REPLAY KEEPS THE CALIBRATION IT STARTED WITH. Its per-vial masks were built
+        # when it started, so vials drawn now change the NEXT replay, not the numbers currently
+        # scrolling past. Saying so is the difference between a useful tool and a misleading one.
+        if self._replay_video and self.run.is_running:
+            self.stage.show_notice(
+                "drawing on the recording being replayed - the run in progress keeps the vial "
+                "positions it started with, so what you draw here applies to the NEXT replay")
+            draw(video=self._replay_video)
+            return
 
         self.with_camera(draw, why="draw the vial positions")
 
@@ -1172,6 +1228,10 @@ class MainWindow(QMainWindow):
             "config_path": self.controller.config_path,
             "source_factory": _video_source_factory(video),
             "replay_of": video,
+            # THE SAME TICKBOX AS A LIVE RUN. This key was missing here, so a replay tracked flies
+            # whatever "activity only" said -- reported from the rig as the tickbox "not working",
+            # which for the replays being used to check the software it was not.
+            "track_flies": self.session_bar.track_flies(),
         }
         self.results.clear()
         self.behaviour.clear()
@@ -1179,7 +1239,9 @@ class MainWindow(QMainWindow):
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()
+        self._replay_video = video
         if not self.run.start(plan):
+            self._replay_video = None
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             return
         self.stage.show_run()

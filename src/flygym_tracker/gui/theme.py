@@ -270,7 +270,7 @@ QPushButton[role="step"]:disabled {
    which is why arming is not a click anywhere on the cell. */
 QPushButton[role="ghost"] {
     background: transparent; border: 1px solid %(rule)s; border-radius: 3px;
-    color: %(dim)s; padding: 3px 8px; font-size: %(pt_small)dpt;
+    color: %(dim)s; padding: 3px 6px; font-size: %(pt_small)dpt;
 }
 QPushButton[role="ghost"]:hover { color: %(text)s; border-color: %(focus)s; }
 QPushButton[role="ghost"]:disabled { color: %(blocked)s; border-color: %(rule)s; }

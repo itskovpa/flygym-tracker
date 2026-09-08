@@ -27,7 +27,8 @@ import threading
 from typing import List, Optional
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QWidget
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QSizePolicy, QToolButton, QWidget
+from flygym_tracker.gui.elided_label import ElidedLabel
 
 #: What `serial: null` means, in the operator's words rather than YAML's.
 ANY_CAMERA = "use whatever camera is attached"
@@ -87,9 +88,8 @@ class CameraPicker(QWidget):
         self.refresh_button.clicked.connect(self._on_refresh_clicked)
         line.addWidget(self.refresh_button)
 
-        self.note = QLabel("")
+        self.note = ElidedLabel("")
         self.note.setProperty("role", "note")
-        self.note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         line.addWidget(self.note, 1)
 
         # OWNED BY THIS WIDGET, so it stops the moment the widget is destroyed. That ownership is

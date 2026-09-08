@@ -34,6 +34,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
                                QVBoxLayout, QWidget)
 
+from flygym_tracker.gui.elided_label import ElidedLabel
 from flygym_tracker.gui import theme
 
 #: The drum: two faces of sixteen.
@@ -151,14 +152,13 @@ class ResultsPanel(QWidget):
         title = QLabel("MEASURING NOW")
         title.setProperty("role", "grouptitle")
         live_head.addWidget(title)
-        self.live_note = QLabel("per frame, not yet binned - not in the file")
+        self.live_note = ElidedLabel("per frame, not yet binned - not in the file")
         self.live_note.setProperty("role", "note")
         # IGNORED WIDTH, like the other two notes, and this was measured. Its text grows once a run
         # starts posting to it ("face A - pixel threshold 15.0 - per frame, not yet binned - not in
         # the file"), and a plain QLabel's minimum width is its whole sentence: the window's minimum
         # went to 1740 px on a 1440 px desktop the moment a run began. The layout tests never caught
         # it because they build the window but never push a progress payload through it.
-        self.live_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         live_head.addWidget(self.live_note, 1)
         layout.addLayout(live_head)
 
@@ -187,7 +187,7 @@ class ResultsPanel(QWidget):
         # WHAT THE TABLE IS REPLACED BY, at this end: one line saying how much has been written.
         # That is the only question the table answered that a graph does not -- "is the file
         # actually growing" -- and it takes a line rather than a scrolling wall.
-        self.recorded_note = QLabel("no bins finished yet")
+        self.recorded_note = ElidedLabel("no bins finished yet")
         self.recorded_note.setProperty("role", "note")
         # NOT WRAPPED, now that this panel is a short band UNDER the picture rather than a tall
         # column beside it. A wrapping label's minimum height grows with its text, and these two
@@ -195,17 +195,15 @@ class ResultsPanel(QWidget):
         # Qt gave the band its minimum and squeezed the PICTURE, which is the one thing the layout
         # exists to protect. One line each, and the full text stays in the tooltip.
         self.recorded_note.setWordWrap(False)
-        self.recorded_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.recorded_note)
 
         # THE RECORDING, IF THERE IS ONE. Shown HERE rather than only beside its tick box because
         # that tick box lives in a section that collapses -- and a recorder quietly dropping frames
         # to a slow or filling disk looks exactly like one that is keeping up unless it is asked.
         # The answer is only worth anything while there is still time to lower the rate.
-        self.recording_note = QLabel("")
+        self.recording_note = ElidedLabel("")
         self.recording_note.setProperty("role", "note")
         self.recording_note.setWordWrap(False)
-        self.recording_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.recording_note.setVisible(False)
         layout.addWidget(self.recording_note)
         layout.addStretch(1)

@@ -22,7 +22,9 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
+
+from flygym_tracker.gui.elided_label import ElidedLabel
 
 from flygym_tracker.gui import theme
 from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERROR_OTHER, OPENING,
@@ -63,7 +65,7 @@ class CameraStatusBar(QWidget):
         self.dot.setFixedWidth(14)
         layout.addWidget(self.dot)
 
-        self.sentence = QLabel("")
+        self.sentence = ElidedLabel("")
         self.sentence.setWordWrap(False)
         # A STATUS LINE MUST NOT DECIDE HOW WIDE THE WINDOW IS. With the default policy this
         # label's sizeHint is the full width of its longest sentence ("Camera DA4282883 is yours -
@@ -72,7 +74,6 @@ class CameraStatusBar(QWidget):
         # widest thing in the window; the moment the settings moved into a dock beside it, the
         # window's minimum became 1752 px on a 1440 px desktop. Same rule the run band's state
         # label already follows, and the same rule as `flow_layout` -- fifth occurrence.
-        self.sentence.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.sentence, 1)
 
         self.open_button = QPushButton("Open camera")

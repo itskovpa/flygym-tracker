@@ -33,8 +33,9 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QPushButton,
                                QVBoxLayout, QWidget)
+from flygym_tracker.gui.elided_label import ElidedLabel
 
 from flygym_tracker.gui.flow_layout import flow_strip
 from flygym_tracker.gui.run_controller import DONE, FAILED, IDLE, RUNNING, STARTING, STOPPING
@@ -66,6 +67,7 @@ class RunPanel(QWidget):
         super().__init__(parent)
         self._running = False
         self._stage_busy = False
+        self._replay = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 6, 10, 6)
         outer.setSpacing(6)
@@ -87,9 +89,8 @@ class RunPanel(QWidget):
         self.stop_button.setEnabled(False)
         controls.addWidget(self.stop_button)
 
-        self.state_label = QLabel("No run in progress")
+        self.state_label = ElidedLabel("No run in progress")
         self.state_label.setProperty("role", "note")
-        self.state_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         controls.addWidget(self.state_label, 1)
 
         # The most-looked-at numbers in the app, in tabular monospace so they do not jitter as
@@ -104,24 +105,35 @@ class RunPanel(QWidget):
         # row of thirteen buttons would be the tool strip's width problem all over again.
         from flygym_tracker.gui.behaviour_series import PLOTTABLE
 
-        plot_row = QHBoxLayout()
-        plot_row.setSpacing(8)
+        # ON THE CONTROL ROW, at its right, not on a row of its own: the status sentence elides, so
+        # the row has room, and the picture above is what every saved row of height goes to.
         plot_label = QLabel("PLOT")
         plot_label.setProperty("role", "grouptitle")
-        plot_row.addWidget(plot_label)
+        controls.addWidget(plot_label)
         self.plot_box = QComboBox()
+        # Sized to a couple of dozen characters, not to its longest entry: the status sentence
+        # on this row is what must keep its room, and the picker's full names are in its list.
+        self.plot_box.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.plot_box.setMinimumContentsLength(22)
         for field, label in PLOTTABLE:
             self.plot_box.addItem(label, field)
         self.plot_box.setToolTip(
             "A behavioural parameter to plot as a timeseries, 8x2 vials per drum face. Each one "
             "opens its own dock, which can be floated, tabbed or closed.")
-        plot_row.addWidget(self.plot_box, 1)
+        controls.addWidget(self.plot_box)
         self.plot_button = QPushButton("Show graph")
         self.plot_button.setProperty("role", "ghost")
         self.plot_button.clicked.connect(
             lambda: self.plot_requested.emit(self.plot_box.currentData()))
-        plot_row.addWidget(self.plot_button)
-        outer.addLayout(plot_row)
+        controls.addWidget(self.plot_button)
+        outer.addLayout(controls)
+
+        # THE NUMBERS GET A LINE OF THEIR OWN. Beside the status sentence they were ~600 px of
+        # monospace that cut the sentence to "Run in progress - camera and algorith" at 1440 px.
+        # Hidden until there is something to count, so an idle window does not carry a blank row.
+        self.readout.setVisible(False)
+        outer.addWidget(self.readout)
 
         # THE JOBS THAT WERE IN run.bat. Buttons, not a numbered menu, and each one names what it
         # opens rather than what it is called internally.
@@ -165,16 +177,34 @@ class RunPanel(QWidget):
     #: The video jobs. All of them want frames, and there is one picture to show them in.
     VIDEO_TOOLS = ("draw_vials", "mark_band", "replay", "noise", "learn_faces")
 
+    #: The jobs that stay available while a REPLAY is playing. A replay reads a file and holds no
+    #: camera, so the reason the others are blocked -- "the run has the camera" -- is simply untrue
+    #: of it. Drawing vial positions is the one job wired to work on the recording being replayed
+    #: (`MainWindow._begin_draw` hands it the file), which is why it alone is listed: offering a
+    #: button whose job would then refuse would be the same broken promise in a new place.
+    REPLAY_TOOLS = ("draw_vials",)
+
     # -- state ----------------------------------------------------------------------------------
     def set_stage_busy(self, busy: bool) -> None:
         """A video job already has the picture, so nothing may start a second one."""
         self._stage_busy = bool(busy)
         self._refresh_tools()
 
+    def set_replay(self, replay: bool) -> None:
+        """Whether the run in progress is a REPLAY (a file) rather than a live acquisition."""
+        self._replay = bool(replay)
+        self._refresh_tools()
+
     def _refresh_tools(self) -> None:
         blocked = self._running or self._stage_busy
         for action in self.VIDEO_TOOLS:
-            getattr(self, "tool_%s_button" % action).setEnabled(not blocked)
+            # A replay blocks the picture, not the camera, so the jobs that can work on the
+            # recording itself stay clickable. The rig owner reported exactly this: "I cannot draw
+            # vials if I am replaying the video" -- the button was grey, so the fix further down
+            # the call path could never have been reached.
+            allowed = (blocked and self._replay and not self._stage_busy
+                       and action in self.REPLAY_TOOLS)
+            getattr(self, "tool_%s_button" % action).setEnabled(not blocked or allowed)
 
     def set_run_state(self, state: str, detail: str = "") -> None:
         """Enable exactly the actions that are legal now, and say what is happening in a sentence."""
@@ -190,6 +220,7 @@ class RunPanel(QWidget):
     def set_progress(self, payload: dict) -> None:
         """Render one throttled snapshot. Every figure here was counted by the pipeline."""
         elapsed = float(payload.get("elapsed_s") or 0.0)
+        self.readout.setVisible(True)
         self.readout.setText(
             "%s   %d frames   %.1f fps   %d rot   face %s%s" % (
                 _hms(elapsed), int(payload.get("frames") or 0),
@@ -239,7 +270,7 @@ def _state_sentence(state: str, detail: str) -> str:
     base = {
         IDLE: "No run in progress",
         STARTING: "Starting the run",
-        RUNNING: "Run in progress - camera and algorithm settings are live",
+        RUNNING: "Run in progress - settings stay live",
         STOPPING: "Stopping - finishing the current bin",
         DONE: "Run finished",
         FAILED: "Run could not start",

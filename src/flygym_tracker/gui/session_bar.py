@@ -27,9 +27,10 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QSpinBox, QToolButton,
+                               QHBoxLayout, QLabel, QLineEdit, QSpinBox, QToolButton,
                                QVBoxLayout, QWidget)
 
+from flygym_tracker.gui.elided_label import ElidedLabel
 from flygym_tracker.gui.camera_picker import CameraPicker
 from flygym_tracker.gui.flow_layout import FlowContainer
 
@@ -116,9 +117,8 @@ class SessionBar(QWidget):
         title.setProperty("role", "grouptitle")
         header.addWidget(title)
 
-        self.summary = QLabel("")
+        self.summary = ElidedLabel("")
         self.summary.setProperty("role", "note")
-        self.summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         header.addWidget(self.summary, 1)
         outer.addLayout(header)
 
@@ -258,9 +258,8 @@ class SessionBar(QWidget):
         self.record_scale.valueChanged.connect(self._emit_recording)
         line.addWidget(self.record_scale)
 
-        self.record_note = QLabel("")
+        self.record_note = ElidedLabel("")
         self.record_note.setProperty("role", "note")
-        self.record_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         line.addWidget(self.record_note)
         return row
 
@@ -338,9 +337,8 @@ class SessionBar(QWidget):
         self.activity_only_box.toggled.connect(self._on_tracking_toggled)
         line.addWidget(self.activity_only_box)
 
-        self.tracking_note = QLabel("")
+        self.tracking_note = ElidedLabel("")
         self.tracking_note.setProperty("role", "note")
-        self.tracking_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         line.addWidget(self.tracking_note)
         return row
 
