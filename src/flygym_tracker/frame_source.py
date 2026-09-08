@@ -338,6 +338,7 @@ class VideoFileSource(FrameSource):
         self._next_index = 0
         self._fps = 0.0
         self._frame_size = (0, 0)
+        self._timestamps = None
 
     def open(self) -> None:
         import cv2
@@ -347,12 +348,49 @@ class VideoFileSource(FrameSource):
         cap = cv2.VideoCapture(self.path)
         if not cap.isOpened():
             raise RuntimeError(f"could not open video file: {self.path!r}")
+        try:
+            self._timestamps = self._load_timestamps(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        except Exception:
+            cap.release()
+            raise
         self._cap = cap
         self._fps = float(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self._frame_size = (width, height)
         self._next_index = 0
+
+    def _load_timestamps(self, frame_count):
+        """Use the recorder's sidecar; never silently replace corrupt timing with index/fps."""
+        import csv
+        import math
+        from pathlib import Path
+
+        video = Path(self.path)
+        path = video.with_name(video.stem + "_frames.csv")
+        if not path.exists():
+            return None
+        stamps = []
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as stream:
+                for index, row in enumerate(csv.DictReader(stream)):
+                    stamp = float(row["elapsed_s"])
+                    if int(row["video_frame"]) != index:
+                        raise ValueError("video_frame indices must start at zero and be consecutive")
+                    if not math.isfinite(stamp) or stamp < 0 or (stamps and stamp < stamps[-1]):
+                        raise ValueError("elapsed_s must be finite, nonnegative and nondecreasing")
+                    stamps.append(stamp)
+            if not stamps or (frame_count > 0 and len(stamps) != frame_count):
+                raise ValueError("timestamp row count does not match the video frame count")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid recording timestamps in {path}: {exc}") from exc
+        return stamps
+
+    def recorded_elapsed_s(self, index: int) -> Optional[float]:
+        """Original experiment time for a frame, or None for a video without a sidecar."""
+        if self._timestamps is None:
+            return None
+        return self._timestamps[index]
 
     def read(self) -> Optional[Frame]:
         import cv2
@@ -388,6 +426,7 @@ class VideoFileSource(FrameSource):
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+        self._timestamps = None
 
     @property
     def fps(self) -> float:

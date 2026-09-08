@@ -59,6 +59,14 @@ middle of an experiment.
 Requires the HikRobot **MVS** runtime installed (for live capture); the `MvImport` Python SDK is
 loaded from the MVS install directory at runtime.
 
+### Replay timing
+
+Keep a recording's `video_<stamp>_frames.csv` beside its AVI. Replay automatically uses this
+sidecar's `elapsed_s` values, preserving experiment timing even when video frames were skipped
+or dropped. Without a sidecar, replay uses nominal frame-index / FPS timing. A present but
+invalid sidecar is reported as an error rather than silently changing the time axis.
+Replaying compressed or incomplete video cannot reproduce every measurement from live frames.
+
 ## Licence
 
 **[PolyForm Noncommercial 1.0.0](LICENSE)** — free for noncommercial use.

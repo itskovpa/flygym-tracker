@@ -894,8 +894,7 @@ def _cmd_replay(args) -> int:
     logger = _build_logger(config, args, _make_run_id())
     marker_detector = _build_marker_detector(config, calib)
 
-    # clock="auto" already resolves to the video's own index/fps clock for a VideoFileSource
-    # (pipeline.py), which is exactly the "offline dev path bins by content time" behaviour wanted.
+    # Auto uses recorded elapsed times from a sidecar when present, otherwise index/fps.
     return _run_pipeline_or_report(
         config, calib, source, logger, marker_detector,
         clock="auto", max_frames=args.max_frames, stop_flag=None, monitor=args.monitor,

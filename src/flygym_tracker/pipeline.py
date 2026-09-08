@@ -14,15 +14,15 @@ elapsed time maps to bins, and how a completed `ActivityBin` becomes `ActivityRe
 Elapsed clock (DESIGN.md §5.2/§7)
 --------------------------------
 `elapsed_s` (used for binning, `ActivityRecord.elapsed_s`, and the ISO bin timestamps) is derived
-one of two ways, selected by the `clock` argument:
+according to the `clock` argument:
 
   * ``"monotonic"`` (live default): ``frame.t_monotonic - t0`` where ``t0`` is the first frame's
     monotonic timestamp. This tracks *real* elapsed wall time, which is what a live multi-day
     experiment wants even if frames are dropped.
-  * ``"index"`` (video default): ``frame.index / source.fps``. This tracks *content* time, so an
+  * ``"index"``: ``frame.index / source.fps``. This tracks nominal playback time, so an
     offline replay bins by the video's own timeline regardless of how fast it is processed.
-  * ``"auto"`` (default): ``"index"`` for a `VideoFileSource`, ``"monotonic"`` for everything else
-    (live camera / in-memory sources).
+  * ``"auto"`` (default): recorded sidecar elapsed times for a `VideoFileSource` when available,
+    otherwise ``"index"``; ``"monotonic"`` for live camera / in-memory sources.
 
 Wall-clock ISO timestamps for the output table are anchored to the first frame's ``t_wall_iso``
 (``run wall-start``) and offset by ``bin_start_s``/``bin_end_s``, so `bin_start_iso`/`bin_end_iso`
@@ -410,6 +410,7 @@ class TrackerPipeline:
         self.accumulator = ActivityAccumulator(bin_seconds=self.bin_seconds)
 
         # -- clock selection ------------------------------------------------------------------
+        self._use_recorded_clock = clock == "auto" and isinstance(source, VideoFileSource)
         if clock == "auto":
             self._use_index_clock = isinstance(source, VideoFileSource)
         elif clock == "index":
@@ -1442,6 +1443,10 @@ class TrackerPipeline:
         self._t0_monotonic = float(frame.t_monotonic)
 
     def _elapsed(self, frame) -> float:
+        if self._use_recorded_clock:
+            recorded = self.source.recorded_elapsed_s(frame.index)
+            if recorded is not None:
+                return recorded
         if self._use_index_clock:
             return float(frame.index) / self._fps
         return float(frame.t_monotonic) - float(self._t0_monotonic)
