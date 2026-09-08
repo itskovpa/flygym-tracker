@@ -306,7 +306,14 @@ class BehaviourPlotPanel(QWidget):
             points = {face: {i: (pts[-cap:] if pts else pts) for i, pts in cells.items()}
                       for face, cells in points.items()}
         value_range = _range_of(points)
-        time_range = _time_range_of(points) if cap else self.series.time_range()
+        time_range = _time_range_of(points)
+        if not cap:
+            # Bin centres can precede the first row or follow the last one. Include
+            # both the recorded interval and the drawn points so neither is clipped.
+            recorded_range = self.series.time_range()
+            if recorded_range is not None and time_range is not None:
+                time_range = (min(recorded_range[0], time_range[0]),
+                              max(recorded_range[1], time_range[1]))
         shared = self.shared_scale()
         for face, grid in self.grids.items():
             grid.configure(field=self.field, bin_seconds=bin_seconds, cumulative=cumulative,

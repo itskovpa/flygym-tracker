@@ -394,6 +394,7 @@ class MainWindow(QMainWindow):
         self.run.progress.connect(self.results.set_progress)
         self.run.progress.connect(self._on_run_progress)
         self.run.bin_done.connect(self._on_activity_rows)
+        self.run.bin_done.connect(self.results.add_bin)
         self.run.behaviour_done.connect(self._on_behaviour_rows)
         self.run.setting_applied.connect(self._on_run_setting_applied)
         self.session_bar.config_changed.connect(self._on_config_changed)

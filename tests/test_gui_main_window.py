@@ -70,6 +70,15 @@ def test_the_window_has_all_five_bands(qapp, window):
     assert window.settings_view.save_button is not None
 
 
+def test_completed_bin_updates_both_recorded_summary_and_plot_history(qapp, window):
+    window.run.bin_done.emit({"records": [
+        {"elapsed_s": 10, "face": "A", "vial_id": 1, "motion_px_sum": 123}
+    ]})
+    qapp.processEvents()
+    assert "1 bin(s), 1 row(s)" in window.results.recorded_note.text()
+    assert window.behaviour.series("motion_px_sum", "A", 0, bin_seconds=0) == [(10, 123)]
+
+
 # =============================================================================================
 # Where graphs open
 # =============================================================================================
