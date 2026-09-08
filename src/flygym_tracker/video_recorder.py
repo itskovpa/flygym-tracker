@@ -111,7 +111,7 @@ class VideoRecorder:
     # -- lifecycle ---------------------------------------------------------------------------
     @property
     def is_recording(self) -> bool:
-        return self._thread is not None and self.error is None
+        return self._thread is not None and not self._closing and self.error is None
 
     def start(self, width: int, height: int) -> bool:
         """Open the file for frames of this size. False (with `error` set) if it cannot be.
@@ -120,6 +120,8 @@ class VideoRecorder:
         what was ASKED of the camera, and a camera that rounded to its increment would leave every
         submitted frame silently refused by a writer expecting the requested size.
         """
+        if self._closing or self.error is not None:
+            return False
         if self._thread is not None:
             return self.error is None
         width = max(2, int(round(int(width) * self.scale)) // 2 * 2)
@@ -146,6 +148,7 @@ class VideoRecorder:
                 self._open_timestamps()
         except Exception as exc:                      # pragma: no cover - backend-specific
             self.error = "could not start recording: %s" % exc
+            self._release_resources()
             return False
 
         self._thread = threading.Thread(target=self._loop, name="video-recorder", daemon=True)
@@ -169,7 +172,7 @@ class VideoRecorder:
         frames as the baseline of the next difference and this thread would otherwise be reading an
         array the measurement is still using.
         """
-        if self.error is not None or image is None:
+        if self._closing or self.error is not None or image is None:
             return False
         if self._thread is None:
             # OPENED FROM THE FIRST FRAME, which is where the true frame size is. See `start`.
@@ -180,6 +183,8 @@ class VideoRecorder:
             self.frames_skipped += 1
             return False
         with self._lock:
+            if self._closing or self.error is not None:
+                return False
             if len(self._queue) >= QUEUE_FRAMES:
                 # THE ENCODER IS BEHIND THE CAMERA. Losing this frame of video is the cheaper of
                 # the two available failures; making the pipeline wait is the other one.
@@ -197,15 +202,23 @@ class VideoRecorder:
         the backstop -- a wedged codec must not stop the window closing.
         """
         thread = self._thread
+        with self._lock:
+            self._closing = True
+            self._wake.notify_all()
         if thread is not None:
-            with self._lock:
-                self._closing = True
-                self._wake.notify_all()
             thread.join(timeout)
+            if thread.is_alive():
+                self.error = self.error or "recording finalization timed out; encoder still draining"
+                return self.stats()
             self._thread = None
+        return self.stats()
+
+    def _release_resources(self) -> None:
+        """Only the encoder releases its resources once it has started."""
         if self._writer is not None:
             try:
-                self._writer.release()
+                with CV_LOCK:
+                    self._writer.release()
             except Exception:                          # pragma: no cover - backend-specific
                 pass
             self._writer = None
@@ -215,7 +228,6 @@ class VideoRecorder:
             except Exception:                          # pragma: no cover
                 pass
             self._stamp_file = self._stamp_writer = None
-        return self.stats()
 
     def stats(self) -> dict:
         """What was written, what was skipped by request, and what was lost to load."""
@@ -236,6 +248,12 @@ class VideoRecorder:
 
     # -- the worker --------------------------------------------------------------------------
     def _loop(self) -> None:
+        try:
+            self._drain_queue()
+        finally:
+            self._release_resources()
+
+    def _drain_queue(self) -> None:
         while True:
             with self._lock:
                 while not self._queue and not self._closing:
@@ -248,9 +266,12 @@ class VideoRecorder:
             try:
                 self._write(image, elapsed_s)
             except Exception as exc:                   # pragma: no cover - backend-specific
-                # One bad frame does not end the recording, but a failure that persists is recorded
-                # so the run summary can say the file is short rather than implying it is complete.
+                # Stop the optional recording and count accepted frames lost on failure.
+                # The measurement continues, and the summary reports the incomplete video.
                 self.error = "write failed: %s" % exc
+                with self._lock:
+                    self.frames_dropped += 1 + len(self._queue)
+                    self._queue.clear()
                 return
 
     def _write(self, image: np.ndarray, elapsed_s: float) -> None:

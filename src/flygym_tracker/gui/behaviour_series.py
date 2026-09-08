@@ -21,14 +21,14 @@ zero -- an empty vial has no height, which is not the same claim as "its flies a
 A bin with nothing measurable in it yields no point at all, so a gap in the line is a gap in the
 data rather than a dip toward zero.
 
-CUMULATIVE MEANS RUNNING SUM OF THE BINNED VALUES. For a rate-like parameter (path length per
-dwell) that is a genuine total-distance-so-far curve. For a level-like one (mean height) it is
-not meaningful, and nothing here pretends otherwise -- the control is offered because the operator
-asked for it and knows which parameters it suits.
+CUMULATIVE MEANS RUNNING SUM OF THE RETAINED BIN MEDIANS (raw mode: retained samples).
+It depends on display bin width and history retention, and is not total distance travelled.
+For a level-like parameter (mean height) it is not meaningful.
 """
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
 #: Parameters offered for plotting, in the order they are shown, as ``(field, label)``.
@@ -92,7 +92,7 @@ def _is_number(value) -> bool:
         number = float(value)
     except (TypeError, ValueError):
         return False
-    return not math.isnan(number)
+    return math.isfinite(number)
 
 
 def _median(values: Sequence[float]) -> float:
@@ -112,10 +112,11 @@ class BehaviourSeries:
 
     def __init__(self, max_rows: int = 200_000) -> None:
         #: ``(elapsed_s, face, vial_id, {field: value})`` per row.
-        self._rows: List[Tuple[float, str, int, dict]] = []
+        self._rows = deque()
+        self._by_vial = {}
         #: A 3-day run at ~2 s dwells over 32 vials is ~4 million rows; the file holds them all and
         #: this is for watching, so the oldest are dropped once the cap is reached.
-        self._max_rows = int(max_rows)
+        self._max_rows = max(0, int(max_rows))
         self.dropped_rows = 0
         #: ``(face, local_index) -> lit_area_px``, harvested from whatever rows carry `lit_area_px`
         #: (the activity rows do; the tracking rows do not). The lit area of a vial is FIXED for a
@@ -127,7 +128,8 @@ class BehaviourSeries:
         return len(self._rows)
 
     def clear(self) -> None:
-        self._rows = []
+        self._rows.clear()
+        self._by_vial.clear()
         self.dropped_rows = 0
         self._vial_area = {}
 
@@ -139,9 +141,14 @@ class BehaviourSeries:
                 elapsed = float(row["elapsed_s"])
                 face = str(row["face"])
                 vial = int(row["vial_id"])
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, OverflowError):
                 continue
-            self._rows.append((elapsed, face, vial, dict(row)))
+            if not math.isfinite(elapsed):
+                continue
+            entry = (elapsed, face, vial, dict(row))
+            self._rows.append(entry)
+            key = (face, self.local_index(face, vial))
+            self._by_vial.setdefault(key, deque()).append(entry)
             # HARVEST THE VIAL'S LIT AREA when the row carries it (activity rows do). Constant per
             # vial, so the latest wins and one value serves the whole run -- including for this
             # vial's tracking metrics, whose own rows have no area of their own.
@@ -149,14 +156,19 @@ class BehaviourSeries:
             if area is not None:
                 try:
                     area_px = int(area)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     area_px = 0
                 if area_px > 0:
                     self._vial_area[(face, self.local_index(face, vial))] = area_px
             added += 1
         overflow = len(self._rows) - self._max_rows
         if overflow > 0:
-            del self._rows[:overflow]
+            for _ in range(overflow):
+                _, face, vial, _ = self._rows.popleft()
+                key = (face, self.local_index(face, vial))
+                self._by_vial[key].popleft()
+                if not self._by_vial[key]:
+                    del self._by_vial[key]
             self.dropped_rows += overflow
         return added
 
@@ -199,13 +211,16 @@ class BehaviourSeries:
         a metric that does not scale with area (a speed, a height, a per-fly figure) is never
         touched even when the flag is on.
         """
+        raw = float(bin_seconds) <= 0
         width = max(1e-6, float(bin_seconds))
         buckets: Dict[int, List[float]] = {}
-        for elapsed, row_face, vial, row in self._rows:
-            if row_face != face or self.local_index(row_face, vial) != vial_index:
-                continue
+        points = []
+        for elapsed, row_face, vial, row in self._by_vial.get((face, vial_index), ()):
             value = row.get(field)
             if not _is_number(value):
+                continue
+            if raw:
+                points.append((elapsed, float(value)))
                 continue
             # `math.floor(elapsed / width + eps)`, NOT `elapsed // width`: floor division on floats
             # puts a value that is an exact multiple of the width into the WRONG bucket, because the
@@ -214,10 +229,11 @@ class BehaviourSeries:
             # point. The epsilon is a fraction of one bin, far below any real spacing.
             bucket = int(math.floor(elapsed / width + 1e-9))
             buckets.setdefault(bucket, []).append(float(value))
-        if not buckets:
-            return []
-        points = [((index + 0.5) * width, _median(values))
-                  for index, values in sorted(buckets.items())]
+        if raw:
+            points.sort(key=lambda point: point[0])
+        else:
+            points = [((index + 0.5) * width, _median(values))
+                      for index, values in sorted(buckets.items())]
         # AREA NORMALISATION is a constant per-vial factor, so median(k*v) == k*median(v): applying
         # it to the binned medians here is identical to scaling every raw row, and cheaper. Only the
         # extensive fields are eligible; everything else is returned exactly as measured.

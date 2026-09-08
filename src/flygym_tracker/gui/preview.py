@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import numpy as np
+
 from PySide6.QtCore import QPointF, QRect, Qt, Signal
 from PySide6.QtGui import QImage, QPainter
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -251,9 +253,12 @@ class PreviewWidget(QWidget):
         """
         if array is None or getattr(array, "ndim", 0) != 2:
             return
+        if array.dtype != np.uint8:
+            return
         height, width = array.shape
         if width <= 0 or height <= 0:
             return
+        array = np.ascontiguousarray(array)
         # Replaced TOGETHER: the QImage borrows this exact buffer (see the module docstring).
         self._array = array
         self._image = QImage(array.data, width, height, width, QImage.Format.Format_Grayscale8)

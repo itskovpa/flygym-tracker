@@ -216,8 +216,9 @@ class BehaviourPlotPanel(QWidget):
 
         self.cumulative_box = QCheckBox("cumulative")
         self.cumulative_box.setToolTip(
-            "Running sum of the binned values. A genuine total-so-far for a rate-like parameter "
-            "such as path length; not meaningful for a level such as mean height.")
+            "Running sum of the retained bin medians (raw mode: retained samples). "
+            "This depends on display bin width and live-history retention; it is not total "
+            "distance travelled. Not meaningful for a level such as mean height.")
         self.cumulative_box.toggled.connect(self.refresh)
         controls.addWidget(self.cumulative_box)
 
@@ -254,9 +255,11 @@ class BehaviourPlotPanel(QWidget):
 
         self.range_label = QLabel("")
         self.range_label.setProperty("role", "note")
-        self.range_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        controls.addWidget(self.range_label)
+        self.range_label.setWordWrap(True)
+        self.range_label.setMinimumWidth(0)
+        self.range_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout.addLayout(controls)
+        layout.addWidget(self.range_label)
 
         self.grids = {}
         for face in FACES:
@@ -321,10 +324,17 @@ class BehaviourPlotPanel(QWidget):
                 # rescaled to the median ROI so the vials compare.
                 span += "   -   per ROI area (x median/area)"
             if time_range is not None:
-                span += "   -   %s of run" % _hms(time_range[1])
+                span += "   -   showing %s to %s" % (_hms(time_range[0]), _hms(time_range[1]))
+            if cumulative:
+                span += ("   -   sum of retained samples" if bin_seconds <= 0 else
+                         "   -   sum of retained-bin medians")
             # THE RANGE IS PRINTED because every cell shares it: without the numbers, a tall line
             # in one cell and a flat one in another are not comparable, which is the whole point.
             self.range_label.setText(span)
+        if self.series.dropped_rows:
+            self.range_label.setText(self.range_label.text() +
+                                     "   -   %s older rows omitted from live history; CSV unchanged"
+                                     % format(self.series.dropped_rows, ","))
 
 
 class BehaviourPlotDock(QDockWidget):
