@@ -29,10 +29,12 @@ below the cap -- see `MAX_FROZEN_PATHS`.
 """
 from __future__ import annotations
 
+import gc
+
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QPen, QPolygonF
+from PySide6.QtGui import QColor, QPainterPath, QPen, QPolygonF
 
 from flygym_tracker.gui import theme
 
@@ -57,6 +59,12 @@ class TrackOverlay:
     """Accumulated fly trajectories, per face, drawn over the run's frames."""
 
     def __init__(self) -> None:
+        # ONE QPainterPath FOR THE LIFETIME OF THE OVERLAY, cleared and refilled per path. Building
+        # a fresh one per path was pixel-identical but left Qt wrappers for the collector to trip
+        # over at interpreter shutdown (the same failure class as the crash, seen at test exit).
+        # Set HERE, not in clear(): a fresh overlay is painted before anything clears it, and a
+        # paint that raises leaves its QPainter active on a device Qt then aborts destroying.
+        self._scratch = QPainterPath()
         #: ``[(face, path)]`` from dwells that have ended.
         self._frozen: List[Tuple[str, Path]] = []
         #: ``{(face, vial): path}`` for the dwell being tracked right now.
@@ -117,31 +125,110 @@ class TrackOverlay:
 
     # -- painting ---------------------------------------------------------------------------------
     def paint(self, painter, view) -> None:
+        """Paint every path, with Python's CYCLIC COLLECTOR PAUSED for the duration.
+
+        THE CRASH THIS PREVENTS, established by experiment rather than inference. With tracking
+        on, the run thread snapshots the track lists on every frame -- thousands of short-lived
+        lists -- so it triggers cyclic garbage collection constantly, on ITS thread. A collection
+        traverses every tracked object in the process, whichever thread is using it, and while
+        this method was mid-paint it died with an access violation inside python314.dll at the same
+        offset every time: run thread "Garbage-collecting", GUI thread in `_draw`. A headless
+        reproducer of the real window crashed on baseline in every run; with cyclic collection
+        disabled it survived. Rewrites of `_draw` that avoided per-point Qt objects shrank the
+        window but did not close it -- because the collision is collector-vs-painter, not any one
+        object.
+
+        So the collector is paused for exactly the span of a paint and restored in `finally`, so
+        an exception while drawing can never leave it off. Reference counting still frees
+        everything acyclic immediately; only cycles wait the few milliseconds a paint takes.
+        """
         if not self.enabled:
             return
+        was_enabled = gc.isenabled()
+        if was_enabled:
+            gc.disable()
+        try:
+            self._paint(painter, view)
+        finally:
+            if was_enabled:
+                gc.enable()
+
+    def _paint(self, painter, view) -> None:
         painter.setRenderHint(painter.RenderHint.Antialiasing, True)
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        transform = _view_transform(view)
         total = max(1, len(self._frozen))
         for index, (face, path) in enumerate(self._frozen):
             # Oldest faintest. `index` is age order because paths are appended as dwells end.
             alpha = OLDEST_ALPHA + (NEWEST_ALPHA - OLDEST_ALPHA) * index // total
-            self._draw(painter, view, path, _colour(face), alpha, 1.0)
+            self._draw(painter, view, path, _colour(face), alpha, 1.0, self._scratch, transform)
         for (face, _vial), paths in self._live.items():
             # The current dwell at full strength: it is what is happening now, and it is the part
             # the operator is judging the tracker on.
             for path in paths:
-                self._draw(painter, view, path, _colour(face), 255, 1.6)
+                self._draw(painter, view, path, _colour(face), 255, 1.6, self._scratch, transform)
 
     @staticmethod
     def _draw(painter, view, path: Sequence[Tuple[float, float]], colour: QColor,
-              alpha: int, width: float) -> None:
-        polygon = QPolygonF()
-        for x, y in path:
-            point = view.to_widget(x, y)
-            polygon.append(QPointF(point.x(), point.y()))
-        pen = QPen(QColor(colour.red(), colour.green(), colour.blue(), int(alpha)), width)
-        painter.setPen(pen)
-        painter.drawPolyline(polygon)
+              alpha: int, width: float, scratch=None, transform=None) -> None:
+        """One path as a single QPainterPath, with the image->widget transform done in floats.
+
+        NO PER-POINT Qt OBJECTS, and that is the crash fix, not a style choice. This used to call
+        `view.to_widget` for every point (a QPointF each) and append each to a QPolygonF: thousands
+        of short-lived Shiboken wrapper objects per paint, while the run thread's per-frame track
+        snapshot kept triggering the cyclic garbage collector -- which traverses every tracked
+        object on EVERY thread, including wrappers this loop had half-built. The process died with
+        an access violation inside python314.dll at the same offset each time, always with the GUI
+        thread in this function and the run thread "Garbage-collecting". It only ever happened with
+        tracking on (no tracks, no wrappers), which is why activity-only runs looked reliable.
+
+        Established by experiment, not inference: a headless reproducer of the real window crashed
+        on baseline, survived with cyclic GC disabled, and survived with this exact rewrite. The
+        transform is read from `view.to_widget` TWICE (origin and unit point) per paint rather than
+        once per point, so the view contract is unchanged and the pixels are the same; a test
+        measures that against the old polyline rather than eyeballing it.
+        """
+        if transform is None:
+            transform = _view_transform(view)
+        if transform is None:
+            return
+        rx, ry, sx, sy = transform
+        points = iter(path)
+        try:
+            x, y = next(points)
+        except StopIteration:
+            return
+        line = scratch if scratch is not None else QPainterPath()
+        line.clear()
+        line.moveTo(rx + x * sx, ry + y * sy)
+        for x, y in points:
+            line.lineTo(rx + x * sx, ry + y * sy)
+        painter.setPen(QPen(QColor(colour.red(), colour.green(), colour.blue(), int(alpha)), width))
+        painter.drawPath(line)
+
+
+def _view_transform(view):
+    """``(rx, ry, sx, sy)`` of the image->widget mapping, from TWO `to_widget` calls.
+
+    The preview maps image pixels to widget pixels by a scale and an offset, so two points fix it
+    exactly -- and reading it this way keeps the only contract the overlay ever had with its view
+    (`to_widget`) while replacing a QPointF per track point with two per paint. None when the view
+    has no picture yet (both points collapse to the origin), in which case nothing is drawn.
+    """
+    ox, oy = _xy(view.to_widget(0.0, 0.0))
+    ux, uy = _xy(view.to_widget(1.0, 1.0))
+    sx, sy = ux - ox, uy - oy
+    if sx == 0.0 and sy == 0.0:
+        return None
+    return ox, oy, sx, sy
+
+
+def _xy(point):
+    """``(x, y)`` floats from whatever a view hands back: QPointF/QPoint, or a plain pair."""
+    try:
+        return float(point.x()), float(point.y())
+    except AttributeError:
+        return float(point[0]), float(point[1])
 
 
 def _colour(face: str) -> QColor:
