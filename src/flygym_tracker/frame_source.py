@@ -356,14 +356,24 @@ class VideoFileSource(FrameSource):
 
     def read(self) -> Optional[Frame]:
         import cv2
+        from flygym_tracker.cv_setup import CV_LOCK
 
         if self._cap is None:
             raise RuntimeError("VideoFileSource is not open; call open() first")
-        ok, image = self._cap.read()
-        if not ok or image is None:
-            return None
-        if image.ndim == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # UNDER THE SHARED OpenCV LOCK, and this is the replay crash. Decoding a frame and converting
+        # it are OpenCV work on the pipeline thread, once per frame -- and they ran while the fly-
+        # tracking workers were inside OpenCV holding CV_LOCK. Two threads in OpenCV at once corrupts
+        # the allocator; the process then died with an access violation inside python314.dll at the
+        # same offset every time, tripped wherever the heap was next touched hard (the track overlay's
+        # paint loop). Only REPLAYS read through cv2 -- the live camera goes through the vendor SDK --
+        # which is why every crash on the rig was a replay with tracking on, and why the same replay
+        # ran clean headless: nothing there hammers the heap enough to notice.
+        with CV_LOCK:
+            ok, image = self._cap.read()
+            if not ok or image is None:
+                return None
+            if image.ndim == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         image = np.ascontiguousarray(image, dtype=np.uint8)
         frame = Frame(
             image=image,

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from flygym_tracker.types import TrackState
@@ -84,7 +83,9 @@ class RotationDetector:
         Uses `cv2.absdiff` rather than plain numpy subtraction so unsigned (e.g. uint8) frames
         don't wrap around on underflow.
         """
-        diff = cv2.absdiff(cur, prev)
+        # Out of OpenCV for the same concurrency reason as activity.per_frame_activity;
+        # maximum-minimum is exact for unsigned input and bit-identical to cv2.absdiff.
+        diff = np.maximum(cur, prev) - np.minimum(cur, prev)
         if mask is not None:
             if not np.any(mask):
                 return 0.0

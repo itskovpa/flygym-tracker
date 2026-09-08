@@ -40,13 +40,25 @@ def _imports(module_path: pathlib.Path):
     return names
 
 
-def test_the_activity_path_does_not_import_opencv():
-    """THE INVARIANT, checked statically so it cannot regress by accident. If a future change wants
+@pytest.mark.parametrize("module", ["activity.py", "rotation.py"])
+def test_the_per_frame_measurement_paths_do_not_import_opencv(module):
+    """THE INVARIANT, checked statically so it cannot regress by accident. Both modules do one
+    absdiff per frame on the pipeline thread; both now do it in numpy. If a future change wants
     OpenCV here it must also answer for the lock -- and this test is where that argument happens."""
-    assert "cv2" not in _imports(SRC / "activity.py"), (
-        "activity.py imports cv2 again: the per-vial hot path is back inside OpenCV, "
-        "unsynchronised against the tracking workers")
+    assert "cv2" not in _imports(SRC / module), (
+        "%s imports cv2 again: a per-frame pipeline-thread path is back inside OpenCV, "
+        "unsynchronised against the tracking workers" % module)
 
+
+def test_replay_frame_decoding_is_serialised_against_the_workers():
+    """THE REPLAY CRASH. VideoFileSource.read decodes with cv2 once per frame on the pipeline
+    thread; it is the only per-frame OpenCV call left there, and only replays go through it --
+    which is why every crash on the rig was a replay with tracking on."""
+    text = (SRC / "frame_source.py").read_text(encoding="utf-8")
+    body = text[text.index("class VideoFileSource"):]
+    body = body[body.index("def read("):body.index("def close(")]
+    assert "with CV_LOCK:" in body, "VideoFileSource.read decodes outside CV_LOCK"
+    assert "self._cap.read()" in body.split("with CV_LOCK:")[1],         "the cv2 decode happens before the lock is taken"
 
 @pytest.mark.parametrize("shape", [(4, 4), (37, 61), (400, 160)])
 def test_the_replacement_is_bit_identical_to_cv2_absdiff(shape):
@@ -85,5 +97,5 @@ def test_every_other_opencv_caller_still_takes_the_lock():
 def test_the_pipeline_locks_its_per_dwell_opencv_work():
     """`find_strips` and `identify_face` are OpenCV on the pipeline thread, once per dwell."""
     text = (SRC / "pipeline.py").read_text(encoding="utf-8")
-    assert text.count("with CV_LOCK:") >= 2, \
-        "the per-dwell marker/band OpenCV calls are no longer serialised"
+    assert text.count("with CV_LOCK:") >= 4, \
+        "a per-dwell OpenCV call on the pipeline thread is no longer serialised"

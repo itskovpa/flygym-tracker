@@ -845,7 +845,9 @@ class TrackerPipeline:
             return cb, np.zeros((0, 0), dtype=bool)
         sub = illum_mask[y:y + h, x:x + w] == 255
         if shape is not None:
-            sub = sub & quad_polygon_mask(shape, cb)
+            # cv2.fillPoly, reached per dwell through _apply_registration on the pipeline thread.
+            with CV_LOCK:
+                sub = sub & quad_polygon_mask(shape, cb)
         return cb, sub
 
     def _default_max_shift(self) -> float:
@@ -1309,7 +1311,11 @@ class TrackerPipeline:
             # No supplied reference: adopt this first stationary frame; ROIs stay at calibration.
             self._face_refs[face] = np.asarray(gray).copy()
             return
-        dx, dy, residual = estimate_shift(gray, ref, mask=self._face_lit_mask[face])
+        # phaseCorrelate is OpenCV on the pipeline thread, once per dwell: same rule as the marker
+        # calls. Scope closes before _apply_registration, whose own OpenCV leaf takes the lock
+        # again -- CV_LOCK does not re-enter, so the two must not nest.
+        with CV_LOCK:
+            dx, dy, residual = estimate_shift(gray, ref, mask=self._face_lit_mask[face])
         too_large = abs(dx) > self.max_shift or abs(dy) > self.max_shift
         if residual <= self.max_residual and not too_large:
             self._apply_registration(face, dx, dy)
