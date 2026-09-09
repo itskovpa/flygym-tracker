@@ -71,7 +71,7 @@ def test_the_window_has_all_five_bands(qapp, window):
 
 
 def test_fast_tracking_menu_settings_reach_run_config(window):
-    window._set_fast_backend('process')
+    window.state['fast_tracking_backend'] = 'process'
     window.state['fast_tracking_threshold']=22.5
     window.state['fast_tracking_min_area']=12
     config=window._config_for_run()

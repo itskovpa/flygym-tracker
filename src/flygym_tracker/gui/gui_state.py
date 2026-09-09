@@ -77,10 +77,13 @@ DEFAULTS: Dict[str, Any] = {
     #: Listed HERE for the same reason as the keys above: `save_state` writes only known keys, so a
     #: key the window sets but this table does not carry would be dropped silently on the way to disk.
     "track_flies": True,
-    "fast_tracking_backend": "configured",
+    "fast_tracking_backend": "process",
     "fast_tracking_threshold": 15.0,
     "fast_tracking_min_area": 8,
     "fast_tracking_max_area": 300,
+    "fast_tracking_max_speed": 150.0,
+    "fast_tracking_max_gap_s": 0.25,
+    "fast_tracking_max_group_s": 1.0,
 }
 
 #: How many entries the config dropdown keeps. Small: this is a shortcut, not a history feature,
@@ -149,6 +152,13 @@ def _coerce(key: str, value: Any) -> Any:
             number = int(value)
             return min(600, max(10, number)) if key == "spatial_background_window_s" else number
         except (TypeError, ValueError):
+            return default
+    if isinstance(default, float):
+        import math
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else default
+        except (ValueError, TypeError):
             return default
     if value is None:
         return default

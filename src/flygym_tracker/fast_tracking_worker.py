@@ -65,7 +65,7 @@ def _run(inbox, outbox, params, window, csv_path):
                 np.divide(gray,max(light,1),out=normal,casting='unsafe')
                 rolling = state['background']
                 rolling.add(normal.ravel(),t)
-                data = dict(face=face,elapsed_s=t,dwell=dwell,vials={})
+                data = dict(face=face,elapsed_s=t,frame_index=frame_index,dwell=dwell,vials={})
                 if rolling.background is None:
                     metrics['warmup_frames'] += 1
                 else:
@@ -99,6 +99,11 @@ def _run(inbox, outbox, params, window, csv_path):
                 now = time.perf_counter()
                 if now-last_publish>=.2:
                     data['frame'] = gray.copy()
+                    data['normalized'] = normal.copy()
+                    data['background'] = None if rolling.background is None else state['cached_background'].copy()
+                    data['geometry'] = state['geometry']
+                    data['parameters'] = vars(params).copy()
+                    data['background_window_s'] = window
                     data['contrast'] = None if rolling.background is None else state['contrast'].copy()
                     latest = data
                     last_publish = now

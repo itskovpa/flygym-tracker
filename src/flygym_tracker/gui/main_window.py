@@ -166,45 +166,30 @@ class MainWindow(QMainWindow):
         open_logs = QAction("Open logs folder", self)
         open_logs.triggered.connect(self._open_logs_folder)
         menu.addAction(open_logs)
-        from PySide6.QtGui import QActionGroup
-        tracking_menu = self.menuBar().addMenu('&Tracking')
-        self.tracking_menu = tracking_menu
-        choices = QActionGroup(self)
-        self.tracking_choices = choices
-        for text,value in [('Configured tracker','configured'),('Fast centroids (thread)','thread'),
-                           ('Fast centroids (separate process)','process')]:
-            action = tracking_menu.addAction(text)
-            action.setCheckable(True)
-            action.setChecked(self.state.get('fast_tracking_backend','configured') == value)
-            choices.addAction(action)
-            action.triggered.connect(lambda checked=False,v=value: self._set_fast_backend(v))
-        tracking_menu.addSeparator()
-        for text,key in [('Darkness threshold (%)...','fast_tracking_threshold'),
-                         ('Minimum blob area...','fast_tracking_min_area'),
-                         ('Maximum single-fly area...','fast_tracking_max_area')]:
-            action = tracking_menu.addAction(text)
-            action.triggered.connect(lambda checked=False,k=key: self._set_fast_parameter(k))
-        tracking_menu.addSeparator()
-        tracking_menu.addAction('Changes apply to the next run').setEnabled(False)
+        self.tracking_menu = self.menuBar().addMenu('&Tracking')
+        self.tracking_menu.addAction('Setup and inspection...', self.show_tracking_setup)
+        self._tracking_setup = None
+        self.session_bar.tracking_setup_requested.connect(self.show_tracking_setup)
 
-    def _set_fast_backend(self, value):
-        self.state['fast_tracking_backend'] = value
-        gui_state.save_state(self.root,self.state)
+    def show_tracking_setup(self):
+        from flygym_tracker.gui.tracking_setup import TrackingSetup
+        if self._tracking_setup is None or not self._tracking_setup.isVisible():
+            if self._tracking_setup is not None:
+                self._tracking_setup.deleteLater()
+            self._tracking_setup = TrackingSetup(self.state, lambda: self.spatial_heatmap, self)
+            self._tracking_setup.applied.connect(self._apply_tracking_setup)
+        self._tracking_setup.show()
+        self._tracking_setup.raise_()
+        self._tracking_setup.activateWindow()
+        self._tracking_setup.refresh()
 
-    def _set_fast_parameter(self, key):
-        from PySide6.QtWidgets import QInputDialog
-        if key == 'fast_tracking_threshold':
-            value,ok = QInputDialog.getDouble(self,'Fast centroid tracking','Relative darkness threshold (%)',
-                float(self.state.get(key,15)),.1,99.9,1)
-        else:
-            minimum = 1 if key.endswith('min_area') else int(self.state.get('fast_tracking_min_area',8))
-            maximum = int(self.state.get('fast_tracking_max_area',300)) if key.endswith('min_area') else 100000
-            value,ok = QInputDialog.getInt(self,'Fast centroid tracking',
-                'Blob area (pixels). Oversized blobs remain unresolved groups.',
-                int(self.state.get(key,8 if key.endswith('min_area') else 300)),minimum,maximum)
-        if ok:
-            self.state[key] = value
-            gui_state.save_state(self.root,self.state)
+    def _apply_tracking_setup(self, values):
+        self.state.update(values)
+        self.session_bar.set_tracking(values['track_flies'])
+        gui_state.save_state(self.root, self.state)
+        # Fast tracker reads its window at run creation; do not alter the current run.
+        if self.run.state not in (STARTING, RUNNING):
+            self.run.set_background_window(values['spatial_background_window_s'])
 
     def _save_diagnostics(self) -> None:
         from flygym_tracker import diagnostics
@@ -799,6 +784,7 @@ class MainWindow(QMainWindow):
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()
+        self.run.set_background_window(self.state.get('spatial_background_window_s', 120))
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             self.stage.show_camera()       # the run did not begin; stop implying it did
@@ -893,7 +879,10 @@ class MainWindow(QMainWindow):
                 background_window_s=float(self.state.get('spatial_background_window_s',120)),
                 fast=dict(threshold=float(self.state.get('fast_tracking_threshold',15))/100,
                           min_area=int(self.state.get('fast_tracking_min_area',8)),
-                          max_single_area=int(self.state.get('fast_tracking_max_area',300))))
+                          max_single_area=int(self.state.get('fast_tracking_max_area',300)),
+                          max_speed=float(self.state.get('fast_tracking_max_speed',150)),
+                          max_gap_s=float(self.state.get('fast_tracking_max_gap_s',.25)),
+                          max_group_s=float(self.state.get('fast_tracking_max_group_s',1.))))
         if not overrides:
             return self.config
         try:
@@ -992,7 +981,9 @@ class MainWindow(QMainWindow):
             if field == HEATMAP_KEY:
                 dock.panel.threshold_requested.connect(self._apply_inspector_threshold)
                 dock.panel.background_window.setValue(self.state.get('spatial_background_window_s', 120))
-                self.run.set_background_window(dock.panel.background_window.value())
+                dock.panel.setup_requested.connect(self.show_tracking_setup)
+                dock.panel.centralized_settings = True
+                dock.panel.refresh()
                 dock.panel.background_window_requested.connect(self._apply_background_window)
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
@@ -1329,6 +1320,7 @@ class MainWindow(QMainWindow):
             dock.refresh()
         self._show_run_vials()
         self._replay_video = video
+        self.run.set_background_window(self.state.get('spatial_background_window_s', 120))
         if not self.run.start(plan):
             self._replay_video = None
             self.run_panel.set_run_state(self.run.state, self.run.detail)

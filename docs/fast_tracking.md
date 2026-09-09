@@ -1,17 +1,34 @@
 # Experimental fast centroid tracking
 
-In the desktop application's **Tracking** menu select **Fast centroids (thread)** or
-**Fast centroids (separate process)**. Enable fly tracking (not activity-only mode), then
-start a new run/replay. Menu changes apply to the next run. Threshold and blob-size
-controls are in the same menu; the background window uses the spatial panel's saved
-window at run start. Existing spatial maps retain their existing measurement method.
+Open **Tracking → Setup and inspection** (also accessible from the experiment bar and
+spatial heatmap panel). This single window contains tracking enablement, backend,
+background window, darkness threshold, minimum and maximum single-fly area, maximum
+link speed, disappearance tolerance and group retention. Explanations appear below each field.
+The separate process is recommended. Existing saved backend choices are retained.
 
-Open **Spatial activity heatmap → Fast centroid tracking** or **Fast background subtraction**.
-These views display matched worker frames, not an overlay paired with a newer camera frame.
-Green points are centroid measurements; orange squares are unresolved groups. The readout
-separates submitted, completed, dropped, pending and warm-up frames and reports mean processing
-time and queue delay. Preview refresh is limited to 5 Hz; analysis is attempted for every
-stationary frame. No camera-rate guarantee is implied by a responsive preview.
+1. Enable trajectories, select the fast process backend and click **Apply to next run**.
+2. Start a camera run or replay using the existing run controls.
+3. Inspect raw video, brightness normalization, learned background, subtraction,
+   draft binary threshold, draft blob classification and recorded trajectories. Select a vial
+   to enlarge it, or freeze a snapshot to compare stages while processing continues.
+4. Adjust darkness threshold and area limits while watching the draft preview.
+   Green regions meet the single-size limits, purple regions are too small, and orange
+   regions are large unresolved groups. These are provisional blob counts, not verified fly counts.
+5. Apply, then restart the run/replay to record with the new settings.
+
+**Draft changes never rewrite recorded measurements.** Background and linking changes require
+a new run; the displayed learned background belongs to the current run. Its actual threshold,
+area limits and background window are shown under the image. Close without Apply discards
+unsaved edits. Choosing the configuration-file tracker disables the fast-specific controls.
+The shared background-window choice still applies to existing spatial maps at the next run.
+Camera, rotation and frame-difference activity settings remain in the existing settings panel.
+Existing spatial maps retain their existing measurement method.
+
+All processing-stage images come from the same worker snapshot. The readout separates
+submitted, completed, dropped, pending and warm-up frames and reports mean processing time
+and queue delay. Preview refresh is limited to 5 Hz; analysis is attempted for every stationary
+frame. Rotation and settling are excluded. A responsive preview is not a camera-rate guarantee.
+The existing spatial panel's fast views remain available for monitoring.
 
 Configuration equivalent:
 

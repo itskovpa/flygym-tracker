@@ -84,6 +84,7 @@ class SessionBar(QWidget):
     recording_changed = Signal(dict)
     #: Whether to track individual flies changed. True = track (default); False = activity only.
     tracking_changed = Signal(bool)
+    tracking_setup_requested = Signal()
     #: A different physical camera was chosen. `None` means "use whatever is attached".
     camera_serial_changed = Signal(object)
 
@@ -327,7 +328,7 @@ class SessionBar(QWidget):
         """
         row = FlowContainer(spacing=8)
         line = row.flow()
-        self.activity_only_box = QCheckBox("activity only — don't track individual flies")
+        self.activity_only_box = QCheckBox("activity only — don't track individual flies", self)
         self.activity_only_box.setChecked(False)
         self.activity_only_box.setToolTip(
             "Measure per-vial activity and climbing height only, and skip tracking individual "
@@ -335,7 +336,11 @@ class SessionBar(QWidget):
             "flies per vial the individual tracks are not recoverable, so this drops the two "
             "tracking threads to hold a steadier frame rate. Activity and rotation are unaffected.")
         self.activity_only_box.toggled.connect(self._on_tracking_toggled)
-        line.addWidget(self.activity_only_box)
+        self.activity_only_box.hide()
+        self.tracking_setup_button = QToolButton()
+        self.tracking_setup_button.setText('Tracking setup and inspection...')
+        self.tracking_setup_button.clicked.connect(self.tracking_setup_requested.emit)
+        line.addWidget(self.tracking_setup_button)
 
         self.tracking_note = ElidedLabel("")
         self.tracking_note.setProperty("role", "note")
@@ -355,7 +360,7 @@ class SessionBar(QWidget):
         self.activity_only_box.blockSignals(True)
         self.activity_only_box.setChecked(not bool(track))
         self.activity_only_box.blockSignals(False)
-        self.tracking_note.setText("" if track else "per-fly tracking off")
+        self.tracking_note.setText("trajectories enabled" if track else "activity only")
 
     # -- collapsing --------------------------------------------------------------------------
     def set_expanded(self, expanded: bool) -> None:

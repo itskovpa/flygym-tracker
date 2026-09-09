@@ -51,11 +51,13 @@ class ActivityHeatmapWidget(QWidget):
 
 
 class ActivityHeatmapPanel(QWidget):
+    setup_requested = Signal()
     threshold_requested = Signal(float)
     background_window_requested = Signal(float)
 
     def __init__(self, snapshot, parent=None):
         super().__init__(parent)
+        self.centralized_settings = False
         self.snapshot = snapshot
         self._rendered = None
         layout = QVBoxLayout(self)
@@ -69,6 +71,9 @@ class ActivityHeatmapPanel(QWidget):
                                 'Fast centroid tracking', 'Fast background subtraction'])
         self.mode_box.currentIndexChanged.connect(self.refresh)
         layout.addWidget(self.mode_box)
+        setup = QPushButton('Tracking setup and inspection...')
+        setup.clicked.connect(self.setup_requested.emit)
+        layout.addWidget(setup)
         self.background_controls = QWidget()
         background_layout = QHBoxLayout(self.background_controls)
         background_layout.setContentsMargins(0, 0, 0, 0)
@@ -138,8 +143,8 @@ class ActivityHeatmapPanel(QWidget):
             self.range_label.setText(self.snapshot['error'])
             return
         is_live = self.mode_box.currentIndex() == 1
-        self.threshold_controls.setVisible(is_live)
-        self.background_controls.setVisible(self.mode_box.currentIndex() == 3)
+        self.threshold_controls.setVisible(is_live and not self.centralized_settings)
+        self.background_controls.setVisible(self.mode_box.currentIndex() == 3 and not self.centralized_settings)
         self.face_box.setVisible(not is_live)
         self.legend.setVisible(not is_live)
         self.legend_low.setVisible(not is_live)
@@ -244,7 +249,7 @@ class ActivityHeatmapPanel(QWidget):
         data = self.snapshot.get('fast_tracking') or {}
         stats = data.get('stats',{})
         frame = data.get('frame')
-        self.note.setText('Experimental. Select a fast tracker in the Tracking menu, enable fly tracking, '
+        self.note.setText('Experimental. Select a fast tracker in Tracking setup and inspection, enable fly tracking, '
                           'then start a new run. Green points are measured centroids; orange squares are '
                           'unresolved groups, not separate measured flies. Counts and gap displacement '
                           'are exported to fast_tracking CSV. The worker preview refreshes up to 5 times/s; '
