@@ -28,6 +28,7 @@ For a level-like parameter (mean height) it is not meaningful.
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from collections import deque
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -114,6 +115,7 @@ class BehaviourSeries:
         #: ``(elapsed_s, face, vial_id, {field: value})`` per row.
         self._rows = deque()
         self._by_vial = {}
+        self.activity_bin_widths = set()
         #: A 3-day run at ~2 s dwells over 32 vials is ~4 million rows; the file holds them all and
         #: this is for watching, so the oldest are dropped once the cap is reached.
         self._max_rows = max(0, int(max_rows))
@@ -130,6 +132,7 @@ class BehaviourSeries:
     def clear(self) -> None:
         self._rows.clear()
         self._by_vial.clear()
+        self.activity_bin_widths.clear()
         self.dropped_rows = 0
         self._vial_area = {}
 
@@ -145,6 +148,15 @@ class BehaviourSeries:
                 continue
             if not math.isfinite(elapsed):
                 continue
+            # Read the measurement interval from the recorded row, not the current
+            # settings (which may already have been edited for the next run).
+            try:
+                duration = (datetime.fromisoformat(row["bin_end_iso"]) -
+                            datetime.fromisoformat(row["bin_start_iso"])).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                duration = 0
+            if duration > 0:
+                self.activity_bin_widths.add(duration)
             entry = (elapsed, face, vial, dict(row))
             self._rows.append(entry)
             key = (face, self.local_index(face, vial))

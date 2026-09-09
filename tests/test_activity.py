@@ -172,3 +172,14 @@ def test_activity_accumulator_rejects_nonpositive_bin_seconds():
         ActivityAccumulator(bin_seconds=0)
     with pytest.raises(ValueError):
         ActivityAccumulator(bin_seconds=-5)
+
+def test_subsecond_bins_do_not_merge_decimal_boundary_frames():
+    acc = ActivityAccumulator(.2)
+    bins = []
+    for i in range(10):
+        result = acc.add(i / 5, TrackState.STATIONARY, {1: (1, 100, .01)})
+        if result is not None:
+            bins.append(result)
+    bins.append(acc.flush())
+    assert len(bins) == 10
+    assert [b.vials[1]['n_stationary_frames'] for b in bins] == [1] * 10

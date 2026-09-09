@@ -193,7 +193,7 @@ class BehaviourPlotPanel(QWidget):
         # Same rule the rest of the app follows (see `flow_layout`).
         controls = FlowLayout(margin=0, spacing=8)
 
-        controls.addWidget(QLabel("bin"))
+        controls.addWidget(QLabel("display bin"))
         self.bin_box = QComboBox()
         for seconds in BIN_CHOICES:
             self.bin_box.addItem(_bin_label(seconds), seconds)
@@ -261,6 +261,12 @@ class BehaviourPlotPanel(QWidget):
         layout.addLayout(controls)
         layout.addWidget(self.range_label)
 
+        self.resolution_label = QLabel("")
+        self.resolution_label.setWordWrap(True)
+        self.resolution_label.setMinimumWidth(0)
+        self.resolution_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.resolution_label)
+
         self.grids = {}
         for face in FACES:
             label = QLabel("FACE %s" % face)
@@ -290,6 +296,22 @@ class BehaviourPlotPanel(QWidget):
     def refresh(self) -> None:
         """Re-read the shared store. Cheap enough to call on every completed dwell."""
         bin_seconds, cumulative = self.bin_seconds(), self.cumulative()
+        if self.field in {"motion_px_sum", "active_fraction_mean"}:
+            widths = sorted(self.series.activity_bin_widths)
+            note = ""
+            if widths:
+                note = "Recorded activity bins: %s." % ", ".join(_bin_label(w) for w in widths)
+                if 0 < bin_seconds < max(widths):
+                    note += (" Smaller display bins cannot recover detail within a recorded bin. "
+                             "Set Settings > Recording > bin size before replaying the video "
+                             "to measure finer activity.")
+                elif bin_seconds <= 0:
+                    note += " Raw shows one point per recorded row, not per video frame."
+        else:
+            note = ("Tracking values summarize each stationary dwell. Smaller display bins "
+                    "do not produce measurements within a dwell.")
+        self.resolution_label.setText(note)
+        self.resolution_label.setVisible(bool(note))
         normalize = self._area_applies and self.area_box.isChecked()
         # ONE READ of the store for the whole panel: the points every cell draws and the range
         # every cell is scaled by come from the same snapshot. See `VialPlotGrid.configure`. The

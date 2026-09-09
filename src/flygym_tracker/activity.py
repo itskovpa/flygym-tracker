@@ -21,6 +21,7 @@ reset; whatever `prev_gray` the pipeline's reference policy selects, just call
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -139,7 +140,9 @@ class ActivityAccumulator:
     ) -> Optional[ActivityBin]:
         """Fold one frame's results in; returns the completed previous bin on rollover, else None."""
         vial_results = vial_results or {}
-        bin_index = int(elapsed_s // self.bin_seconds)
+        # Float floor division can send an exact decimal boundary (e.g. .6/.2)
+        # into the preceding bin. Match the display's boundary tolerance.
+        bin_index = math.floor(elapsed_s / self.bin_seconds + 1e-9)
 
         rollover: Optional[ActivityBin] = None
         if self._bin_index is None:
