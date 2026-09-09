@@ -84,6 +84,7 @@ class RunWorker(QObject):
     away from the SDK handle.
     """
 
+    spatial_ready = Signal(dict)
     progress = Signal(dict)
     started = Signal(dict)
     finished = Signal(dict)
@@ -160,6 +161,9 @@ class RunWorker(QObject):
             self.failed.emit(str(exc))
             return
 
+        from flygym_tracker.spatial_activity import AsyncSpatialActivity
+        pipeline.spatial_activity = AsyncSpatialActivity(self._plan.get('spatial_background_window_s', 120))
+        self._spatial_elapsed = 0.0
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
         pipeline.add_bin_observer(self._on_bin)
@@ -169,10 +173,15 @@ class RunWorker(QObject):
             summary = pipeline.run(max_frames=self._plan.get("max_frames"),
                                    stop_flag=self._stop.is_set)
         except Exception as exc:
+            pipeline.spatial_activity.close()
             self._pipeline = None
             self._close_recorder()      # a failed run still leaves whatever it recorded playable
             self.failed.emit(str(exc))
             return
+        pipeline.spatial_activity.close()
+        snapshot = pipeline.spatial_activity.snapshot(self._spatial_elapsed, force=True)
+        if snapshot is not None:
+            self.spatial_ready.emit(snapshot)
         self._pipeline = None
         summary = dict(summary or {})
         # THE VIDEO IS FINALISED AFTER THE PIPELINE, NOT INSIDE IT. `close` drains the frames
@@ -220,7 +229,8 @@ class RunWorker(QObject):
             # `run_meta.json` snapshots the config at START (invariant 4's other half): everything
             # chosen BEFORE the run belongs here, everything changed after belongs in events.csv.
             meta={"config": config.to_dict(), "calibration_dir": plan["calib_dir"],
-                  "started_from": "gui"},
+                  "started_from": "gui",
+                  "spatial_background_window_s": plan.get("spatial_background_window_s", 120)},
         )
         # WHETHER TO TRACK INDIVIDUAL FLIES. Normally the "activity only" tick box decides
         # (`plan["track_flies"]`, default True). `FLYGYM_DISABLE_TRACKING=1` still forces it off as
@@ -260,6 +270,11 @@ class RunWorker(QObject):
         of a three-day run. Hence the broad guard around each applied setting: a rejected value is
         reported to the row and the acquisition continues.
         """
+        if self._pipeline is not None and self._pipeline.spatial_activity is not None:
+            self._spatial_elapsed = float(payload.get("elapsed_s", 0.0))
+            snapshot = self._pipeline.spatial_activity.snapshot(self._spatial_elapsed)
+            if snapshot is not None:
+                self.spatial_ready.emit(snapshot)
         self._drain_pending()
         self._frames = int(payload.get("index", self._frames) or 0)
         if self._recorder is not None:
@@ -288,7 +303,20 @@ class RunWorker(QObject):
                     pass                      # a preview must never be able to end a run
         self._last_emit = now
         vial_results = payload.get("vial_results") or {}
+        spatial = getattr(self._pipeline, "spatial_activity", None)
+        valid = bool(vial_results) and str(payload.get("state")) in ("STATIONARY", "TrackState.STATIONARY", "stationary")
+        motion = spatial.last_motion if spatial is not None and valid else None
+        live = None
+        frame_image = payload.get("frame")
+        if frame_image is not None:
+            # Exact frame and its detector mask travel together, never separate preview updates.
+            live = dict(frame=frame_image.copy(), motion=motion.copy() if motion is not None else None,
+                        threshold=payload.get("pixel_threshold"), face=payload.get("face"),
+                        elapsed_s=float(payload.get("elapsed_s") or 0),
+                        state=str(payload.get("state")), measured=motion is not None)
         self.progress.emit({
+            "fast_tracking": self._fast_tracking_preview(),
+            "live_activity": live,
             "frames": self._frames,
             "elapsed_s": float(payload.get("elapsed_s") or 0.0),
             "state": str(payload.get("state") or ""),
@@ -314,6 +342,12 @@ class RunWorker(QObject):
             # asked, and the answer is only useful while there is still time to lower the rate.
             "video": self._recorder.stats() if self._recorder is not None else None,
         })
+
+    def _fast_tracking_preview(self):
+        pool = getattr(self._pipeline,'_pool',None)
+        if pool is None or not getattr(pool,'fast_mode',False): return None
+        stats = pool.stats()
+        return dict(pool.latest,stats=stats)
 
     def _record(self, payload: dict) -> None:
         """Offer this frame to the recorder. EVERY frame, not the throttled 5 Hz the picture gets.
@@ -386,6 +420,7 @@ class RunController(QObject):
     the thread it owns with it.
     """
 
+    spatial_ready = Signal(dict)
     progress = Signal(dict)
     state_changed = Signal(str, str)          # state, detail
     started = Signal(dict)
@@ -409,6 +444,7 @@ class RunController(QObject):
         self._worker: Optional[RunWorker] = None
         self._state = IDLE
         self._detail = ""
+        self.background_window_s = 120.0
 
     @property
     def state(self) -> str:
@@ -451,9 +487,11 @@ class RunController(QObject):
             return False
 
         self._thread = QThread()
+        plan = dict(plan, spatial_background_window_s=self.background_window_s)
         self._worker = RunWorker(plan, latest=self.latest)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.spatial_ready.connect(self.spatial_ready)
         self._worker.progress.connect(self._on_progress)
         self._worker.started.connect(self._on_started)
         self._worker.finished.connect(self._on_finished)
@@ -471,6 +509,12 @@ class RunController(QObject):
             return
         self._set_state(STOPPING, "finishing the current bin and closing the files")
         self._worker.request_stop()
+
+    def set_background_window(self, seconds: float) -> None:
+        if not 10 <= float(seconds) <= 600:
+            raise ValueError('Background window must be 10 to 600 seconds')
+        self.background_window_s = float(seconds)
+        self.apply_setting('spatial.background_window_s', self.background_window_s)
 
     def apply_setting(self, key: str, value: Any) -> bool:
         """Route one live change into the running pipeline. False if there is no run to route to.

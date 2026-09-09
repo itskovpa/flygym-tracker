@@ -76,6 +76,8 @@ def camera_factory_from_config(config):
 
 
 def main(argv: Optional[list] = None) -> int:
+    from multiprocessing import freeze_support
+    freeze_support()
     args = build_parser().parse_args(argv)
 
     # CRASH LOGGING ON, FIRST, before anything that could crash. Every build writes a per-session
@@ -106,6 +108,8 @@ def main(argv: Optional[list] = None) -> int:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    from flygym_tracker.gui.garbage_collection import install_gui_collector
+    install_gui_collector(app)
     from flygym_tracker.gui import theme
 
     app.setApplicationName("FlyGym v2 Tracker")

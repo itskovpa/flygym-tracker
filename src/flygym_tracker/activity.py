@@ -37,6 +37,7 @@ def per_frame_activity(
     prev_gray: np.ndarray,
     vial_mask_bool: np.ndarray,
     pixel_threshold: float,
+    motion_out: Optional[np.ndarray] = None,
 ) -> Tuple[int, int, float]:
     """One frame's motion for one vial (DESIGN.md §5.3). Pure function, no state.
 
@@ -70,7 +71,11 @@ def per_frame_activity(
     motion = diff > pixel_threshold
 
     lit_area_px = int(np.count_nonzero(vial_mask_bool))
-    motion_px = int(np.count_nonzero(motion & vial_mask_bool))
+    motion &= vial_mask_bool
+    if motion_out is not None:
+        # Union overlapping ROIs: a spatial pixel is counted once per frame.
+        motion_out |= motion
+    motion_px = int(np.count_nonzero(motion))
     active_fraction = (motion_px / lit_area_px) if lit_area_px > 0 else 0.0
     return motion_px, lit_area_px, active_fraction
 

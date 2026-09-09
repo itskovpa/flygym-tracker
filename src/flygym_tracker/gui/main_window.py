@@ -42,6 +42,7 @@ from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERRO
 from flygym_tracker.gui.camera_status import CameraStatusBar
 from flygym_tracker.gui.behaviour_series import BehaviourSeries
 from flygym_tracker.gui.plot_dock import BehaviourPlotDock
+from flygym_tracker.gui.activity_heatmap import ActivityHeatmapDock, HEATMAP_KEY
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.results_panel import ResultsPanel
 from flygym_tracker.gui.run_controller import RunController
@@ -116,6 +117,7 @@ class MainWindow(QMainWindow):
         #: preview camera's state rather than a boolean: USB3 Vision is exclusive, and whether the
         #: preview holds the handle changes while this window is up.
         self.run = RunController(camera_is_open=lambda: self.session.is_open, parent=self)
+        self.run.set_background_window(self.state.get("spatial_background_window_s", 120))
         model = build_app_settings(config)
         self.controller = SettingsController(
             model,
@@ -134,6 +136,7 @@ class MainWindow(QMainWindow):
         #: Every behaviour row of this run, shared by every open plot dock. ONE STORE: a dock
         #: opened at hour 40 draws the whole run rather than only what arrives after it opened.
         self.behaviour = BehaviourSeries()
+        self.spatial_heatmap = {}
         self._plot_docks = {}
         #: The recording a REPLAY is running, or None when the run is live (or nothing is running).
         #: A replay holds no camera, so it is the one kind of run that can still be drawn on -- and
@@ -142,6 +145,10 @@ class MainWindow(QMainWindow):
         #: One-shot guard so the after-show geometry clamp (see `showEvent`) runs on the FIRST show
         #: only -- after that the operator is free to move or resize the window wherever they like.
         self._geometry_clamped = False
+        # One application-owned service. Device monitoring is independent of the camera and a
+        # future run pipeline can share this object instead of opening the USB port again.
+        self._rig_device_service = None
+        self._device_control = None
         self._build()
         self._build_help_menu()
         self._connect()
@@ -163,6 +170,47 @@ class MainWindow(QMainWindow):
         open_logs = QAction("Open logs folder", self)
         open_logs.triggered.connect(self._open_logs_folder)
         menu.addAction(open_logs)
+        self.tracking_menu = self.menuBar().addMenu('&Tracking')
+        self.tracking_menu.addAction('Setup and inspection...', self.show_tracking_setup)
+        self.device_menu = self.menuBar().addMenu('&Device')
+        self.device_menu.addAction('Control and status...', self.show_device_control)
+        self._tracking_setup = None
+        self.session_bar.tracking_setup_requested.connect(self.show_tracking_setup)
+
+    def _make_rig_device_service(self, port):
+        from flygym_tracker.rig_device import RigDeviceService
+        self._rig_device_service = RigDeviceService(port)
+        return self._rig_device_service
+
+    def show_device_control(self):
+        from flygym_tracker.gui.device_control import DeviceControlWindow
+        if self._device_control is None:
+            self._device_control = DeviceControlWindow(
+                self._rig_device_service, service_factory=self._make_rig_device_service,
+                parent=self)
+        self._device_control.show()
+        self._device_control.raise_()
+        self._device_control.activateWindow()
+
+    def show_tracking_setup(self):
+        from flygym_tracker.gui.tracking_setup import TrackingSetup
+        if self._tracking_setup is None or not self._tracking_setup.isVisible():
+            if self._tracking_setup is not None:
+                self._tracking_setup.deleteLater()
+            self._tracking_setup = TrackingSetup(self.state, lambda: self.spatial_heatmap, self)
+            self._tracking_setup.applied.connect(self._apply_tracking_setup)
+        self._tracking_setup.show()
+        self._tracking_setup.raise_()
+        self._tracking_setup.activateWindow()
+        self._tracking_setup.refresh()
+
+    def _apply_tracking_setup(self, values):
+        self.state.update(values)
+        self.session_bar.set_tracking(values['track_flies'])
+        gui_state.save_state(self.root, self.state)
+        # Fast tracker reads its window at run creation; do not alter the current run.
+        if self.run.state not in (STARTING, RUNNING):
+            self.run.set_background_window(values['spatial_background_window_s'])
 
     def _save_diagnostics(self) -> None:
         from flygym_tracker import diagnostics
@@ -393,6 +441,7 @@ class MainWindow(QMainWindow):
         self.run.progress.connect(self.run_panel.set_progress)
         self.run.progress.connect(self.results.set_progress)
         self.run.progress.connect(self._on_run_progress)
+        self.run.spatial_ready.connect(self._on_spatial_ready)
         self.run.bin_done.connect(self._on_activity_rows)
         self.run.bin_done.connect(self.results.add_bin)
         self.run.behaviour_done.connect(self._on_behaviour_rows)
@@ -751,10 +800,12 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.spatial_heatmap.clear()
         self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()
+        self.run.set_background_window(self.state.get('spatial_background_window_s', 120))
         if not self.run.start(plan):
             self.run_panel.set_run_state(self.run.state, self.run.detail)
             self.stage.show_camera()       # the run did not begin; stop implying it did
@@ -843,6 +894,16 @@ class MainWindow(QMainWindow):
         from flygym_tracker.config import load_config
 
         overrides = self.controller.model.to_overrides()
+        backend = self.state.get('fast_tracking_backend','configured')
+        if backend in ('thread','process'):
+            overrides.setdefault('tracking',{}).update(mode='fast',backend=backend,
+                background_window_s=float(self.state.get('spatial_background_window_s',120)),
+                fast=dict(threshold=float(self.state.get('fast_tracking_threshold',15))/100,
+                          min_area=int(self.state.get('fast_tracking_min_area',8)),
+                          max_single_area=int(self.state.get('fast_tracking_max_area',300)),
+                          max_speed=float(self.state.get('fast_tracking_max_speed',150)),
+                          max_gap_s=float(self.state.get('fast_tracking_max_gap_s',.25)),
+                          max_group_s=float(self.state.get('fast_tracking_max_group_s',1.))))
         if not overrides:
             return self.config
         try:
@@ -899,6 +960,13 @@ class MainWindow(QMainWindow):
             self._share_width_with_results()
         # A finished run gives the picture back to the camera preview, so the next thing the
         # operator does is not done against the last frame of the last experiment.
+        if state in (DONE, FAILED, IDLE):
+            live = self.spatial_heatmap.get('live')
+            if live is not None:
+                live['ended'] = True
+                dock = self._plot_docks.get(HEATMAP_KEY)
+                if dock is not None:
+                    dock.refresh()
         if state in (DONE, FAILED, IDLE) and self.stage.mode == STAGE_RUN:
             self.stage.show_camera()
         # Width/Height must LOOK dead while the stream is running, not merely refuse when pressed
@@ -921,7 +989,7 @@ class MainWindow(QMainWindow):
             dock.refresh()
 
     def show_plot(self, field: str) -> None:
-        """Open (or raise) the dock for one behavioural parameter.
+        """Open (or raise) one behavioural plot or the activity heatmap.
 
         RAISED RATHER THAN DUPLICATED: two docks of the same parameter would be two identical
         graphs the operator then has to tell apart, and closing one would look like it had failed
@@ -929,7 +997,15 @@ class MainWindow(QMainWindow):
         """
         dock = self._plot_docks.get(field)
         if dock is None:
-            dock = BehaviourPlotDock(self.behaviour, field, self)
+            dock = (ActivityHeatmapDock(self.spatial_heatmap, self) if field == HEATMAP_KEY else
+                    BehaviourPlotDock(self.behaviour, field, self))
+            if field == HEATMAP_KEY:
+                dock.panel.threshold_requested.connect(self._apply_inspector_threshold)
+                dock.panel.background_window.setValue(self.state.get('spatial_background_window_s', 120))
+                dock.panel.setup_requested.connect(self.show_tracking_setup)
+                dock.panel.centralized_settings = True
+                dock.panel.refresh()
+                dock.panel.background_window_requested.connect(self._apply_background_window)
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
             # on and asked to have from the start: a graph opens in the same left tab group as the
@@ -953,8 +1029,31 @@ class MainWindow(QMainWindow):
         dock.raise_()
         dock.refresh()
 
+    def _apply_background_window(self, value: float) -> None:
+        self.state['spatial_background_window_s'] = value
+        gui_state.save_state(self.root, self.state)
+        self.run.set_background_window(value)
+
+    def _apply_inspector_threshold(self, value: float) -> None:
+        self.controller.commit("activity.pixel_threshold", value)
+        self.settings_view.refresh()
+
+    def _on_spatial_ready(self, payload: dict) -> None:
+        self.spatial_heatmap.update(payload)
+        dock = self._plot_docks.get(HEATMAP_KEY)
+        if dock is not None:
+            dock.refresh()
+
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
+        live = payload.get("live_activity")
+        if payload.get('fast_tracking') is not None:
+            self.spatial_heatmap['fast_tracking'] = payload['fast_tracking']
+        if live is not None:
+            self.spatial_heatmap['live'] = live
+            dock = self._plot_docks.get(HEATMAP_KEY)
+            if dock is not None:
+                dock.refresh()
         self.stage.set_run_activity(payload.get("vial_results") or {})
         self.stage.set_run_tracks(payload.get("fly_tracks"))
 
@@ -1236,11 +1335,13 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.spatial_heatmap.clear()
         self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()
         self._show_run_vials()
         self._replay_video = video
+        self.run.set_background_window(self.state.get('spatial_background_window_s', 120))
         if not self.run.start(plan):
             self._replay_video = None
             self.run_panel.set_run_state(self.run.state, self.run.detail)
@@ -1479,6 +1580,8 @@ class MainWindow(QMainWindow):
         # grab loop calling into a job whose owner has gone.
         self.stage.shutdown()
         self.session.shutdown()
+        if self._rig_device_service is not None:
+            self._rig_device_service.close()
         gui_state.save_state(self.root, self.state)
         event.accept()
 

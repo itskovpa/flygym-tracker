@@ -244,8 +244,9 @@ def test_a_session_with_no_frame_says_so_instead_of_saving_polygons_it_cannot_ma
     stage.job_finished.connect(lambda kind, payload: results.append(payload))
     stage.draw_session.finish()
     qapp.processEvents()
-    assert results and results[0]["saved"] is False
-    assert "no frame" in results[0]["message"]
+    assert not results
+    assert stage.draw_session is not None
+    assert "no frame" in stage.caption.text()
 
 
 def test_the_camera_is_never_taken_just_because_a_video_job_was_asked_for(qapp):
@@ -718,3 +719,89 @@ def test_editing_a_loaded_selection_saves_the_edited_shape(qapp, tmp_path):
     saved = json.loads((out / "calibration.json").read_text())
     face = list(saved["faces"].values())[0]
     assert face["vials"][0]["polygon"][0] == [46, 49], "the edit did not reach the bundle"
+
+@pytest.mark.parametrize('save_key', [None, 'q'])
+def test_save_includes_reopened_vial_without_vial_done(qapp, tmp_path, save_key):
+    from flygym_tracker.calibration import saved_selection
+    stage = _stage(qapp)
+    stage.view.set_frame(_frame())
+    polygon = [[5, 5], [35, 5], [35, 40], [5, 40]]
+    out = str(tmp_path / 'edited')
+    stage.begin_draw(out_dir=out, n_vials=4, polygons=[polygon])
+    draw = stage.draw_session
+    draw.undo_vial()
+    draw.undo_vertex()
+    draw.on_click(8, 38)
+    if save_key:
+        draw.on_key(save_key)
+    else:
+        QTest.mouseClick(stage.draw_done_button, Qt.MouseButton.LeftButton)
+    saved = saved_selection(out)
+    assert saved is not None
+    assert saved.polygons == [[[5, 5], [35, 5], [35, 40], [8, 38]]]
+    stage.begin_draw(out_dir=out, n_vials=4, polygons=saved.polygons)
+    assert stage.draw_session.state.polygons == saved.polygons
+    stage.close()
+
+
+def test_incomplete_vial_stays_editable_on_save(qapp, tmp_path):
+    stage = _stage(qapp)
+    stage.view.set_frame(_frame())
+    stage.begin_draw(out_dir=str(tmp_path / 'incomplete'), n_vials=4)
+    draw = stage.draw_session
+    draw.on_click(5, 5)
+    draw.on_key('q')
+    assert stage.draw_session is draw
+    assert not draw.state.done
+    assert 'at least 3' in stage.caption.text()
+    draw.on_click(35, 5)
+    assert len(draw.state.current) == 2
+    stage.close()
+
+
+def test_failed_save_keeps_drawing_for_retry(qapp, tmp_path, monkeypatch):
+    from flygym_tracker.calibration import saved_selection
+    stage = _stage(qapp)
+    stage.view.set_frame(_frame())
+    out = str(tmp_path / 'retry')
+    stage.begin_draw(out_dir=out, n_vials=1)
+    draw = stage.draw_session
+    polygon = [[5, 5], [35, 5], [35, 40]]
+    for x, y in polygon:
+        draw.on_click(x, y)
+    save = draw._save
+    def fail(polygons):
+        raise PermissionError('test folder is not writable')
+    monkeypatch.setattr(draw, '_save', fail)
+    draw.finish_vial()  # Completing the last vial automatically attempts a save.
+    assert stage.draw_session is draw
+    assert not draw.state.done
+    assert draw.state.polygons == [polygon]
+    assert 'could NOT be saved' in stage.caption.text()
+    monkeypatch.setattr(draw, '_save', save)
+    QTest.mouseClick(stage.draw_done_button, Qt.MouseButton.LeftButton)
+    assert stage.draw_session is None
+    assert saved_selection(out).polygons == [polygon]
+    stage.close()
+
+
+def test_redrawing_vials_preserves_learned_face_templates(qapp, tmp_path):
+    from flygym_tracker.calibration import load_calibration
+    stage = _stage(qapp)
+    stage.view.set_frame(_frame())
+    out = str(tmp_path / 'face-metadata')
+    polygon = [[5, 5], [35, 5], [35, 40]]
+    stage.begin_draw(out_dir=out, polygons=[polygon])
+    stage.draw_session.finish()
+    calib = load_calibration(out)
+    for face, fc in calib.faces.items():
+        fc.marker.update(band_templates=[[1, 2, 3]], band_detector={'rows': [20, 25]}, band_learned=face)
+    calib.to_json(str(tmp_path / 'face-metadata' / 'calibration.json'))
+    stage.begin_draw(out_dir=out, polygons=[polygon])
+    stage.draw_session.state.move_vertex(0, 0, 8, 8)
+    stage.draw_session.finish()
+    saved = load_calibration(out)
+    for face, fc in saved.faces.items():
+        assert fc.marker == calib.faces[face].marker
+        assert fc.vials[0].polygon[0] == [8, 8]
+    stage.close()

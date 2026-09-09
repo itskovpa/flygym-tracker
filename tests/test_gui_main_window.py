@@ -70,6 +70,17 @@ def test_the_window_has_all_five_bands(qapp, window):
     assert window.settings_view.save_button is not None
 
 
+def test_fast_tracking_menu_settings_reach_run_config(window):
+    window.state['fast_tracking_backend'] = 'process'
+    window.state['fast_tracking_threshold']=22.5
+    window.state['fast_tracking_min_area']=12
+    config=window._config_for_run()
+    assert config.tracking.mode=='fast'
+    assert config.tracking.backend=='process'
+    assert config.tracking.fast.threshold==.225
+    assert config.tracking.fast.min_area==12
+
+
 def test_completed_bin_updates_both_recorded_summary_and_plot_history(qapp, window):
     window.run.bin_done.emit({"records": [
         {"elapsed_s": 10, "face": "A", "vial_id": 1, "motion_px_sum": 123}
@@ -110,6 +121,15 @@ def test_asking_for_the_same_graph_twice_raises_the_one_dock(qapp, window):
     window.show_plot("median_path_length")
     qapp.processEvents()
     assert len(window._plot_docks) == 1
+
+
+def test_activity_heatmap_is_available_in_the_existing_plot_picker(qapp, window):
+    index = window.run_panel.plot_box.findData("activity_heatmap")
+    assert index >= 0
+    window.run_panel.plot_box.setCurrentIndex(index)
+    window.run_panel.plot_button.click()
+    qapp.processEvents()
+    assert "activity_heatmap" in window._plot_docks
 
 
 def test_the_session_bar_shows_the_three_paths_run_bat_kept_in_a_batch_file(qapp, window,
@@ -479,3 +499,19 @@ def test_a_camera_that_never_releases_does_not_silently_start_a_run(qapp, window
     assert not window._pending_start
     assert window.stage.mode == CAMERA
     assert "did not release" in window.run_panel.state_label.text()
+
+def test_inspector_threshold_uses_normal_settings_controller(qapp, window):
+    window.show_plot('activity_heatmap')
+    panel = window._plot_docks['activity_heatmap'].panel
+    panel.threshold_requested.emit(23.0)
+    assert window.controller.model.get('activity.pixel_threshold').value == 23.0
+
+
+def test_occupancy_window_control_reaches_run_and_persists(window):
+    from flygym_tracker.gui.activity_heatmap import HEATMAP_KEY
+    window.show_plot(HEATMAP_KEY)
+    panel = window._plot_docks[HEATMAP_KEY].panel
+    panel.mode_box.setCurrentIndex(3)
+    panel.background_window.setValue(60)
+    assert window.run.background_window_s == 60
+    assert gui_state.load_state(window.root)['spatial_background_window_s'] == 60

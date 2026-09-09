@@ -269,24 +269,27 @@ class VialDrawSession(QObject):
         that has just gone wrong happened AFTER somebody spent several minutes clicking and the
         one thing they need to know is whether that work survived.
         """
+        # Save includes the polygon on screen, including a vial reopened for editing.
+        if self.state.current and not self.state.finish_vial():
+            self._keep_open(self.state.message)
+            return
         polygons = self.state.polygons
         if not polygons:
             self.finished.emit({"saved": False, "n_vials": 0, "out_dir": self.out_dir,
                                 "message": "no vials were drawn - nothing saved"})
             return
         if self.last_image is None:
-            self.finished.emit({
-                "saved": False, "n_vials": len(polygons), "out_dir": self.out_dir,
-                "message": "no frame was ever received, so the %d drawn vial(s) could not be "
-                           "saved - the mask and overlay are built from the picture they were "
-                           "drawn on" % len(polygons)})
+            self._keep_open(
+                "no frame was received - the %d drawn vial(s) are still here; "
+                "wait for a picture and try Save and finish again" % len(polygons))
             return
         try:
             calib = self._save(polygons)
         except Exception as exc:
-            self.finished.emit({
-                "saved": False, "n_vials": len(polygons), "out_dir": self.out_dir,
-                "message": "the %d drawn vial(s) could NOT be saved: %s" % (len(polygons), exc)})
+            self._keep_open(
+                "the %d drawn vial(s) could NOT be saved: %s. "
+                "Your drawing is still here; fix the problem and retry Save and finish."
+                % (len(polygons), exc))
             return
         self.finished.emit({
             "saved": True, "n_vials": len(polygons), "out_dir": self.out_dir,
@@ -294,15 +297,31 @@ class VialDrawSession(QObject):
             "message": "saved %d vial(s) on face(s) %s to %s"
                        % (len(polygons), ", ".join(sorted(calib.faces)), self.out_dir)})
 
+    def _keep_open(self, message: str) -> None:
+        """A failed save must not dismiss the drawing or prevent further edits."""
+        self.state.finished = False
+        self.state.editing = True
+        self.state.note(message)
+        self.changed.emit()
+
     def _save(self, polygons):
         """Write the bundle. The same two calls `load_or_select_vials` makes, in the same order."""
         from flygym_tracker.calibration import (build_two_face_calibration_from_polygons,
-                                                save_calibration)
+                                                save_calibration, load_calibration)
 
         frame = self.last_image
         height, width = frame.shape[:2]
         calib, masks, overlays = build_two_face_calibration_from_polygons(
             polygons, frame, (width, height), faces=self.faces)
+        existing_path = os.path.join(self.out_dir, "calibration.json")
+        if os.path.isfile(existing_path):
+            existing = load_calibration(self.out_dir)
+            if (existing.image_width, existing.image_height) == (width, height):
+                for face, fc in calib.faces.items():
+                    previous = existing.faces.get(face)
+                    if previous is not None:
+                        # Vial edits must not erase learned face IDs or marker-band settings.
+                        fc.marker = {**(previous.marker or {}), **(fc.marker or {})}
         save_calibration(calib, masks, self.out_dir, overlay=overlays)
         # Saved with RELATIVE mask paths so the bundle stays movable, handed back RESOLVED so it
         # can go straight to the pipeline -- exactly what `load_calibration` returns.

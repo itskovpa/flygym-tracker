@@ -442,10 +442,16 @@ class TrackerPipeline:
         #: rolls, so a caller that wants them cannot infer them from the activity bin.
         self._behaviour_observers: List[Callable[[dict], None]] = []
         self.observer_failures = 0
+        self.spatial_activity = None
+        self._spatial_offsets = {}
+        self._spatial_masks = {}
         self._fps_times: List[float] = []
 
         # -- live settings (see the "live settings" section below) ----------------------------
         self._setting_routes = self._build_setting_routes()
+        self._setting_routes['spatial.background_window_s'] = (
+            lambda: self.spatial_activity.background_window_s,
+            lambda value: self.spatial_activity.set_background_window(value))
 
     # ---- observers ----------------------------------------------------------------------------
     #
@@ -965,12 +971,16 @@ class TrackerPipeline:
                 self._flush_behaviour()
             self._write_workbook()
         finally:
+            if self.spatial_activity is not None:
+                self.spatial_activity.close()
             if self._pool is not None:
                 # READ BEFORE CLOSING. How much of the stream was actually tracked belongs in the
                 # run summary -- a behavioural figure computed from 60% of the frames is a real
                 # measurement of those frames, and the number saying so must survive the teardown.
                 self._tracking_summary = self._pool.stats()
                 self._pool.close()
+                if getattr(self._pool, 'fast_mode', False):
+                    self._tracking_summary = self._pool.stats()
                 self._pool = None
             # THE CAMERA IS RELEASED EVEN IF CLOSING THE LOG FAILS, and that ordering is the whole
             # point of the nesting. `logger.close()` regenerates the .xlsx siblings, and that step
@@ -1038,6 +1048,16 @@ class TrackerPipeline:
         # `tracking.max_dwell_frames` bounds a dwell that never ends (a stalled drum). 0/null keeps
         # the old unbounded behaviour; the config comment explains the trade in full.
         tracking_cfg = self.config.get("tracking") or {}
+        if tracking_cfg.get('mode') == 'fast':
+            from flygym_tracker.fast_tracking import FastParams
+            from flygym_tracker.fast_tracking_worker import FastTrackingPool
+            values = tracking_cfg.get('fast') or {}
+            self._pool = FastTrackingPool(self.logger.output_dir, self.logger.stamp,
+                backend=tracking_cfg.get('backend','thread'),
+                params=FastParams(**dict(values.items())),
+                window=float(tracking_cfg.get('background_window_s',120)))
+            self._pool.start()
+            return
         max_dwell = tracking_cfg.get("max_dwell_frames") or 0
         self._pool = FlyTrackingPool(
             {vid: (self._track_masks[vid], self._track_axes[vid]) for vid in self._track_masks},
@@ -1189,6 +1209,7 @@ class TrackerPipeline:
             if self._prev_stationary is None:
                 # First stationary frame after a reset: seed the baseline, no pair yet -> no motion.
                 self._prev_stationary = gray
+                self._collect_spatial(gray, None)
                 obs_vial_results = {}
                 rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, obs_vial_results)
             else:
@@ -1201,7 +1222,13 @@ class TrackerPipeline:
             # -- a frame the workers cannot take is dropped for tracking and counted, and the
             # activity measurement above has already happened regardless.
             if self.track_flies and self._pool is not None:
-                self._pool.submit(gray, elapsed_s)
+                if getattr(self._pool, 'fast_mode', False):
+                    geometry = {self._vial_meta[k][1].id: value
+                                for k,value in self._face_active.get(self._current_face,{}).items()}
+                    self._pool.submit(gray, elapsed_s, self._current_face,
+                                      self._spatial_offsets.get(self._current_face,(0,0)),geometry,frame.index)
+                else:
+                    self._pool.submit(gray, elapsed_s)
         elif state == TrackState.ROTATING:
             # Feed present-vial keys (motion/active ignored by the accumulator for ROTATING) so
             # `n_rotating_frames`/`lit_area_px` stay populated -> a bin straddling a rotation is
@@ -1340,6 +1367,10 @@ class TrackerPipeline:
         A vial's shape is translated by the SAME rounded offset as its bbox (`shift_quad` mirrors
         `apply_shift`'s rounding), so the polygon keeps its exact position within the crop.
         """
+        offset = (int(round(dx)), int(round(dy)))
+        if self._spatial_offsets.get(face, (0, 0)) != offset:
+            self._spatial_masks.pop(face, None)
+        self._spatial_offsets[face] = offset
         illum = self._illum_mask[face]
         active = self._face_active[face]
         quads = self._face_calib_quad[face]
@@ -1377,6 +1408,8 @@ class TrackerPipeline:
         results: Dict[int, Tuple[int, int, float]] = {}
         if self._current_face is None:
             return results
+        spatial = self.spatial_activity
+        motion = np.zeros(gray.shape, dtype=bool) if spatial is not None else None
         for gvid, (bbox, submask) in self._face_active[self._current_face].items():
             x, y, w, h = bbox
             if w <= 0 or h <= 0 or submask.size == 0:
@@ -1384,8 +1417,34 @@ class TrackerPipeline:
                 continue
             cur_crop = gray[y:y + h, x:x + w]
             prev_crop = prev[y:y + h, x:x + w]
-            results[gvid] = per_frame_activity(cur_crop, prev_crop, submask, self.pixel_threshold)
+            results[gvid] = per_frame_activity(
+                cur_crop, prev_crop, submask, self.pixel_threshold,
+                motion_out=motion[y:y+h, x:x+w] if motion is not None else None)
+        if spatial is not None and results:
+            self._collect_spatial(gray, motion)
         return results
+
+    def _collect_spatial(self, gray, motion):
+        from flygym_tracker.fast_tracking import uint8_percentile90
+        if self.spatial_activity is None or self._current_face is None:
+            return
+        mask = self._spatial_masks.get(self._current_face)
+        if mask is None:
+            mask = np.zeros(gray.shape, dtype=bool)
+            for (x, y, w, h), submask in self._face_active[self._current_face].values():
+                if w > 0 and h > 0 and submask.size:
+                    mask[y:y+h, x:x+w] |= submask
+            mask.setflags(write=False)
+            self._spatial_masks[self._current_face] = mask
+        normalized = np.empty(gray.shape, dtype=np.float32)
+        for (x, y, w, h), submask in self._face_active[self._current_face].values():
+            if w > 0 and h > 0 and submask.size and np.any(submask):
+                crop = gray[y:y+h, x:x+w]
+                light = uint8_percentile90(crop[submask])
+                np.divide(crop, max(light, 1.0), out=normalized[y:y+h, x:x+w],
+                          where=submask, casting='unsafe')
+        self.spatial_activity.add(self._current_face, gray, motion, mask,
+                                  self._spatial_offsets.get(self._current_face, (0, 0)), normalized, self._last_elapsed)
 
     # ---- bin -> records ---------------------------------------------------------------------
 
