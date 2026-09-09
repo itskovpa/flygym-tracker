@@ -315,6 +315,7 @@ class RunWorker(QObject):
                         elapsed_s=float(payload.get("elapsed_s") or 0),
                         state=str(payload.get("state")), measured=motion is not None)
         self.progress.emit({
+            "fast_tracking": self._fast_tracking_preview(),
             "live_activity": live,
             "frames": self._frames,
             "elapsed_s": float(payload.get("elapsed_s") or 0.0),
@@ -341,6 +342,12 @@ class RunWorker(QObject):
             # asked, and the answer is only useful while there is still time to lower the rate.
             "video": self._recorder.stats() if self._recorder is not None else None,
         })
+
+    def _fast_tracking_preview(self):
+        pool = getattr(self._pipeline,'_pool',None)
+        if pool is None or not getattr(pool,'fast_mode',False): return None
+        stats = pool.stats()
+        return dict(pool.latest,stats=stats)
 
     def _record(self, payload: dict) -> None:
         """Offer this frame to the recorder. EVERY frame, not the throttled 5 Hz the picture gets.

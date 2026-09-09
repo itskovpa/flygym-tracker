@@ -979,6 +979,8 @@ class TrackerPipeline:
                 # measurement of those frames, and the number saying so must survive the teardown.
                 self._tracking_summary = self._pool.stats()
                 self._pool.close()
+                if getattr(self._pool, 'fast_mode', False):
+                    self._tracking_summary = self._pool.stats()
                 self._pool = None
             # THE CAMERA IS RELEASED EVEN IF CLOSING THE LOG FAILS, and that ordering is the whole
             # point of the nesting. `logger.close()` regenerates the .xlsx siblings, and that step
@@ -1046,6 +1048,16 @@ class TrackerPipeline:
         # `tracking.max_dwell_frames` bounds a dwell that never ends (a stalled drum). 0/null keeps
         # the old unbounded behaviour; the config comment explains the trade in full.
         tracking_cfg = self.config.get("tracking") or {}
+        if tracking_cfg.get('mode') == 'fast':
+            from flygym_tracker.fast_tracking import FastParams
+            from flygym_tracker.fast_tracking_worker import FastTrackingPool
+            values = tracking_cfg.get('fast') or {}
+            self._pool = FastTrackingPool(self.logger.output_dir, self.logger.stamp,
+                backend=tracking_cfg.get('backend','thread'),
+                params=FastParams(**dict(values.items())),
+                window=float(tracking_cfg.get('background_window_s',120)))
+            self._pool.start()
+            return
         max_dwell = tracking_cfg.get("max_dwell_frames") or 0
         self._pool = FlyTrackingPool(
             {vid: (self._track_masks[vid], self._track_axes[vid]) for vid in self._track_masks},
@@ -1210,7 +1222,13 @@ class TrackerPipeline:
             # -- a frame the workers cannot take is dropped for tracking and counted, and the
             # activity measurement above has already happened regardless.
             if self.track_flies and self._pool is not None:
-                self._pool.submit(gray, elapsed_s)
+                if getattr(self._pool, 'fast_mode', False):
+                    geometry = {self._vial_meta[k][1].id: value
+                                for k,value in self._face_active.get(self._current_face,{}).items()}
+                    self._pool.submit(gray, elapsed_s, self._current_face,
+                                      self._spatial_offsets.get(self._current_face,(0,0)),geometry,frame.index)
+                else:
+                    self._pool.submit(gray, elapsed_s)
         elif state == TrackState.ROTATING:
             # Feed present-vial keys (motion/active ignored by the accumulator for ROTATING) so
             # `n_rotating_frames`/`lit_area_px` stay populated -> a bin straddling a rotation is
@@ -1407,6 +1425,7 @@ class TrackerPipeline:
         return results
 
     def _collect_spatial(self, gray, motion):
+        from flygym_tracker.fast_tracking import uint8_percentile90
         if self.spatial_activity is None or self._current_face is None:
             return
         mask = self._spatial_masks.get(self._current_face)
@@ -1421,7 +1440,7 @@ class TrackerPipeline:
         for (x, y, w, h), submask in self._face_active[self._current_face].values():
             if w > 0 and h > 0 and submask.size and np.any(submask):
                 crop = gray[y:y+h, x:x+w]
-                light = float(np.percentile(crop[submask], 90))
+                light = uint8_percentile90(crop[submask])
                 np.divide(crop, max(light, 1.0), out=normalized[y:y+h, x:x+w],
                           where=submask, casting='unsafe')
         self.spatial_activity.add(self._current_face, gray, motion, mask,

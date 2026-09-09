@@ -77,6 +77,10 @@ DEFAULTS: Dict[str, Any] = {
     #: Listed HERE for the same reason as the keys above: `save_state` writes only known keys, so a
     #: key the window sets but this table does not carry would be dropped silently on the way to disk.
     "track_flies": True,
+    "fast_tracking_backend": "configured",
+    "fast_tracking_threshold": 15.0,
+    "fast_tracking_min_area": 8,
+    "fast_tracking_max_area": 300,
 }
 
 #: How many entries the config dropdown keeps. Small: this is a shortcut, not a history feature,

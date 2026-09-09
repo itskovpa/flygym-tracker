@@ -65,7 +65,8 @@ class ActivityHeatmapPanel(QWidget):
         layout.addWidget(self.face_box)
         self.mode_box = QComboBox()
         self.mode_box.addItems(['Accumulated activity', 'Live detection', 'Mean image (frame sum)',
-                                'Relative occupancy (lighting corrected)'])
+                                'Relative occupancy (lighting corrected)',
+                                'Fast centroid tracking', 'Fast background subtraction'])
         self.mode_box.currentIndexChanged.connect(self.refresh)
         layout.addWidget(self.mode_box)
         self.background_controls = QWidget()
@@ -129,6 +130,9 @@ class ActivityHeatmapPanel(QWidget):
         self.refresh()
 
     def refresh(self):
+        if self.mode_box.currentIndex() in (4,5):
+            self._refresh_fast()
+            return
         if self.snapshot.get('error') and self.mode_box.currentIndex() != 1:
             self.heatmap.set_image(None)
             self.range_label.setText(self.snapshot['error'])
@@ -232,6 +236,52 @@ class ActivityHeatmapPanel(QWidget):
             self.range_label.setText('Face %s | %d measured frame pairs | shared scale 0-%.1f%% detections/pixel '
                                      '| updated at %.1f s' % (face, data['frames'], 100*maximum,
                                                              self.snapshot['elapsed_s']))
+
+    def _refresh_fast(self):
+        self._rendered = None
+        for widget in (self.threshold_controls,self.background_controls,self.face_box,
+                       self.legend,self.legend_low,self.legend_high): widget.setVisible(False)
+        data = self.snapshot.get('fast_tracking') or {}
+        stats = data.get('stats',{})
+        frame = data.get('frame')
+        self.note.setText('Experimental. Select a fast tracker in the Tracking menu, enable fly tracking, '
+                          'then start a new run. Green points are measured centroids; orange squares are '
+                          'unresolved groups, not separate measured flies. Counts and gap displacement '
+                          'are exported to fast_tracking CSV. The worker preview refreshes up to 5 times/s; '
+                          'the subtraction display uses a fixed 0-50% darkness scale.')
+        if frame is None:
+            self.heatmap.set_image(None)
+            self.range_label.setText('Waiting for fast tracking frames. '+str(stats.get('last_error','')))
+            return
+        subtraction = self.mode_box.currentIndex() == 5
+        contrast = data.get('contrast')
+        shown = np.rint(np.clip(contrast/.5,0,1)*255).astype(np.uint8) if subtraction and contrast is not None else frame
+        rgb = np.repeat(shown[:,:,None],3,axis=2)
+        measured = known = unknown = 0
+        def dot(x,y,color,radius):
+            x,y=int(round(x)),int(round(y))
+            rgb[max(0,y-radius):min(rgb.shape[0],y+radius+1),max(0,x-radius):min(rgb.shape[1],x+radius+1)] = color
+        for vial in data.get('vials',{}).values():
+            x,y,w,h = vial['bbox']
+            outline = vial.get('outline')
+            if outline is not None and len(outline): rgb[y+outline[:,0],x+outline[:,1]]=(0,120,0)
+            for point in vial['measured']:
+                measured += 1
+                if not subtraction: dot(x+point['x'],y+point['y'],(0,255,0),2)
+            for group in vial['groups']:
+                known += group['count'] or 0
+                unknown += int(group['count'] is None)
+                if not subtraction: dot(x+group['x'],y+group['y'],(255,150,0),4)
+        self.heatmap.set_image(rgb)
+        self.range_label.setText('Face %s | %.2f s | %d measured, %d in known groups, %d unknown groups\n'
+            'Completed %d / accepted %d | dropped %d | pending %d | processing %.1f ms | queue %.1f ms%s' %
+            (data.get('face'),data.get('elapsed_s',0),measured,known,unknown,
+             stats.get('frames_completed',0),stats.get('frames_submitted',0),stats.get('frames_dropped',0),
+             stats.get('pending_frames',0),stats.get('processing_mean_ms',0),stats.get('queue_delay_mean_ms',0),
+             ' | learning background' if contrast is None else ''))
+        self.range_label.setText(self.range_label.text()+' | warm-up %d | failures %d%s' %
+            (stats.get('warmup_frames',0),stats.get('failures',0),
+             ' | '+stats['last_error'] if stats.get('last_error') else ''))
 
 
 class ActivityHeatmapDock(QDockWidget):

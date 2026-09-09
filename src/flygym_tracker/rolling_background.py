@@ -24,7 +24,7 @@ def bright_percentile(samples):
 
 
 class RollingBackground:
-    def __init__(self, size, window_s=120, executor=None):
+    def __init__(self, size, window_s=120, executor=None, accumulate=True):
         self.window_s = float(window_s)
         self.samples = deque(maxlen=32)
         self.last_sample = -np.inf
@@ -38,6 +38,7 @@ class RollingBackground:
         self.total = np.zeros(size, np.float64)
         self.count = np.zeros(size, np.uint64)
         self.measured_frames = 0
+        self.accumulate = accumulate
 
     def set_window(self, seconds):
         if not np.isfinite(seconds) or not 10 <= seconds <= 600:
@@ -68,7 +69,7 @@ class RollingBackground:
                 self.background = background
                 self.background_time = self.future_time
         # Measure against the previous estimate, before learning from this frame.
-        if self.background is not None:
+        if self.background is not None and self.accumulate:
             valid = np.isfinite(values) & np.isfinite(self.background) & (self.background > 0)
             contrast = np.divide(self.background-values, self.background,
                                  out=np.zeros_like(self.background), where=valid)

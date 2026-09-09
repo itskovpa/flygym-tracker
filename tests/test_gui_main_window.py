@@ -70,6 +70,17 @@ def test_the_window_has_all_five_bands(qapp, window):
     assert window.settings_view.save_button is not None
 
 
+def test_fast_tracking_menu_settings_reach_run_config(window):
+    window._set_fast_backend('process')
+    window.state['fast_tracking_threshold']=22.5
+    window.state['fast_tracking_min_area']=12
+    config=window._config_for_run()
+    assert config.tracking.mode=='fast'
+    assert config.tracking.backend=='process'
+    assert config.tracking.fast.threshold==.225
+    assert config.tracking.fast.min_area==12
+
+
 def test_completed_bin_updates_both_recorded_summary_and_plot_history(qapp, window):
     window.run.bin_done.emit({"records": [
         {"elapsed_s": 10, "face": "A", "vial_id": 1, "motion_px_sum": 123}

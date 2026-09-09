@@ -166,6 +166,45 @@ class MainWindow(QMainWindow):
         open_logs = QAction("Open logs folder", self)
         open_logs.triggered.connect(self._open_logs_folder)
         menu.addAction(open_logs)
+        from PySide6.QtGui import QActionGroup
+        tracking_menu = self.menuBar().addMenu('&Tracking')
+        self.tracking_menu = tracking_menu
+        choices = QActionGroup(self)
+        self.tracking_choices = choices
+        for text,value in [('Configured tracker','configured'),('Fast centroids (thread)','thread'),
+                           ('Fast centroids (separate process)','process')]:
+            action = tracking_menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(self.state.get('fast_tracking_backend','configured') == value)
+            choices.addAction(action)
+            action.triggered.connect(lambda checked=False,v=value: self._set_fast_backend(v))
+        tracking_menu.addSeparator()
+        for text,key in [('Darkness threshold (%)...','fast_tracking_threshold'),
+                         ('Minimum blob area...','fast_tracking_min_area'),
+                         ('Maximum single-fly area...','fast_tracking_max_area')]:
+            action = tracking_menu.addAction(text)
+            action.triggered.connect(lambda checked=False,k=key: self._set_fast_parameter(k))
+        tracking_menu.addSeparator()
+        tracking_menu.addAction('Changes apply to the next run').setEnabled(False)
+
+    def _set_fast_backend(self, value):
+        self.state['fast_tracking_backend'] = value
+        gui_state.save_state(self.root,self.state)
+
+    def _set_fast_parameter(self, key):
+        from PySide6.QtWidgets import QInputDialog
+        if key == 'fast_tracking_threshold':
+            value,ok = QInputDialog.getDouble(self,'Fast centroid tracking','Relative darkness threshold (%)',
+                float(self.state.get(key,15)),.1,99.9,1)
+        else:
+            minimum = 1 if key.endswith('min_area') else int(self.state.get('fast_tracking_min_area',8))
+            maximum = int(self.state.get('fast_tracking_max_area',300)) if key.endswith('min_area') else 100000
+            value,ok = QInputDialog.getInt(self,'Fast centroid tracking',
+                'Blob area (pixels). Oversized blobs remain unresolved groups.',
+                int(self.state.get(key,8 if key.endswith('min_area') else 300)),minimum,maximum)
+        if ok:
+            self.state[key] = value
+            gui_state.save_state(self.root,self.state)
 
     def _save_diagnostics(self) -> None:
         from flygym_tracker import diagnostics
@@ -848,6 +887,13 @@ class MainWindow(QMainWindow):
         from flygym_tracker.config import load_config
 
         overrides = self.controller.model.to_overrides()
+        backend = self.state.get('fast_tracking_backend','configured')
+        if backend in ('thread','process'):
+            overrides.setdefault('tracking',{}).update(mode='fast',backend=backend,
+                background_window_s=float(self.state.get('spatial_background_window_s',120)),
+                fast=dict(threshold=float(self.state.get('fast_tracking_threshold',15))/100,
+                          min_area=int(self.state.get('fast_tracking_min_area',8)),
+                          max_single_area=int(self.state.get('fast_tracking_max_area',300))))
         if not overrides:
             return self.config
         try:
@@ -989,6 +1035,8 @@ class MainWindow(QMainWindow):
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
         live = payload.get("live_activity")
+        if payload.get('fast_tracking') is not None:
+            self.spatial_heatmap['fast_tracking'] = payload['fast_tracking']
         if live is not None:
             self.spatial_heatmap['live'] = live
             dock = self._plot_docks.get(HEATMAP_KEY)

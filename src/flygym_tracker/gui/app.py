@@ -76,6 +76,8 @@ def camera_factory_from_config(config):
 
 
 def main(argv: Optional[list] = None) -> int:
+    from multiprocessing import freeze_support
+    freeze_support()
     args = build_parser().parse_args(argv)
 
     # CRASH LOGGING ON, FIRST, before anything that could crash. Every build writes a per-session
