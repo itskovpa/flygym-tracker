@@ -108,6 +108,8 @@ def main(argv: Optional[list] = None) -> int:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    from flygym_tracker.gui.garbage_collection import install_gui_collector
+    install_gui_collector(app)
     from flygym_tracker.gui import theme
 
     app.setApplicationName("FlyGym v2 Tracker")
