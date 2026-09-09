@@ -145,6 +145,10 @@ class MainWindow(QMainWindow):
         #: One-shot guard so the after-show geometry clamp (see `showEvent`) runs on the FIRST show
         #: only -- after that the operator is free to move or resize the window wherever they like.
         self._geometry_clamped = False
+        # One application-owned service. Device monitoring is independent of the camera and a
+        # future run pipeline can share this object instead of opening the USB port again.
+        self._rig_device_service = None
+        self._device_control = None
         self._build()
         self._build_help_menu()
         self._connect()
@@ -168,8 +172,25 @@ class MainWindow(QMainWindow):
         menu.addAction(open_logs)
         self.tracking_menu = self.menuBar().addMenu('&Tracking')
         self.tracking_menu.addAction('Setup and inspection...', self.show_tracking_setup)
+        self.device_menu = self.menuBar().addMenu('&Device')
+        self.device_menu.addAction('Control and status...', self.show_device_control)
         self._tracking_setup = None
         self.session_bar.tracking_setup_requested.connect(self.show_tracking_setup)
+
+    def _make_rig_device_service(self, port):
+        from flygym_tracker.rig_device import RigDeviceService
+        self._rig_device_service = RigDeviceService(port)
+        return self._rig_device_service
+
+    def show_device_control(self):
+        from flygym_tracker.gui.device_control import DeviceControlWindow
+        if self._device_control is None:
+            self._device_control = DeviceControlWindow(
+                self._rig_device_service, service_factory=self._make_rig_device_service,
+                parent=self)
+        self._device_control.show()
+        self._device_control.raise_()
+        self._device_control.activateWindow()
 
     def show_tracking_setup(self):
         from flygym_tracker.gui.tracking_setup import TrackingSetup
@@ -1559,6 +1580,8 @@ class MainWindow(QMainWindow):
         # grab loop calling into a job whose owner has gone.
         self.stage.shutdown()
         self.session.shutdown()
+        if self._rig_device_service is not None:
+            self._rig_device_service.close()
         gui_state.save_state(self.root, self.state)
         event.accept()
 

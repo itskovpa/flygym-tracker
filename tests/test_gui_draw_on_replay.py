@@ -285,12 +285,13 @@ class _PlanCatcher(_Run):
 def test_a_replay_carries_the_tracking_tickbox_into_its_plan(window, monkeypatch, track):
     """REPORTED FROM THE RIG: "fly tracking tickbox does not seem to work - even with it selected
     the software draws fly tracks." The replay plan simply never carried the tickbox."""
-    window.run = _PlanCatcher()
+    plans = []
+    monkeypatch.setattr(window.run, "start", lambda plan: plans.append(plan) or False)
     window.session_bar.set_tracking(track)
     monkeypatch.setattr(window, "_pick_video", lambda title: "C:/clips/rig.avi")
 
     window._begin_replay(str(window.state["calib_dir"]))
 
-    assert window.run.plans, "the replay was not started"
-    assert window.run.plans[0].get("track_flies") is track,         "the replay plan says track_flies=%r with the tickbox at %r" % (
-            window.run.plans[0].get("track_flies"), track)
+    assert plans, "the replay was not started"
+    assert plans[0].get("track_flies") is track,         "the replay plan says track_flies=%r with the tickbox at %r" % (
+            plans[0].get("track_flies"), track)

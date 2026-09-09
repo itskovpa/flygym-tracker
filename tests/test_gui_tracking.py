@@ -43,17 +43,18 @@ def test_tracking_is_on_by_default(qapp, window):
     assert bar.track_flies() is True
 
 
-def test_the_box_lives_in_the_collapsible_experiment_section(qapp, window):
-    """As asked -- the same Experiment section as the paths and the recording box, and it collapses
-    with them. It belongs there: like recording, it is settled once at the start, not mid-run."""
+def test_tracking_setup_link_lives_in_the_collapsible_experiment_section(qapp, window):
+    """The consolidated setup link replaces the old duplicate tracking checkbox."""
     bar = window.session_bar
-    assert bar.activity_only_box.isVisible()
+    assert not bar.activity_only_box.isVisible()
+    assert bar.tracking_setup_button.isVisible()
     bar.set_expanded(False)
     qapp.processEvents()
-    assert not bar.activity_only_box.isVisible(), "the tracking box did not collapse with the rest"
+    assert not bar.tracking_setup_button.isVisible()
     bar.set_expanded(True)
     qapp.processEvents()
-    assert bar.activity_only_box.isVisible()
+    assert bar.tracking_setup_button.isVisible()
+    assert not bar.activity_only_box.isVisible()
 
 
 def test_ticking_it_means_activity_only_and_announces_the_change(qapp, window):
