@@ -903,6 +903,13 @@ class MainWindow(QMainWindow):
             self._share_width_with_results()
         # A finished run gives the picture back to the camera preview, so the next thing the
         # operator does is not done against the last frame of the last experiment.
+        if state in (DONE, FAILED, IDLE):
+            live = self.spatial_heatmap.get('live')
+            if live is not None:
+                live['ended'] = True
+                dock = self._plot_docks.get(HEATMAP_KEY)
+                if dock is not None:
+                    dock.refresh()
         if state in (DONE, FAILED, IDLE) and self.stage.mode == STAGE_RUN:
             self.stage.show_camera()
         # Width/Height must LOOK dead while the stream is running, not merely refuse when pressed
@@ -935,6 +942,8 @@ class MainWindow(QMainWindow):
         if dock is None:
             dock = (ActivityHeatmapDock(self.spatial_heatmap, self) if field == HEATMAP_KEY else
                     BehaviourPlotDock(self.behaviour, field, self))
+            if field == HEATMAP_KEY:
+                dock.panel.threshold_requested.connect(self._apply_inspector_threshold)
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
             # on and asked to have from the start: a graph opens in the same left tab group as the
@@ -958,8 +967,11 @@ class MainWindow(QMainWindow):
         dock.raise_()
         dock.refresh()
 
+    def _apply_inspector_threshold(self, value: float) -> None:
+        self.controller.commit("activity.pixel_threshold", value)
+        self.settings_view.refresh()
+
     def _on_spatial_ready(self, payload: dict) -> None:
-        self.spatial_heatmap.clear()
         self.spatial_heatmap.update(payload)
         dock = self._plot_docks.get(HEATMAP_KEY)
         if dock is not None:
@@ -967,6 +979,12 @@ class MainWindow(QMainWindow):
 
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
+        live = payload.get("live_activity")
+        if live is not None:
+            self.spatial_heatmap['live'] = live
+            dock = self._plot_docks.get(HEATMAP_KEY)
+            if dock is not None:
+                dock.refresh()
         self.stage.set_run_activity(payload.get("vial_results") or {})
         self.stage.set_run_tracks(payload.get("fly_tracks"))
 

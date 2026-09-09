@@ -300,7 +300,19 @@ class RunWorker(QObject):
                     pass                      # a preview must never be able to end a run
         self._last_emit = now
         vial_results = payload.get("vial_results") or {}
+        spatial = getattr(self._pipeline, "spatial_activity", None)
+        valid = bool(vial_results) and str(payload.get("state")) in ("STATIONARY", "TrackState.STATIONARY", "stationary")
+        motion = spatial.last_motion if spatial is not None and valid else None
+        live = None
+        frame_image = payload.get("frame")
+        if frame_image is not None:
+            # Exact frame and its detector mask travel together, never separate preview updates.
+            live = dict(frame=frame_image.copy(), motion=motion.copy() if motion is not None else None,
+                        threshold=payload.get("pixel_threshold"), face=payload.get("face"),
+                        elapsed_s=float(payload.get("elapsed_s") or 0),
+                        state=str(payload.get("state")), measured=motion is not None)
         self.progress.emit({
+            "live_activity": live,
             "frames": self._frames,
             "elapsed_s": float(payload.get("elapsed_s") or 0.0),
             "state": str(payload.get("state") or ""),

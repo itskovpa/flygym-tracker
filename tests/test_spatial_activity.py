@@ -86,3 +86,31 @@ def test_pipeline_spatial_counts_match_activity_and_exclude_rotation(tmp_path):
     counts = sum(int(d['counts'].sum()) for d in pipe.spatial_activity.faces.values())
     assert counts > 0
     assert counts == sum(totals)
+
+def test_live_mode_renders_exact_frame_mask_and_keeps_cumulative_snapshot(qapp):
+    gray = np.full((4, 5), 80, np.uint8)
+    motion = np.zeros(gray.shape, bool)
+    motion[1, 2] = True
+    store = SpatialActivity()
+    store.add('A', gray, motion)
+    payload = store.snapshot(10)
+    payload['live'] = dict(frame=gray, motion=motion, threshold=15, face='A', elapsed_s=11)
+    panel = ActivityHeatmapPanel(payload)
+    changes = []
+    panel.threshold_requested.connect(changes.append)
+    panel.mode_box.setCurrentIndex(1)
+    assert '1 pixels detected' in panel.range_label.text()
+    assert panel.heatmap.image.pixelColor(0, 0).red() == 80
+    assert panel.heatmap.image.pixelColor(2, 1).red() > 80
+    panel.threshold_box.setValue(25)
+    panel.apply_button.click()
+    assert changes == [25]
+    # Editing the detector does not relabel the threshold used for this older frame.
+    assert 'actual threshold 15' in panel.range_label.text()
+    payload['live'] = dict(frame=gray, motion=None, threshold=25, face='B', elapsed_s=12)
+    panel.refresh()
+    assert 'not measured' in panel.range_label.text()
+    assert panel.heatmap.image.pixelColor(2, 1).red() == 80
+    panel.mode_box.setCurrentIndex(0)
+    assert payload['faces']['A']['counts'][1, 2] == 1
+    assert 'updated at 10.0' in panel.range_label.text()

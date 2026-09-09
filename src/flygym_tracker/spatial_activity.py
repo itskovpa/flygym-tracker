@@ -6,6 +6,7 @@ class SpatialActivity:
     def __init__(self):
         self.faces = {}
         self.last_publish = 0.0
+        self.last_motion = None
 
     def add(self, face, gray, motion):
         if face not in ('A', 'B'):
@@ -16,6 +17,7 @@ class SpatialActivity:
             background.setflags(write=False)
             data = dict(background=background, counts=np.zeros(gray.shape, dtype=np.uint64), frames=0)
             self.faces[face] = data
+        self.last_motion = motion
         data['counts'] += motion
         data['frames'] += 1
 

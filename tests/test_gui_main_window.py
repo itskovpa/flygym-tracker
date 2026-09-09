@@ -488,3 +488,9 @@ def test_a_camera_that_never_releases_does_not_silently_start_a_run(qapp, window
     assert not window._pending_start
     assert window.stage.mode == CAMERA
     assert "did not release" in window.run_panel.state_label.text()
+
+def test_inspector_threshold_uses_normal_settings_controller(qapp, window):
+    window.show_plot('activity_heatmap')
+    panel = window._plot_docks['activity_heatmap'].panel
+    panel.threshold_requested.emit(23.0)
+    assert window.controller.model.get('activity.pixel_threshold').value == 23.0
