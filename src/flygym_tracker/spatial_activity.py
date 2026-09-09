@@ -120,3 +120,91 @@ class SpatialActivity:
 
 def relative_occupancy(data):
     return data['occupancy']
+
+
+class AsyncSpatialActivity:
+    """Ordered, bounded accumulation worker; live masks stay on the producer thread."""
+    def __init__(self, background_window_s=120):
+        import queue
+        import threading
+        self.store = SpatialActivity(background_window_s)
+        self.background_window_s = background_window_s
+        self.last_motion = None
+        self._queue = queue.Queue(maxsize=8)
+        self._latest = self._seen = None
+        self._error = None
+        self._closed = False
+        self.processed_frames = 0
+        self.peak_queue = 0
+        self._thread = threading.Thread(target=self._work, name='flygym-spatial', daemon=True)
+        self._thread.start()
+
+    @property
+    def faces(self):
+        # Inspect only after close() or flush, when the worker has finished writing.
+        return self.store.faces
+
+    def add(self, face, gray, motion, mask=None, offset=(0, 0), normalized=None, elapsed_s=None):
+        self.last_motion = motion
+        if self._closed or self._error is not None:
+            return
+        # Own image data because camera adapters may reuse buffers on their next read.
+        frame = (face, gray.copy(), None if motion is None else motion.copy(),
+                 mask if mask is None or not mask.flags.writeable else mask.copy(), offset,
+                 None if normalized is None else normalized.copy(), elapsed_s)
+        self._queue.put(('frame', frame))
+        self.peak_queue = max(self.peak_queue, self._queue.qsize())
+
+    def set_background_window(self, seconds):
+        if not np.isfinite(seconds) or not 10 <= seconds <= 600:
+            raise ValueError('Background window must be 10 to 600 seconds')
+        if self._closed or float(seconds) == self.background_window_s:
+            return
+        self.background_window_s = float(seconds)
+        self._queue.put(('window', float(seconds)))
+
+    def _work(self):
+        elapsed = 0.0
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    break
+                if self._error is not None:
+                    continue
+                kind, value = item
+                if kind == 'window':
+                    self.store.set_background_window(value)
+                else:
+                    self.store.add(*value)
+                    self.processed_frames += 1
+                    elapsed = value[-1] if value[-1] is not None else self.processed_frames/20
+                    snapshot = self.store.snapshot(elapsed)
+                    if snapshot is not None:
+                        self._latest = snapshot
+            except Exception as exc:
+                self._error = 'Spatial accumulation failed: %s' % exc
+            finally:
+                self._queue.task_done()
+        self.store.close()
+        if self._error is None:
+            self._latest = self.store.snapshot(elapsed, force=True)
+
+    def snapshot(self, elapsed_s, force=False):
+        if force and not self._closed:
+            self._queue.join()
+            if self._error is None:
+                self._latest = self.store.snapshot(elapsed_s, force=True)
+        if self._error is not None:
+            return dict(elapsed_s=elapsed_s, faces={}, maximum=0, error=self._error)
+        if not force and self._latest is self._seen:
+            return None
+        self._seen = self._latest
+        return self._latest
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+        self._thread.join()

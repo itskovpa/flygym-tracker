@@ -161,8 +161,8 @@ class RunWorker(QObject):
             self.failed.emit(str(exc))
             return
 
-        from flygym_tracker.spatial_activity import SpatialActivity
-        pipeline.spatial_activity = SpatialActivity(self._plan.get('spatial_background_window_s', 120))
+        from flygym_tracker.spatial_activity import AsyncSpatialActivity
+        pipeline.spatial_activity = AsyncSpatialActivity(self._plan.get('spatial_background_window_s', 120))
         self._spatial_elapsed = 0.0
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
@@ -173,10 +173,12 @@ class RunWorker(QObject):
             summary = pipeline.run(max_frames=self._plan.get("max_frames"),
                                    stop_flag=self._stop.is_set)
         except Exception as exc:
+            pipeline.spatial_activity.close()
             self._pipeline = None
             self._close_recorder()      # a failed run still leaves whatever it recorded playable
             self.failed.emit(str(exc))
             return
+        pipeline.spatial_activity.close()
         snapshot = pipeline.spatial_activity.snapshot(self._spatial_elapsed, force=True)
         if snapshot is not None:
             self.spatial_ready.emit(snapshot)

@@ -129,6 +129,10 @@ class ActivityHeatmapPanel(QWidget):
         self.refresh()
 
     def refresh(self):
+        if self.snapshot.get('error') and self.mode_box.currentIndex() != 1:
+            self.heatmap.set_image(None)
+            self.range_label.setText(self.snapshot['error'])
+            return
         is_live = self.mode_box.currentIndex() == 1
         self.threshold_controls.setVisible(is_live)
         self.background_controls.setVisible(self.mode_box.currentIndex() == 3)

@@ -278,3 +278,58 @@ def test_live_background_window_setting_routes_through_pipeline(tmp_path):
     assert not pipe.apply_setting('spatial.background_window_s', 0)
     assert pipe.spatial_activity.background_window_s == 60
     pipe.spatial_activity.close();logger.close()
+
+
+def test_async_accumulation_owns_frames_and_flushes_every_submission():
+    from flygym_tracker.spatial_activity import AsyncSpatialActivity
+    store = AsyncSpatialActivity()
+    gray = np.full((4, 5), 200, np.uint8)
+    motion = np.ones(gray.shape, bool)
+    mask = np.ones(gray.shape, bool);mask.setflags(write=False)
+    for i in range(100):
+        store.add('A', gray, motion, mask, elapsed_s=i/20)
+    gray[:] = 0;motion[:] = False
+    store.set_background_window(60)
+    store.close()
+    data = store.snapshot(5, force=True)['faces']['A']
+    assert data['image_frames'] == 100
+    assert np.all(data['counts'] == 100)
+    assert np.all(data['mean'] == 200)
+    assert store.processed_frames == 100
+    assert store.peak_queue <= 8
+    assert store.store.background_window_s == 60
+    store.close()  # RunWorker and the pipeline can both close safely.
+
+
+def test_async_failure_is_reported_without_deadlocking_primary_pipeline(monkeypatch):
+    from flygym_tracker.spatial_activity import AsyncSpatialActivity
+    store = AsyncSpatialActivity()
+    def fail(*args):
+        raise ValueError('test failure')
+    monkeypatch.setattr(store.store, 'add', fail)
+    store.add('A', np.zeros((2, 2), np.uint8), None)
+    store.close()
+    assert 'test failure' in store.snapshot(1, force=True)['error']
+
+
+def test_async_live_mask_is_current_even_when_accumulation_is_busy(monkeypatch):
+    import threading
+    from flygym_tracker.spatial_activity import AsyncSpatialActivity
+    store = AsyncSpatialActivity()
+    entered, release = threading.Event(), threading.Event()
+    original = store.store.add
+    def wait_then_add(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+    monkeypatch.setattr(store.store, 'add', wait_then_add)
+    gray = np.zeros((2, 2), np.uint8)
+    first = np.zeros_like(gray, bool)
+    latest = np.ones_like(gray, bool)
+    try:
+        store.add('A', gray, first)
+        assert entered.wait(5)
+        store.add('A', gray, latest)
+        assert store.last_motion is latest
+    finally:
+        release.set();store.close()

@@ -19,6 +19,11 @@ Longer footage helps only when it reveals unobstructed background. A moving wind
 
 Cumulative statistics are translated into the first stationary frame's coordinates separately for each face using the accepted registration offsets. Translation uses integer slicing without interpolation or edge wrapping. Pixels excluded by masks or outside the aligned image do not enter the averages. This corrects accepted translational shifts; it does not compensate for unknown shifts, rotations within a frame or deformation.
 
-Vial edits now preserve learned face-identification templates when image dimensions match. Missing face templates can cause the existing pipeline to attribute measurements to one face; resolve the face-ID warning before interpreting A/B maps. Learned templates must be relearned if the camera geometry or marker appearance changes.
+GUI vial edits now preserve learned face-identification templates when image dimensions match. Missing face templates can cause the existing pipeline to attribute measurements to one face; resolve the face-ID warning before interpreting A/B maps. Learned templates must be relearned if the camera geometry or marker appearance changes.
 
 The accumulation approach follows the standard per-pixel image-sum operation described in [OpenCV's accumulation documentation](https://docs.opencv.org/4.13.0/d7/df3/group__imgproc__motion.html). FlyGym retains exact uint64 sums for its uint8 grayscale input and uses float64 for normalization and corrected-darkness accumulation.
+
+
+## Acquisition and accumulation
+
+Spatial accumulation runs on an ordered worker with an eight-frame bounded queue. Every submitted frame is processed; a full queue applies backpressure instead of silently dropping heatmap frames. Shutdown drains the queue before publishing the final map. Camera frames are copied before queuing so reused capture buffers cannot corrupt history. The live detection view uses the current producer-thread mask, not the worker's older frame. This reduces work on the primary processing thread but does not guarantee a particular camera frame rate; validate acquisition counters and queue depth on the rig.
