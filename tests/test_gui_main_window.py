@@ -494,3 +494,13 @@ def test_inspector_threshold_uses_normal_settings_controller(qapp, window):
     panel = window._plot_docks['activity_heatmap'].panel
     panel.threshold_requested.emit(23.0)
     assert window.controller.model.get('activity.pixel_threshold').value == 23.0
+
+
+def test_occupancy_window_control_reaches_run_and_persists(window):
+    from flygym_tracker.gui.activity_heatmap import HEATMAP_KEY
+    window.show_plot(HEATMAP_KEY)
+    panel = window._plot_docks[HEATMAP_KEY].panel
+    panel.mode_box.setCurrentIndex(3)
+    panel.background_window.setValue(60)
+    assert window.run.background_window_s == 60
+    assert gui_state.load_state(window.root)['spatial_background_window_s'] == 60

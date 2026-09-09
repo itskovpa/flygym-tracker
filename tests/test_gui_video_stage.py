@@ -783,3 +783,25 @@ def test_failed_save_keeps_drawing_for_retry(qapp, tmp_path, monkeypatch):
     assert stage.draw_session is None
     assert saved_selection(out).polygons == [polygon]
     stage.close()
+
+
+def test_redrawing_vials_preserves_learned_face_templates(qapp, tmp_path):
+    from flygym_tracker.calibration import load_calibration
+    stage = _stage(qapp)
+    stage.view.set_frame(_frame())
+    out = str(tmp_path / 'face-metadata')
+    polygon = [[5, 5], [35, 5], [35, 40]]
+    stage.begin_draw(out_dir=out, polygons=[polygon])
+    stage.draw_session.finish()
+    calib = load_calibration(out)
+    for face, fc in calib.faces.items():
+        fc.marker.update(band_templates=[[1, 2, 3]], band_detector={'rows': [20, 25]}, band_learned=face)
+    calib.to_json(str(tmp_path / 'face-metadata' / 'calibration.json'))
+    stage.begin_draw(out_dir=out, polygons=[polygon])
+    stage.draw_session.state.move_vertex(0, 0, 8, 8)
+    stage.draw_session.finish()
+    saved = load_calibration(out)
+    for face, fc in saved.faces.items():
+        assert fc.marker == calib.faces[face].marker
+        assert fc.vials[0].polygon[0] == [8, 8]
+    stage.close()

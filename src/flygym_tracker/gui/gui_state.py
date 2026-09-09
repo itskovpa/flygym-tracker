@@ -47,6 +47,7 @@ SCHEMA_VERSION = 1
 #: The shape, and the only place a default is written down. `_coerce` is driven off these types.
 DEFAULTS: Dict[str, Any] = {
     "version": SCHEMA_VERSION,
+    "spatial_background_window_s": 120,
     #: THIS MACHINE'S OWN config, not the shipped template. It layers on top of
     #: `config/flygym_rig.yaml` (see `config.load_config`), so the rig gets every value the
     #: template carries plus whatever was tuned here -- and the template stays what a fresh clone
@@ -141,7 +142,8 @@ def _coerce(key: str, value: Any) -> Any:
         return default
     if isinstance(default, int) and not isinstance(default, bool):
         try:
-            return int(value)
+            number = int(value)
+            return min(600, max(10, number)) if key == "spatial_background_window_s" else number
         except (TypeError, ValueError):
             return default
     if value is None:

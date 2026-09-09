@@ -443,10 +443,15 @@ class TrackerPipeline:
         self._behaviour_observers: List[Callable[[dict], None]] = []
         self.observer_failures = 0
         self.spatial_activity = None
+        self._spatial_offsets = {}
+        self._spatial_masks = {}
         self._fps_times: List[float] = []
 
         # -- live settings (see the "live settings" section below) ----------------------------
         self._setting_routes = self._build_setting_routes()
+        self._setting_routes['spatial.background_window_s'] = (
+            lambda: self.spatial_activity.background_window_s,
+            lambda value: self.spatial_activity.set_background_window(value))
 
     # ---- observers ----------------------------------------------------------------------------
     #
@@ -966,6 +971,8 @@ class TrackerPipeline:
                 self._flush_behaviour()
             self._write_workbook()
         finally:
+            if self.spatial_activity is not None:
+                self.spatial_activity.close()
             if self._pool is not None:
                 # READ BEFORE CLOSING. How much of the stream was actually tracked belongs in the
                 # run summary -- a behavioural figure computed from 60% of the frames is a real
@@ -1190,6 +1197,7 @@ class TrackerPipeline:
             if self._prev_stationary is None:
                 # First stationary frame after a reset: seed the baseline, no pair yet -> no motion.
                 self._prev_stationary = gray
+                self._collect_spatial(gray, None)
                 obs_vial_results = {}
                 rolled = self.accumulator.add(elapsed_s, TrackState.STATIONARY, obs_vial_results)
             else:
@@ -1341,6 +1349,10 @@ class TrackerPipeline:
         A vial's shape is translated by the SAME rounded offset as its bbox (`shift_quad` mirrors
         `apply_shift`'s rounding), so the polygon keeps its exact position within the crop.
         """
+        offset = (int(round(dx)), int(round(dy)))
+        if self._spatial_offsets.get(face, (0, 0)) != offset:
+            self._spatial_masks.pop(face, None)
+        self._spatial_offsets[face] = offset
         illum = self._illum_mask[face]
         active = self._face_active[face]
         quads = self._face_calib_quad[face]
@@ -1391,8 +1403,29 @@ class TrackerPipeline:
                 cur_crop, prev_crop, submask, self.pixel_threshold,
                 motion_out=motion[y:y+h, x:x+w] if motion is not None else None)
         if spatial is not None and results:
-            spatial.add(self._current_face, gray, motion)
+            self._collect_spatial(gray, motion)
         return results
+
+    def _collect_spatial(self, gray, motion):
+        if self.spatial_activity is None or self._current_face is None:
+            return
+        mask = self._spatial_masks.get(self._current_face)
+        if mask is None:
+            mask = np.zeros(gray.shape, dtype=bool)
+            for (x, y, w, h), submask in self._face_active[self._current_face].values():
+                if w > 0 and h > 0 and submask.size:
+                    mask[y:y+h, x:x+w] |= submask
+            mask.setflags(write=False)
+            self._spatial_masks[self._current_face] = mask
+        normalized = np.empty(gray.shape, dtype=np.float32)
+        for (x, y, w, h), submask in self._face_active[self._current_face].values():
+            if w > 0 and h > 0 and submask.size and np.any(submask):
+                crop = gray[y:y+h, x:x+w]
+                light = float(np.percentile(crop[submask], 90))
+                np.divide(crop, max(light, 1.0), out=normalized[y:y+h, x:x+w],
+                          where=submask, casting='unsafe')
+        self.spatial_activity.add(self._current_face, gray, motion, mask,
+                                  self._spatial_offsets.get(self._current_face, (0, 0)), normalized, self._last_elapsed)
 
     # ---- bin -> records ---------------------------------------------------------------------
 

@@ -307,12 +307,21 @@ class VialDrawSession(QObject):
     def _save(self, polygons):
         """Write the bundle. The same two calls `load_or_select_vials` makes, in the same order."""
         from flygym_tracker.calibration import (build_two_face_calibration_from_polygons,
-                                                save_calibration)
+                                                save_calibration, load_calibration)
 
         frame = self.last_image
         height, width = frame.shape[:2]
         calib, masks, overlays = build_two_face_calibration_from_polygons(
             polygons, frame, (width, height), faces=self.faces)
+        existing_path = os.path.join(self.out_dir, "calibration.json")
+        if os.path.isfile(existing_path):
+            existing = load_calibration(self.out_dir)
+            if (existing.image_width, existing.image_height) == (width, height):
+                for face, fc in calib.faces.items():
+                    previous = existing.faces.get(face)
+                    if previous is not None:
+                        # Vial edits must not erase learned face IDs or marker-band settings.
+                        fc.marker = {**(previous.marker or {}), **(fc.marker or {})}
         save_calibration(calib, masks, self.out_dir, overlay=overlays)
         # Saved with RELATIVE mask paths so the bundle stays movable, handed back RESOLVED so it
         # can go straight to the pipeline -- exactly what `load_calibration` returns.

@@ -22,7 +22,7 @@ def overlay_image(background, counts, maximum):
     heat = np.empty(rgb.shape, dtype=np.float32)
     for channel, values in enumerate(((30, 255, 255), (100, 220, 30), (255, 20, 0))):
         heat[:, :, channel] = np.interp(level, (0, .5, 1), values)
-    alpha = np.where(counts > 0, .15 + .65 * np.sqrt(level), 0)[:, :, None]
+    alpha = (.8 * np.sqrt(level))[:, :, None]
     return np.rint(rgb * (1-alpha) + heat * alpha).astype(np.uint8)
 
 
@@ -52,6 +52,7 @@ class ActivityHeatmapWidget(QWidget):
 
 class ActivityHeatmapPanel(QWidget):
     threshold_requested = Signal(float)
+    background_window_requested = Signal(float)
 
     def __init__(self, snapshot, parent=None):
         super().__init__(parent)
@@ -63,9 +64,25 @@ class ActivityHeatmapPanel(QWidget):
         self.face_box.currentIndexChanged.connect(self.refresh)
         layout.addWidget(self.face_box)
         self.mode_box = QComboBox()
-        self.mode_box.addItems(['Accumulated activity', 'Live detection'])
+        self.mode_box.addItems(['Accumulated activity', 'Live detection', 'Mean image (frame sum)',
+                                'Relative occupancy (lighting corrected)'])
         self.mode_box.currentIndexChanged.connect(self.refresh)
         layout.addWidget(self.mode_box)
+        self.background_controls = QWidget()
+        background_layout = QHBoxLayout(self.background_controls)
+        background_layout.setContentsMargins(0, 0, 0, 0)
+        background_layout.addWidget(QLabel('Background window (s)'))
+        self.background_window = QDoubleSpinBox()
+        self.background_window.setRange(10, 600)
+        self.background_window.setDecimals(0)
+        self.background_window.setSingleStep(10)
+        self.background_window.setValue(120)
+        self.background_window.setKeyboardTracking(False)
+        stepper = StepperField(self.background_window)
+        self.background_window.valueChanged.connect(stepper.refresh_step_limits)
+        self.background_window.valueChanged.connect(self.background_window_requested.emit)
+        background_layout.addWidget(stepper)
+        layout.addWidget(self.background_controls)
         self.threshold_controls = QWidget()
         threshold_layout = QHBoxLayout(self.threshold_controls)
         threshold_layout.setContentsMargins(0, 0, 0, 0)
@@ -101,8 +118,8 @@ class ActivityHeatmapPanel(QWidget):
         self.legend_high = QLabel('high activity')
         legend_labels.addWidget(self.legend_high)
         layout.addLayout(legend_labels)
-        self.note = QLabel('Accumulated motion detections per pixel since the run began. '
-                      'Static background per face; image and shared scale refresh every 10 s '
+        self.note = QLabel('Motion detections divided by measured frame pairs at each pixel. '
+                      'Registered to a static frame per face; image and shared scale refresh every 10 s '
                       'of recording time and at run end. Rotation and settling are excluded. '
                       'Uncolored pixels have no accumulated motion. Replay video to populate; '
                       'per-vial CSV totals cannot reconstruct this map.')
@@ -114,6 +131,7 @@ class ActivityHeatmapPanel(QWidget):
     def refresh(self):
         is_live = self.mode_box.currentIndex() == 1
         self.threshold_controls.setVisible(is_live)
+        self.background_controls.setVisible(self.mode_box.currentIndex() == 3)
         self.face_box.setVisible(not is_live)
         self.legend.setVisible(not is_live)
         self.legend_low.setVisible(not is_live)
@@ -151,7 +169,8 @@ class ActivityHeatmapPanel(QWidget):
         self.note.setText(self._cumulative_note)
         face = 'AB'[self.face_box.currentIndex()]
         data = self.snapshot.get('faces', {}).get(face)
-        key = (face, id(data), self.snapshot.get('elapsed_s'))
+        mode = self.mode_box.currentIndex()
+        key = (mode, face, id(data), self.snapshot.get('elapsed_s'))
         if key == self._rendered:
             return
         self._rendered = key
@@ -159,11 +178,56 @@ class ActivityHeatmapPanel(QWidget):
             self.heatmap.set_image(None)
             self.range_label.setText('No spatial activity frames for face %s yet.' % face)
             return
-        maximum = self.snapshot['maximum']
-        self.heatmap.set_image(overlay_image(data['background'], data['counts'], maximum))
-        self.range_label.setText('Face %s | %d measured frame pairs | shared scale 0–%d detections/pixel '
-                                 '| updated at %.1f s' % (face, data['frames'], maximum,
-                                                         self.snapshot['elapsed_s']))
+        if mode == 2:
+            valid = data.get('valid')
+            mean = data.get('mean')
+            if mean is None or valid is None or not np.any(valid):
+                self.heatmap.set_image(None)
+                self.range_label.setText('Replay video to accumulate the mean image.')
+                return
+            lo, hi = float(mean[valid].min()), float(mean[valid].max())
+            shown = data['background'].copy()
+            shown[valid] = (np.rint((mean[valid]-lo)*255/(hi-lo)).astype(np.uint8)
+                            if hi > lo else np.rint(mean[valid]).astype(np.uint8))
+            self.heatmap.set_image(np.repeat(shown[:, :, None], 3, axis=2))
+            self.legend.setVisible(False)
+            self.legend_low.setText('dark'); self.legend_high.setText('bright')
+            self.range_label.setText('Face %s | %d stationary frames | mean intensity %.2f-%.2f '
+                                     '| updated at %.1f s' % (face, data['image_frames'], lo, hi,
+                                                             self.snapshot['elapsed_s']))
+            self.note.setText('Exact 64-bit pixel sum divided by each pixel sample count. '
+                              'Display contrast is rescaled every 10 s; accumulated data is never rescaled. '
+                              'Only registered vial pixels are averaged. Dark walls and stationary flies '
+                              'both remain dark: this is an average image, not an occupancy probability.')
+        elif mode == 3:
+            maps = {name: entry['occupancy'] for name, entry in self.snapshot.get('faces', {}).items()
+                    if 'occupancy' in entry}
+            if face not in maps:
+                self.heatmap.set_image(None)
+                self.range_label.setText('Replay video to accumulate relative occupancy.')
+                return
+            maximum = max(float(values.max()) for values in maps.values())
+            self.heatmap.set_image(overlay_image(data['background'], maps[face], maximum))
+            self.legend_low.setText('0'); self.legend_high.setText('%.1f%% relative darkness' % (100*maximum))
+            self.range_label.setText('Face %s | %d corrected frames | %d background samples | scale 0-%.1f%% '
+                                     '| window %.0f s | updated at %.1f s' % (face, data['occupancy_frames'], data['background_samples'],
+                                                             100*maximum, self.snapshot.get('background_window_s', 120),
+                                                             self.snapshot['elapsed_s']))
+            self.note.setText(('Learning background. ' if data['background_learning'] else '') +
+                              'Threshold-free relative darkness after per-vial brightness correction. '
+                              'Background is the temporal 90th percentile of up to 32 frames in the selected '
+                              'moving window (recording seconds), separately for each face. Corrected darkness '
+                              'accumulates over the run after background warm-up. Changing the window relearns '
+                              'the background and keeps earlier corrected history. Resting flies and changes within '
+                              'a vial and registration errors remain limitations. Colors are not time occupied.')
+        else:
+            values = data.get('rate', data['counts'])
+            maximum = self.snapshot.get('rate_maximum', self.snapshot['maximum'])
+            self.heatmap.set_image(overlay_image(data['background'], values, maximum))
+            self.legend_low.setText('0'); self.legend_high.setText('%.1f%% of frame pairs' % (100*maximum))
+            self.range_label.setText('Face %s | %d measured frame pairs | shared scale 0-%.1f%% detections/pixel '
+                                     '| updated at %.1f s' % (face, data['frames'], 100*maximum,
+                                                             self.snapshot['elapsed_s']))
 
 
 class ActivityHeatmapDock(QDockWidget):

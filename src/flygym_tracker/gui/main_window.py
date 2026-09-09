@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
         #: preview camera's state rather than a boolean: USB3 Vision is exclusive, and whether the
         #: preview holds the handle changes while this window is up.
         self.run = RunController(camera_is_open=lambda: self.session.is_open, parent=self)
+        self.run.set_background_window(self.state.get("spatial_background_window_s", 120))
         model = build_app_settings(config)
         self.controller = SettingsController(
             model,
@@ -944,6 +945,9 @@ class MainWindow(QMainWindow):
                     BehaviourPlotDock(self.behaviour, field, self))
             if field == HEATMAP_KEY:
                 dock.panel.threshold_requested.connect(self._apply_inspector_threshold)
+                dock.panel.background_window.setValue(self.state.get('spatial_background_window_s', 120))
+                self.run.set_background_window(dock.panel.background_window.value())
+                dock.panel.background_window_requested.connect(self._apply_background_window)
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
             # on and asked to have from the start: a graph opens in the same left tab group as the
@@ -966,6 +970,11 @@ class MainWindow(QMainWindow):
         dock.show()
         dock.raise_()
         dock.refresh()
+
+    def _apply_background_window(self, value: float) -> None:
+        self.state['spatial_background_window_s'] = value
+        gui_state.save_state(self.root, self.state)
+        self.run.set_background_window(value)
 
     def _apply_inspector_threshold(self, value: float) -> None:
         self.controller.commit("activity.pixel_threshold", value)

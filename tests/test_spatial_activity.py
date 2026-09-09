@@ -136,3 +136,145 @@ def test_inspector_step_buttons_respond_to_mouse_clicks(qapp):
     assert not stepper.up.isEnabled()
     panel.threshold_box.setValue(0)
     assert not stepper.down.isEnabled()
+
+
+def test_registered_counts_do_not_smear_and_do_not_wrap_at_edges():
+    store = SpatialActivity()
+    gray = np.full((5, 8), 100, np.uint8)
+    motion = np.zeros_like(gray, bool); motion[2, 2] = True
+    store.add('A', gray, motion, offset=(0, 0))
+    moved = np.zeros_like(motion); moved[2, 4] = True
+    moved[2, 0] = True  # This camera pixel lies outside the aligned reference image.
+    store.add('A', gray, moved, offset=(2, 0))
+    result = store.snapshot(10)['faces']['A']
+    assert np.argwhere(result['counts']).tolist() == [[2, 2]]
+    assert result['counts'][2, 2] == 2
+    assert result['rate'][2, 2] == 1
+    assert result['mean'][2, 7] == 100  # No zero padding enters the average.
+
+
+def test_frame_sum_exceeds_16_bits_and_includes_reference_without_motion():
+    store = SpatialActivity()
+    gray = np.full((2, 3), 255, np.uint8)
+    for _ in range(300):
+        store.add('A', gray, None)
+    data = store.faces['A']
+    assert data['intensity_sum'].dtype == np.uint64
+    assert data['intensity_sum'][0, 0] == 76500
+    published = store.snapshot(10)['faces']['A']
+    assert published['image_frames'] == 300 and published['frames'] == 0
+    assert np.all(published['mean'] == 255)
+    assert published['background_samples'] <= 32
+    assert not data['rolling'].samples[0][1].flags.writeable
+    store.close()
+
+
+def test_lighting_corrected_background_recovers_known_relative_darkness():
+    from concurrent.futures import Future
+    from flygym_tracker.rolling_background import RollingBackground
+    class ImmediateExecutor:
+        def submit(self, fn, values):
+            future = Future();future.set_result(fn(values));return future
+    rolling = RollingBackground(50, window_s=30, executor=ImmediateExecutor())
+    for i in range(64):
+        light = 200 if i % 2 else 100
+        gray = np.full((5, 10), light, np.uint8)
+        gray[0, 0] = light//2
+        if 32 <= i < 40:
+            gray[2, 3] = light//2
+        normal = gray.astype(np.float32) / np.percentile(gray, 90)
+        if i == 32:
+            rolling.total[:] = 0;rolling.count[:] = 0
+        rolling.add(normal.ravel(), i)
+    result = rolling.mean().reshape(5, 10)
+    assert result[0, 0] == 0
+    assert result[1, 1] == 0
+    assert result[2, 3] == .125  # 25% occupation x 50% contrast, not occupancy time.
+
+
+def test_moving_window_expires_old_background_and_keeps_corrected_history():
+    from concurrent.futures import Future
+    from flygym_tracker.rolling_background import RollingBackground
+    class ImmediateExecutor:
+        def submit(self, fn, values):
+            future = Future();future.set_result(fn(values));return future
+    rolling = RollingBackground(1, window_s=10, executor=ImmediateExecutor())
+    for i in range(8):
+        rolling.add(np.array([1.0]), i)
+    rolling.add(np.array([.5]), 8)
+    history = rolling.total.copy()
+    assert history[0] == .5
+    rolling.add(np.array([.6]), 30)
+    assert len(rolling.samples) == 1
+    assert rolling.background is None
+    np.testing.assert_array_equal(history, rolling.total)
+    for i in range(31, 45):
+        rolling.add(np.array([.6]), i)
+    assert np.allclose(rolling.background, .6)
+    np.testing.assert_array_equal(history, rolling.total)
+    rolling.set_window(20)
+    assert rolling.background is None and not rolling.samples
+    np.testing.assert_array_equal(history, rolling.total)
+
+
+def test_new_map_modes_switch_without_stale_render_and_keep_faces_separate(qapp):
+    store = SpatialActivity()
+    gray = np.full((4, 5), 100, np.uint8)
+    store.add('A', gray, None)
+    darker = gray.copy(); darker[1, 2] = 50
+    store.add('A', darker, np.zeros_like(gray, bool))
+    payload = store.snapshot(10)
+    panel = ActivityHeatmapPanel(payload)
+    panel.mode_box.setCurrentIndex(2)
+    assert '2 stationary frames' in panel.range_label.text()
+    panel.mode_box.setCurrentIndex(3)
+    assert 'background samples' in panel.range_label.text()
+    assert 'Learning background' in panel.note.text()
+    requested = []
+    panel.background_window_requested.connect(requested.append)
+    panel.background_window.setValue(60)
+    assert requested == [60]
+    panel.face_box.setCurrentIndex(1)
+    assert panel.heatmap.image is None
+    panel.close()
+
+
+def test_fast_background_percentile_matches_nanpercentile():
+    import warnings
+    from flygym_tracker.rolling_background import bright_percentile
+    values = np.random.default_rng(4).random((32, 100))
+    values[::3, ::7] = np.nan
+    values[:, 0] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        expected = np.nanpercentile(values, 90, axis=0)
+    np.testing.assert_allclose(bright_percentile(values), expected, atol=1e-14)
+
+
+def test_cached_mask_updates_equal_general_mask_updates():
+    rng = np.random.default_rng(8)
+    mask = rng.random((20, 30)) > .4
+    mask.setflags(write=False)
+    fast, general = SpatialActivity(), SpatialActivity()
+    for i in range(8):
+        gray = rng.integers(0, 256, mask.shape, dtype=np.uint8)
+        motion = rng.random(mask.shape) > .8
+        fast.add('A', gray, motion, mask, elapsed_s=i/20)
+        general.add('A', gray, motion, mask.copy(), elapsed_s=i/20)
+    for key in ('intensity_sum', 'samples', 'counts', 'normal_sum', 'pair_samples'):
+        np.testing.assert_array_equal(fast.faces['A'][key], general.faces['A'][key])
+    fast.close();general.close()
+
+
+def test_live_background_window_setting_routes_through_pipeline(tmp_path):
+    from test_pipeline import _config, _calibration, _full_scene, FakeSource
+    from flygym_tracker.pipeline import TrackerPipeline
+    from flygym_tracker.logger import ActivityLogger
+    logger = ActivityLogger(tmp_path/'out', 'background-window', fmt='csv')
+    pipe = TrackerPipeline(_config(), _calibration(tmp_path), FakeSource(_full_scene()), logger, clock='index')
+    pipe.spatial_activity = SpatialActivity()
+    assert pipe.apply_setting('spatial.background_window_s', 60)
+    assert pipe.spatial_activity.background_window_s == 60
+    assert not pipe.apply_setting('spatial.background_window_s', 0)
+    assert pipe.spatial_activity.background_window_s == 60
+    pipe.spatial_activity.close();logger.close()

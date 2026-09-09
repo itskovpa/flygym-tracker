@@ -162,7 +162,7 @@ class RunWorker(QObject):
             return
 
         from flygym_tracker.spatial_activity import SpatialActivity
-        pipeline.spatial_activity = SpatialActivity()
+        pipeline.spatial_activity = SpatialActivity(self._plan.get('spatial_background_window_s', 120))
         self._spatial_elapsed = 0.0
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
@@ -227,7 +227,8 @@ class RunWorker(QObject):
             # `run_meta.json` snapshots the config at START (invariant 4's other half): everything
             # chosen BEFORE the run belongs here, everything changed after belongs in events.csv.
             meta={"config": config.to_dict(), "calibration_dir": plan["calib_dir"],
-                  "started_from": "gui"},
+                  "started_from": "gui",
+                  "spatial_background_window_s": plan.get("spatial_background_window_s", 120)},
         )
         # WHETHER TO TRACK INDIVIDUAL FLIES. Normally the "activity only" tick box decides
         # (`plan["track_flies"]`, default True). `FLYGYM_DISABLE_TRACKING=1` still forces it off as
@@ -434,6 +435,7 @@ class RunController(QObject):
         self._worker: Optional[RunWorker] = None
         self._state = IDLE
         self._detail = ""
+        self.background_window_s = 120.0
 
     @property
     def state(self) -> str:
@@ -476,6 +478,7 @@ class RunController(QObject):
             return False
 
         self._thread = QThread()
+        plan = dict(plan, spatial_background_window_s=self.background_window_s)
         self._worker = RunWorker(plan, latest=self.latest)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -497,6 +500,12 @@ class RunController(QObject):
             return
         self._set_state(STOPPING, "finishing the current bin and closing the files")
         self._worker.request_stop()
+
+    def set_background_window(self, seconds: float) -> None:
+        if not 10 <= float(seconds) <= 600:
+            raise ValueError('Background window must be 10 to 600 seconds')
+        self.background_window_s = float(seconds)
+        self.apply_setting('spatial.background_window_s', self.background_window_s)
 
     def apply_setting(self, key: str, value: Any) -> bool:
         """Route one live change into the running pipeline. False if there is no run to route to.
