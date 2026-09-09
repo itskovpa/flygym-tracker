@@ -229,7 +229,7 @@ class VideoStage(QWidget):
         self.draw_restart_button = _button(
             "Start over", "Throw away EVERY vial and draw all of them from nothing.")
         self.draw_done_button = _button(
-            "Save and finish", "Keep the vials drawn so far and save the bundle. (q)")
+            "Save and finish", "Finish the current vial and save all positions to the vial-positions folder. (q)")
         self.draw_cancel_button = _button(
             "Cancel", "Leave without writing anything.", role="danger")
         for button, slot in (
