@@ -6,6 +6,7 @@ from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QComboBox, QDockWidget, QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 from flygym_tracker.gui.preview import fit_rect
+from flygym_tracker.gui.stepper import StepperField
 from flygym_tracker.gui import theme
 
 HEATMAP_KEY = 'activity_heatmap'
@@ -73,7 +74,10 @@ class ActivityHeatmapPanel(QWidget):
         self.threshold_box.setRange(0, 255)
         self.threshold_box.setDecimals(1)
         self.threshold_box.setKeyboardTracking(False)
-        threshold_layout.addWidget(self.threshold_box)
+        self.threshold_stepper = StepperField(self.threshold_box)
+        self.threshold_box.valueChanged.connect(self.threshold_stepper.refresh_step_limits)
+        self.threshold_stepper.refresh_step_limits()
+        threshold_layout.addWidget(self.threshold_stepper)
         self.apply_button = QPushButton('Apply to detector')
         self.apply_button.clicked.connect(lambda: self.threshold_requested.emit(self.threshold_box.value()))
         threshold_layout.addWidget(self.apply_button)

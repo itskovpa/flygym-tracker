@@ -114,3 +114,25 @@ def test_live_mode_renders_exact_frame_mask_and_keeps_cumulative_snapshot(qapp):
     panel.mode_box.setCurrentIndex(0)
     assert payload['faces']['A']['counts'][1, 2] == 1
     assert 'updated at 10.0' in panel.range_label.text()
+
+def test_inspector_step_buttons_respond_to_mouse_clicks(qapp):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QAbstractSpinBox
+    panel = ActivityHeatmapPanel({})
+    panel.mode_box.setCurrentIndex(1)
+    panel.resize(700, 600)
+    panel.show()
+    panel.threshold_box.setValue(4)
+    qapp.processEvents()
+    stepper = panel.threshold_stepper
+    assert panel.threshold_box.buttonSymbols() == QAbstractSpinBox.ButtonSymbols.NoButtons
+    assert stepper.up.isVisible() and stepper.up.width() > 0
+    QTest.mouseClick(stepper.up, Qt.MouseButton.LeftButton, pos=stepper.up.rect().center())
+    assert panel.threshold_box.value() == 5
+    QTest.mouseClick(stepper.down, Qt.MouseButton.LeftButton, pos=stepper.down.rect().center())
+    assert panel.threshold_box.value() == 4
+    panel.threshold_box.setValue(255)
+    assert not stepper.up.isEnabled()
+    panel.threshold_box.setValue(0)
+    assert not stepper.down.isEnabled()
