@@ -110,7 +110,7 @@ class ActivityHeatmapPanel(QWidget):
     def refresh(self):
         is_live = self.mode_box.currentIndex() == 1
         self.threshold_controls.setVisible(is_live)
-        self.face_box.setEnabled(not is_live)
+        self.face_box.setVisible(not is_live)
         self.legend.setVisible(not is_live)
         self.legend_low.setVisible(not is_live)
         self.legend_high.setVisible(not is_live)
@@ -129,10 +129,6 @@ class ActivityHeatmapPanel(QWidget):
                 self.apply_button.setEnabled(False)
                 return
             self.apply_button.setEnabled(True)
-            if data.get('face') in ('A', 'B'):
-                self.face_box.blockSignals(True)
-                self.face_box.setCurrentIndex('AB'.index(data['face']))
-                self.face_box.blockSignals(False)
             threshold = data.get('threshold')
             if not self._threshold_initialized and threshold is not None:
                 self.threshold_box.setValue(float(threshold))
