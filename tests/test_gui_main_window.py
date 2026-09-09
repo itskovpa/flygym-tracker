@@ -112,6 +112,15 @@ def test_asking_for_the_same_graph_twice_raises_the_one_dock(qapp, window):
     assert len(window._plot_docks) == 1
 
 
+def test_activity_heatmap_is_available_in_the_existing_plot_picker(qapp, window):
+    index = window.run_panel.plot_box.findData("activity_heatmap")
+    assert index >= 0
+    window.run_panel.plot_box.setCurrentIndex(index)
+    window.run_panel.plot_button.click()
+    qapp.processEvents()
+    assert "activity_heatmap" in window._plot_docks
+
+
 def test_the_session_bar_shows_the_three_paths_run_bat_kept_in_a_batch_file(qapp, window,
                                                                            rig_config, tmp_path):
     assert window.session_bar.config_path() == rig_config

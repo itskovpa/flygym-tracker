@@ -103,6 +103,7 @@ class RunPanel(QWidget):
 
         # THE PLOTS. A picker rather than a button per parameter: there are thirteen of them and a
         # row of thirteen buttons would be the tool strip's width problem all over again.
+        from flygym_tracker.gui.activity_heatmap import HEATMAP_KEY, HEATMAP_LABEL
         from flygym_tracker.gui.behaviour_series import PLOTTABLE
 
         # ON THE CONTROL ROW, at its right, not on a row of its own: the status sentence elides, so
@@ -116,11 +117,12 @@ class RunPanel(QWidget):
         self.plot_box.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.plot_box.setMinimumContentsLength(22)
+        self.plot_box.addItem(HEATMAP_LABEL, HEATMAP_KEY)
         for field, label in PLOTTABLE:
             self.plot_box.addItem(label, field)
         self.plot_box.setToolTip(
-            "A behavioural parameter to plot as a timeseries, 8x2 vials per drum face. Each one "
-            "opens its own dock, which can be floated, tabbed or closed.")
+            "Open a behavioural timeseries or the two-face activity heatmap. Each view uses the "
+            "shared retained run history and opens in a dock that can be floated, tabbed or closed.")
         controls.addWidget(self.plot_box)
         self.plot_button = QPushButton("Show graph")
         self.plot_button.setProperty("role", "ghost")

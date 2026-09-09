@@ -42,6 +42,7 @@ from flygym_tracker.gui.camera_session import (CLOSED, CLOSING, ERROR_BUSY, ERRO
 from flygym_tracker.gui.camera_status import CameraStatusBar
 from flygym_tracker.gui.behaviour_series import BehaviourSeries
 from flygym_tracker.gui.plot_dock import BehaviourPlotDock
+from flygym_tracker.gui.activity_heatmap import ActivityHeatmapDock, HEATMAP_KEY
 from flygym_tracker.gui.readiness_strip import ReadinessStrip
 from flygym_tracker.gui.results_panel import ResultsPanel
 from flygym_tracker.gui.run_controller import RunController
@@ -921,7 +922,7 @@ class MainWindow(QMainWindow):
             dock.refresh()
 
     def show_plot(self, field: str) -> None:
-        """Open (or raise) the dock for one behavioural parameter.
+        """Open (or raise) one behavioural plot or the activity heatmap.
 
         RAISED RATHER THAN DUPLICATED: two docks of the same parameter would be two identical
         graphs the operator then has to tell apart, and closing one would look like it had failed
@@ -929,7 +930,8 @@ class MainWindow(QMainWindow):
         """
         dock = self._plot_docks.get(field)
         if dock is None:
-            dock = BehaviourPlotDock(self.behaviour, field, self)
+            dock = (ActivityHeatmapDock(self.behaviour, self) if field == HEATMAP_KEY else
+                    BehaviourPlotDock(self.behaviour, field, self))
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
             # on and asked to have from the start: a graph opens in the same left tab group as the

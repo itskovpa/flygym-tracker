@@ -28,9 +28,10 @@ For a level-like parameter (mean height) it is not meaningful.
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from collections import deque
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 #: Parameters offered for plotting, in the order they are shown, as ``(field, label)``.
 #: `median_path_length` FIRST because it is the rig owner's default: with up to 20 flies per vial
@@ -86,6 +87,40 @@ BIN_CHOICES = (0, 0.2, 0.5, 1, 10, 30, 60, 300, 900)
 
 VIALS_PER_FACE = 16
 FACES = ("A", "B")
+
+HEATMAP_MEASURED = "measured"
+HEATMAP_OTHER_FACE = "other_face"
+HEATMAP_MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class HeatmapSnapshot:
+    """One immutable activity-heatmap read from the retained history.
+
+    Values are sparse: a long unobserved interval costs no matrix full of ``None`` values, and its
+    width on screen still follows elapsed time. ``observed_faces`` is separate from ``values`` so
+    the painter can distinguish a missing measurement from a period in which the opposite drum
+    face was measured. A numeric zero remains in ``values`` and is therefore a measured cell.
+    """
+
+    field: str
+    bin_seconds: float
+    buckets: Tuple[int, ...]
+    values: Dict[Tuple[str, int, int], float]
+    observed_faces: Set[Tuple[str, int]]
+    value_range: Optional[Tuple[float, float]]
+    time_range: Optional[Tuple[float, float]]
+
+    def value(self, face: str, vial_index: int, bucket: int) -> Optional[float]:
+        return self.values.get((face, vial_index, bucket))
+
+    def state(self, face: str, vial_index: int, bucket: int) -> str:
+        if (face, vial_index, bucket) in self.values:
+            return HEATMAP_MEASURED
+        other = "B" if face == "A" else "A"
+        if (other, bucket) in self.observed_faces and (face, bucket) not in self.observed_faces:
+            return HEATMAP_OTHER_FACE
+        return HEATMAP_MISSING
 
 
 def _is_number(value) -> bool:
@@ -286,6 +321,57 @@ class BehaviourSeries:
             # A flat series still needs a drawable band, or every point lands on one edge.
             return (low - 0.5, high + 0.5)
         return (low, high)
+
+    def activity_heatmap(self, field: str, *, bin_seconds: float = 10.0,
+                         max_columns: Optional[int] = 500,
+                         normalize_area: bool = False) -> HeatmapSnapshot:
+        """Return a sparse, elapsed-time heatmap snapshot for an activity field.
+
+        The same floating-point-safe bucket rule and median aggregation as :meth:`series` are used.
+        Empty/invalid values are never converted to zero. ``max_columns`` caps retained occupied
+        time bins (not pixels), matching the live plot's "show last" control while keeping elapsed
+        gaps proportional on the horizontal axis.
+        """
+        width = max(1e-6, float(bin_seconds))
+        buckets: Set[int] = set()
+        face_values: Dict[Tuple[str, int, int], List[float]] = {}
+        observed_faces: Set[Tuple[str, int]] = set()
+        for elapsed, face, vial, row in self._rows:
+            if face not in FACES or field not in row:
+                continue
+            bucket = int(math.floor(elapsed / width + 1e-9))
+            buckets.add(bucket)
+            value = row.get(field)
+            if not _is_number(value):
+                continue
+            vial_index = self.local_index(face, vial)
+            face_values.setdefault((face, vial_index, bucket), []).append(float(value))
+            observed_faces.add((face, bucket))
+
+        ordered = sorted(buckets)
+        if max_columns is not None:
+            cap = max(0, int(max_columns))
+            ordered = ordered[-cap:] if cap else []
+        kept = set(ordered)
+        values = {key: _median(samples) for key, samples in face_values.items()
+                  if key[2] in kept}
+        if normalize_area and field in AREA_NORMALIZED_FIELDS:
+            values = {key: value * self._area_factor(key[0], key[1])
+                      for key, value in values.items()}
+        observed_faces = {key for key in observed_faces if key[1] in kept}
+
+        if values:
+            # Both activity metrics are non-negative by definition. Anchoring at zero makes a
+            # genuinely still vial an honest colour on every refresh and keeps one shared scale
+            # across both faces. A completely-zero snapshot still needs a non-zero legend span.
+            high = max(values.values())
+            value_range = (0.0, high if high > 1e-12 else 1.0)
+        else:
+            value_range = None
+        time_range = ((ordered[0] * width, (ordered[-1] + 1) * width)
+                      if ordered else None)
+        return HeatmapSnapshot(field, width, tuple(ordered), values, observed_faces,
+                               value_range, time_range)
 
     def time_range(self) -> Optional[Tuple[float, float]]:
         if not self._rows:
