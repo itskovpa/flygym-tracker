@@ -135,6 +135,7 @@ class MainWindow(QMainWindow):
         #: Every behaviour row of this run, shared by every open plot dock. ONE STORE: a dock
         #: opened at hour 40 draws the whole run rather than only what arrives after it opened.
         self.behaviour = BehaviourSeries()
+        self.spatial_heatmap = {}
         self._plot_docks = {}
         #: The recording a REPLAY is running, or None when the run is live (or nothing is running).
         #: A replay holds no camera, so it is the one kind of run that can still be drawn on -- and
@@ -394,6 +395,7 @@ class MainWindow(QMainWindow):
         self.run.progress.connect(self.run_panel.set_progress)
         self.run.progress.connect(self.results.set_progress)
         self.run.progress.connect(self._on_run_progress)
+        self.run.spatial_ready.connect(self._on_spatial_ready)
         self.run.bin_done.connect(self._on_activity_rows)
         self.run.bin_done.connect(self.results.add_bin)
         self.run.behaviour_done.connect(self._on_behaviour_rows)
@@ -752,6 +754,7 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.spatial_heatmap.clear()
         self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()
@@ -930,7 +933,7 @@ class MainWindow(QMainWindow):
         """
         dock = self._plot_docks.get(field)
         if dock is None:
-            dock = (ActivityHeatmapDock(self.behaviour, self) if field == HEATMAP_KEY else
+            dock = (ActivityHeatmapDock(self.spatial_heatmap, self) if field == HEATMAP_KEY else
                     BehaviourPlotDock(self.behaviour, field, self))
             self._plot_docks[field] = dock
             # ON THE LEFT, TABBED WITH SETTINGS, BY DEFAULT -- the arrangement the operator settled
@@ -954,6 +957,13 @@ class MainWindow(QMainWindow):
         dock.show()
         dock.raise_()
         dock.refresh()
+
+    def _on_spatial_ready(self, payload: dict) -> None:
+        self.spatial_heatmap.clear()
+        self.spatial_heatmap.update(payload)
+        dock = self._plot_docks.get(HEATMAP_KEY)
+        if dock is not None:
+            dock.refresh()
 
     def _on_run_progress(self, payload: dict) -> None:
         """Tint the vial outlines on the picture by what each vial is reporting."""
@@ -1238,6 +1248,7 @@ class MainWindow(QMainWindow):
         }
         self.results.clear()
         self.behaviour.clear()
+        self.spatial_heatmap.clear()
         self.stage.clear_tracks()
         for dock in self._plot_docks.values():
             dock.refresh()

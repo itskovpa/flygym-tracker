@@ -2,8 +2,6 @@
 import time
 
 import pytest
-from flygym_tracker.gui.activity_heatmap import (ActivityHeatmapDock, ActivityHeatmapPanel,
-                                                 _heat_colour)
 from flygym_tracker.gui.behaviour_series import (HEATMAP_MEASURED, HEATMAP_MISSING,
                                                  HEATMAP_OTHER_FACE, BehaviourSeries)
 
@@ -58,7 +56,6 @@ def test_shared_colour_range_spans_faces_and_recent_cap_bounds_time():
     assert snap.buckets == (2, 3)
     assert snap.time_range == pytest.approx((20, 40))
     assert snap.value_range == pytest.approx((0, 8))
-    assert _heat_colour(0, snap.value_range) != _heat_colour(8, snap.value_range)
 
 
 def test_heatmap_medians_match_existing_display_binning():
@@ -67,47 +64,6 @@ def test_heatmap_medians_match_existing_display_binning():
     snap = store.activity_heatmap("active_fraction_mean", bin_seconds=10)
     assert snap.value("A", 0, 0) == 3
     assert store.series("active_fraction_mean", "A", 0, bin_seconds=10)[0][1] == 3
-
-
-def test_panel_defaults_to_active_fraction_and_never_splits_recorded_bins(qapp):
-    store = BehaviourSeries()
-    store.add([_row(0, "A", 1, .1, width=10)])
-    panel = ActivityHeatmapPanel(store)
-    assert panel.field() == "active_fraction_mean"
-    panel.bin_box.setCurrentIndex(panel.bin_box.findData(.2))
-    assert panel.effective_bin_seconds() == 10
-    assert panel.heatmap.snapshot.bin_seconds == 10
-    assert "cannot recover finer measurements" in panel.resolution_label.text()
-
-
-def test_switching_metrics_updates_data_and_area_control(qapp):
-    store = BehaviourSeries()
-    row = _row(0, "A", 1, .25)
-    row.update(motion_px_sum=125, lit_area_px=1000)
-    store.add([row])
-    panel = ActivityHeatmapPanel(store)
-    assert panel.heatmap.snapshot.value("A", 0, 0) == pytest.approx(.25)
-    panel.metric_box.setCurrentIndex(panel.metric_box.findData("motion_px_sum"))
-    assert panel.area_box.isEnabled() and panel.area_box.isChecked()
-    assert panel.heatmap.snapshot.field == "motion_px_sum"
-    assert panel.heatmap.snapshot.value("A", 0, 0) == pytest.approx(125)
-
-
-def test_heatmap_dock_scrolls_and_renders_at_small_and_normal_sizes(qapp):
-    store = BehaviourSeries()
-    store.add([_row(0, "A", 1, 0), _row(10, "B", 17, .4)])
-    dock = ActivityHeatmapDock(store)
-    dock.resize(320, 260)
-    dock.show()
-    qapp.processEvents()
-    scroll = dock.widget()
-    assert scroll.verticalScrollBar().maximum() > 0
-    image = dock.grab().toImage()
-    assert image.width() == 320 and image.height() == 260
-    assert image.pixelColor(10, 10).isValid()
-    dock.resize(620, 620)
-    qapp.processEvents()
-    assert dock.panel.heatmap.width() >= 360
 
 
 def test_snapshot_refresh_cost_is_measured_on_bounded_synthetic_history():

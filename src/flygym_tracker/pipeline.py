@@ -442,6 +442,7 @@ class TrackerPipeline:
         #: rolls, so a caller that wants them cannot infer them from the activity bin.
         self._behaviour_observers: List[Callable[[dict], None]] = []
         self.observer_failures = 0
+        self.spatial_activity = None
         self._fps_times: List[float] = []
 
         # -- live settings (see the "live settings" section below) ----------------------------
@@ -1377,6 +1378,8 @@ class TrackerPipeline:
         results: Dict[int, Tuple[int, int, float]] = {}
         if self._current_face is None:
             return results
+        spatial = self.spatial_activity
+        motion = np.zeros(gray.shape, dtype=bool) if spatial is not None else None
         for gvid, (bbox, submask) in self._face_active[self._current_face].items():
             x, y, w, h = bbox
             if w <= 0 or h <= 0 or submask.size == 0:
@@ -1384,7 +1387,11 @@ class TrackerPipeline:
                 continue
             cur_crop = gray[y:y + h, x:x + w]
             prev_crop = prev[y:y + h, x:x + w]
-            results[gvid] = per_frame_activity(cur_crop, prev_crop, submask, self.pixel_threshold)
+            results[gvid] = per_frame_activity(
+                cur_crop, prev_crop, submask, self.pixel_threshold,
+                motion_out=motion[y:y+h, x:x+w] if motion is not None else None)
+        if spatial is not None and results:
+            spatial.add(self._current_face, gray, motion)
         return results
 
     # ---- bin -> records ---------------------------------------------------------------------

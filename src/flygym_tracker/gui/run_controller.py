@@ -84,6 +84,7 @@ class RunWorker(QObject):
     away from the SDK handle.
     """
 
+    spatial_ready = Signal(dict)
     progress = Signal(dict)
     started = Signal(dict)
     finished = Signal(dict)
@@ -160,6 +161,9 @@ class RunWorker(QObject):
             self.failed.emit(str(exc))
             return
 
+        from flygym_tracker.spatial_activity import SpatialActivity
+        pipeline.spatial_activity = SpatialActivity()
+        self._spatial_elapsed = 0.0
         self._pipeline = pipeline
         pipeline.add_observer(self._on_frame)
         pipeline.add_bin_observer(self._on_bin)
@@ -173,6 +177,9 @@ class RunWorker(QObject):
             self._close_recorder()      # a failed run still leaves whatever it recorded playable
             self.failed.emit(str(exc))
             return
+        snapshot = pipeline.spatial_activity.snapshot(self._spatial_elapsed, force=True)
+        if snapshot is not None:
+            self.spatial_ready.emit(snapshot)
         self._pipeline = None
         summary = dict(summary or {})
         # THE VIDEO IS FINALISED AFTER THE PIPELINE, NOT INSIDE IT. `close` drains the frames
@@ -260,6 +267,11 @@ class RunWorker(QObject):
         of a three-day run. Hence the broad guard around each applied setting: a rejected value is
         reported to the row and the acquisition continues.
         """
+        if self._pipeline is not None and self._pipeline.spatial_activity is not None:
+            self._spatial_elapsed = float(payload.get("elapsed_s", 0.0))
+            snapshot = self._pipeline.spatial_activity.snapshot(self._spatial_elapsed)
+            if snapshot is not None:
+                self.spatial_ready.emit(snapshot)
         self._drain_pending()
         self._frames = int(payload.get("index", self._frames) or 0)
         if self._recorder is not None:
@@ -386,6 +398,7 @@ class RunController(QObject):
     the thread it owns with it.
     """
 
+    spatial_ready = Signal(dict)
     progress = Signal(dict)
     state_changed = Signal(str, str)          # state, detail
     started = Signal(dict)
@@ -454,6 +467,7 @@ class RunController(QObject):
         self._worker = RunWorker(plan, latest=self.latest)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.spatial_ready.connect(self.spatial_ready)
         self._worker.progress.connect(self._on_progress)
         self._worker.started.connect(self._on_started)
         self._worker.finished.connect(self._on_finished)

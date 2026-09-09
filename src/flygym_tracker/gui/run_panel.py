@@ -121,8 +121,8 @@ class RunPanel(QWidget):
         for field, label in PLOTTABLE:
             self.plot_box.addItem(label, field)
         self.plot_box.setToolTip(
-            "Open a behavioural timeseries or the two-face activity heatmap. Each view uses the "
-            "shared retained run history and opens in a dock that can be floated, tabbed or closed.")
+            "Open a behavioural timeseries or a spatial heatmap over a fixed video frame. "
+            "Spatial maps accumulate during video processing; each view opens in a movable dock.")
         controls.addWidget(self.plot_box)
         self.plot_button = QPushButton("Show graph")
         self.plot_button.setProperty("role", "ghost")
